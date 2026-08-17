@@ -49,7 +49,7 @@ Review the report for:
 5. current listeners on 443/7443/8443/8444/9443/9444/9543/9544;
 6. Router IP Push current IP and `last_seen`;
 7. current Fail2ban installation/service/jails;
-8. current UFW rules;
+8. current UFW rules and whether UFW is active;
 9. any existing RIPH files/units from manual experiments;
 10. existing stream audit log format/tail.
 
@@ -80,7 +80,9 @@ Confirm the generated audit log exists only on the external `:443` server, not o
 internal bridge listeners.
 
 Validate Fail2ban regex against synthetic controlled log lines before live jails are
-enabled.
+enabled. Validate `riph-fail2ban-ufw` with synthetic UFW status containing both a
+manual deny and a Fail2ban deny for the same IP; unban must select only the exact
+`riph-f2b-<jail>` marked rule.
 
 **STOP GATE 2:** candidate diff must contain no unexpected listener, upstream,
 trusted source, package/service, SSH or unrelated configuration change.
@@ -98,7 +100,8 @@ Immediately before the first controlled install:
 - save Router IP Push state;
 - record enabled/active state of relevant systemd units.
 
-The installer creates its own pre-install snapshot as an additional layer.
+The installer creates its own pre-install snapshot as an additional layer, including
+all three Nginx runtime files that may later be changed by `riph-apply`.
 
 No SSH policy is changed.
 
@@ -171,7 +174,8 @@ Before restart/reload:
   - VPS_GR;
   - Spectra;
   - Hexabyte;
-- verify it returns nonzero for a known untrusted test IP.
+- verify it returns nonzero for a known untrusted test IP;
+- verify `riph-fail2ban-ufw` only selects/removes exact project-marked rules.
 
 After activation:
 
@@ -260,6 +264,7 @@ Private v1 is ready to merge only after:
 - Fail2ban jails match only controlled final routes;
 - trusted IPs cannot remain project-banned;
 - automatic bans remain TCP/443-only;
+- Fail2ban unban cannot remove project manual-deny ownership;
 - Router IP Push remains reachable over SSH;
 - timers/watch behave as designed;
 - harvest shows clean routing categories;
