@@ -1,0 +1,382 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+COMMON_DEFAULT="/usr/local/libexec/riph-common.sh"
+GENERATOR_DEFAULT="/usr/local/sbin/riph-generate-allowlist"
+
+if [[ -f "${SCRIPT_DIR}/../libexec/riph-common.sh" ]]; then
+    # Repository/test layout.
+    # shellcheck source=../libexec/riph-common.sh
+    source "${SCRIPT_DIR}/../libexec/riph-common.sh"
+    GENERATOR="${SCRIPT_DIR}/riph-generate-allowlist"
+else
+    # Installed layout.
+    # shellcheck source=/usr/local/libexec/riph-common.sh
+    source "${COMMON_DEFAULT}"
+    GENERATOR="${GENERATOR_DEFAULT}"
+fi
+
+RIPH_ROOT="/"
+CONFIG_PATH="/etc/router-ip-push-hardening/config.env"
+REASON="manual apply"
+DRY_RUN=0
+RIPH_NOW_EPOCH_OVERRIDE=""
+
+usage() {
+    cat <<'EOF'
+Usage: riph-apply [options]
+
+Options:
+  --root DIR          Test root prefix (/, /tmp/* or /var/tmp/*).
+  --config PATH       Config path inside root.
+  --reason TEXT       Human-readable apply reason.
+  --dry-run           Build candidates and report changes without installing them.
+  --now-epoch EPOCH   Override current UTC epoch for deterministic tests.
+  -h, --help          Show this help.
+
+Testing:
+  RIPH_NGINX_BIN and RIPH_SYSTEMCTL_BIN may point to stub executables.
+EOF
+}
+
+while (($#)); do
+    case "$1" in
+        --root)
+            (($# >= 2)) || riph_die "--root requires a value"
+            RIPH_ROOT="$(riph_validate_root "$2")"
+            shift 2
+            ;;
+        --config)
+            (($# >= 2)) || riph_die "--config requires a value"
+            CONFIG_PATH="$2"
+            shift 2
+            ;;
+        --reason)
+            (($# >= 2)) || riph_die "--reason requires a value"
+            REASON="$2"
+            shift 2
+            ;;
+        --dry-run)
+            DRY_RUN=1
+            shift
+            ;;
+        --now-epoch)
+            (($# >= 2)) || riph_die "--now-epoch requires a value"
+            [[ "$2" =~ ^[0-9]+$ ]] || riph_die "--now-epoch must be an integer"
+            RIPH_NOW_EPOCH_OVERRIDE="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            riph_die "unknown argument: $1"
+            ;;
+    esac
+done
+
+riph_require_cmd jq
+riph_require_cmd flock
+riph_require_cmd sha256sum
+riph_require_cmd install
+riph_require_cmd cmp
+riph_require_cmd date
+
+CONFIG_FILE="$(riph_root_path "${CONFIG_PATH}")"
+riph_load_config "${CONFIG_FILE}"
+riph_prepare_dirs
+
+STATE_DIR="$(riph_root_path "${RIPH_STATE_DIR}")"
+CONFIG_DIR="$(riph_root_path "${RIPH_CONFIG_DIR}")"
+ALLOWLIST_FILE="$(riph_root_path "${ALLOWLIST_OUTPUT}")"
+GRACE_FILE="${CONFIG_DIR}/previous-ip-grace.json"
+LAST_STATE_FILE="${CONFIG_DIR}/last-apply-state.json"
+LOCK_FILE="${STATE_DIR}/locks/apply.lock"
+RUNTIME_DIR="${STATE_DIR}/runtime"
+BACKUP_ROOT="${STATE_DIR}/backups"
+
+mkdir -p "${CONFIG_DIR}" "$(dirname "${ALLOWLIST_FILE}")"
+
+exec 9>"${LOCK_FILE}"
+if ! flock -n 9; then
+    riph_die "another riph-apply/reconcile process is already running"
+fi
+
+NOW_EPOCH="$(riph_now_epoch)"
+NOW_ISO="$(riph_utc_iso_from_epoch "${NOW_EPOCH}")"
+GRACE_SECONDS=$(( PREVIOUS_IP_GRACE_HOURS * 3600 ))
+
+RUN_DIR="$(mktemp -d "${RUNTIME_DIR}/apply.XXXXXX")"
+cleanup() {
+    rm -rf "${RUN_DIR}"
+}
+trap cleanup EXIT
+
+CANDIDATE_GRACE="${RUN_DIR}/previous-ip-grace.json"
+CANDIDATE_ALLOWLIST="${RUN_DIR}/05-router-ip-push-source-allow.conf"
+CANDIDATE_STATE="${RUN_DIR}/last-apply-state.json"
+CURRENT_ROUTERS_JSON="${RUN_DIR}/current-routers.json"
+
+printf '{"version":1,"routers":{}}\n' >"${CURRENT_ROUTERS_JSON}"
+
+# Build validated current-router map.
+for router_id in "${RIPH_ROUTER_IDS[@]}"; do
+    if current_ip="$(riph_current_router_ip "${router_id}")"; then
+        tmp="${CURRENT_ROUTERS_JSON}.tmp"
+        jq \
+            --arg id "${router_id}" \
+            --arg ip "${current_ip}" \
+            '.routers[$id] = {"current_ip": $ip}' \
+            "${CURRENT_ROUTERS_JSON}" >"${tmp}"
+        mv "${tmp}" "${CURRENT_ROUTERS_JSON}"
+    elif [[ "${REQUIRE_ROUTER_IP:-1}" == "1" ]]; then
+        riph_die "no current Router IP Push IPv4 for ${router_id}"
+    else
+        riph_log "warning: no current Router IP Push IPv4 for ${router_id}"
+    fi
+done
+
+if [[ -f "${GRACE_FILE}" ]]; then
+    jq -e '.version == 1 and (.routers | type == "object")' "${GRACE_FILE}" >/dev/null \
+        || riph_die "invalid grace state: ${GRACE_FILE}"
+    cp -a "${GRACE_FILE}" "${CANDIDATE_GRACE}"
+else
+    printf '{"version":1,"routers":{}}\n' >"${CANDIDATE_GRACE}"
+fi
+
+if [[ -f "${LAST_STATE_FILE}" ]]; then
+    jq -e '.version == 1 and (.routers | type == "object")' "${LAST_STATE_FILE}" >/dev/null \
+        || riph_die "invalid last apply state: ${LAST_STATE_FILE}"
+fi
+
+# Expire stale grace entries first.
+tmp="${CANDIDATE_GRACE}.tmp"
+jq --argjson now "${NOW_EPOCH}" '
+    .routers |= with_entries(
+        select((.value.expires_at_epoch // 0) > $now)
+    )
+' "${CANDIDATE_GRACE}" >"${tmp}"
+mv "${tmp}" "${CANDIDATE_GRACE}"
+
+# Drop grace entries for routers no longer present in ROUTER_IDS.
+while IFS= read -r grace_router_id; do
+    [[ -n "${grace_router_id}" ]] || continue
+    configured=0
+    for configured_id in "${RIPH_ROUTER_IDS[@]}"; do
+        if [[ "${configured_id}" == "${grace_router_id}" ]]; then
+            configured=1
+            break
+        fi
+    done
+    if (( configured == 0 )); then
+        tmp="${CANDIDATE_GRACE}.tmp"
+        jq --arg id "${grace_router_id}" 'del(.routers[$id])' "${CANDIDATE_GRACE}" >"${tmp}"
+        mv "${tmp}" "${CANDIDATE_GRACE}"
+    fi
+done < <(jq -r '.routers | keys[]' "${CANDIDATE_GRACE}")
+
+# Detect router current-IP transitions from the last successful apply.
+for router_id in "${RIPH_ROUTER_IDS[@]}"; do
+    current_ip="$(jq -r --arg id "${router_id}" '.routers[$id].current_ip // empty' "${CURRENT_ROUTERS_JSON}")"
+    [[ -n "${current_ip}" ]] || continue
+
+    old_ip=""
+    if [[ -f "${LAST_STATE_FILE}" ]]; then
+        old_ip="$(jq -r --arg id "${router_id}" '.routers[$id].current_ip // empty' "${LAST_STATE_FILE}")"
+    fi
+
+    if [[ -n "${old_ip}" && "${old_ip}" != "${current_ip}" ]]; then
+        riph_is_ipv4 "${old_ip}" || riph_die "invalid previous current IPv4 in last state for ${router_id}: ${old_ip}"
+        tmp="${CANDIDATE_GRACE}.tmp"
+        if (( GRACE_SECONDS > 0 )); then
+            expires_epoch=$(( NOW_EPOCH + GRACE_SECONDS ))
+            expires_iso="$(riph_utc_iso_from_epoch "${expires_epoch}")"
+            jq \
+                --arg id "${router_id}" \
+                --arg ip "${old_ip}" \
+                --arg expires_iso "${expires_iso}" \
+                --argjson expires_epoch "${expires_epoch}" \
+                '.routers[$id] = {
+                    "ip": $ip,
+                    "expires_at": $expires_iso,
+                    "expires_at_epoch": $expires_epoch
+                }' \
+                "${CANDIDATE_GRACE}" >"${tmp}"
+        else
+            jq --arg id "${router_id}" 'del(.routers[$id])' "${CANDIDATE_GRACE}" >"${tmp}"
+        fi
+        mv "${tmp}" "${CANDIDATE_GRACE}"
+    fi
+
+    # If an address cycles back to the grace address, keeping the same address as
+    # both current and previous is pointless and can hide a later transition.
+    grace_ip="$(jq -r --arg id "${router_id}" '.routers[$id].ip // empty' "${CANDIDATE_GRACE}")"
+    if [[ -n "${grace_ip}" && "${grace_ip}" == "${current_ip}" ]]; then
+        tmp="${CANDIDATE_GRACE}.tmp"
+        jq --arg id "${router_id}" 'del(.routers[$id])' "${CANDIDATE_GRACE}" >"${tmp}"
+        mv "${tmp}" "${CANDIDATE_GRACE}"
+    fi
+done
+
+GEN_GRACE_LOGICAL="${RIPH_STATE_DIR}/runtime/previous-ip-grace.candidate.$$.json"
+GEN_ALLOWLIST_LOGICAL="${RIPH_STATE_DIR}/runtime/generated-allowlist.candidate.$$.conf"
+GEN_ARGS=(
+    --root "${RIPH_ROOT}"
+    --config "${CONFIG_PATH}"
+    --static "${RIPH_CONFIG_DIR}/trusted-static.list"
+    --grace "${GEN_GRACE_LOGICAL}"
+    --output "${GEN_ALLOWLIST_LOGICAL}"
+    --now-epoch "${NOW_EPOCH}"
+)
+
+# The generator reads paths inside --root. Publish the grace candidate only in
+# the private runtime directory and use PID-qualified paths to avoid collisions.
+GEN_GRACE_VISIBLE="$(riph_root_path "${GEN_GRACE_LOGICAL}")"
+GEN_ALLOWLIST_VISIBLE="$(riph_root_path "${GEN_ALLOWLIST_LOGICAL}")"
+cp "${CANDIDATE_GRACE}" "${GEN_GRACE_VISIBLE}"
+trap 'rm -f "${GEN_GRACE_VISIBLE}" "${GEN_ALLOWLIST_VISIBLE}"; cleanup' EXIT
+"${GENERATOR}" "${GEN_ARGS[@]}" >/dev/null
+mv "${GEN_ALLOWLIST_VISIBLE}" "${CANDIDATE_ALLOWLIST}"
+rm -f "${GEN_GRACE_VISIBLE}"
+
+ALLOWLIST_SHA="$(riph_sha256_file "${CANDIDATE_ALLOWLIST}")"
+
+jq -n \
+    --arg applied_at "${NOW_ISO}" \
+    --arg reason "${REASON}" \
+    --arg sha "${ALLOWLIST_SHA}" \
+    --slurpfile current "${CURRENT_ROUTERS_JSON}" \
+    '{
+        "version": 1,
+        "applied_at": $applied_at,
+        "reason": $reason,
+        "allowlist_sha256": $sha,
+        "routers": $current[0].routers
+    }' >"${CANDIDATE_STATE}"
+
+allowlist_changed=1
+grace_changed=1
+state_semantic_changed=1
+
+[[ -f "${ALLOWLIST_FILE}" ]] && cmp -s "${ALLOWLIST_FILE}" "${CANDIDATE_ALLOWLIST}" && allowlist_changed=0
+[[ -f "${GRACE_FILE}" ]] && cmp -s "${GRACE_FILE}" "${CANDIDATE_GRACE}" && grace_changed=0
+
+if [[ -f "${LAST_STATE_FILE}" ]]; then
+    # Ignore applied_at/reason when deciding whether the state meaningfully changed.
+    if diff -q \
+        <(jq 'del(.applied_at,.reason)' "${LAST_STATE_FILE}") \
+        <(jq 'del(.applied_at,.reason)' "${CANDIDATE_STATE}") >/dev/null; then
+        state_semantic_changed=0
+    fi
+fi
+
+if (( allowlist_changed == 0 && grace_changed == 0 && state_semantic_changed == 0 )); then
+    riph_log "no effective trusted-set change; nothing to apply"
+    exit 0
+fi
+
+if (( DRY_RUN == 1 )); then
+    riph_log "dry-run: allowlist_changed=${allowlist_changed} grace_changed=${grace_changed} state_changed=${state_semantic_changed}"
+    if [[ -f "${ALLOWLIST_FILE}" ]]; then
+        diff -u "${ALLOWLIST_FILE}" "${CANDIDATE_ALLOWLIST}" || true
+    else
+        cat "${CANDIDATE_ALLOWLIST}"
+    fi
+    exit 0
+fi
+
+backup_id="$(date -u -d "@${NOW_EPOCH}" '+%Y%m%d-%H%M%S')-$$"
+BACKUP_DIR="${BACKUP_ROOT}/${backup_id}"
+mkdir -p "${BACKUP_DIR}"
+
+backup_one() {
+    local source="$1"
+    local name="$2"
+    if [[ -e "${source}" ]]; then
+        cp -a "${source}" "${BACKUP_DIR}/${name}"
+    else
+        : >"${BACKUP_DIR}/${name}.absent"
+    fi
+}
+
+backup_one "${ALLOWLIST_FILE}" "allowlist.conf"
+backup_one "${GRACE_FILE}" "previous-ip-grace.json"
+backup_one "${LAST_STATE_FILE}" "last-apply-state.json"
+
+jq -n \
+    --arg created_at "${NOW_ISO}" \
+    --arg reason "${REASON}" \
+    --argjson allowlist_changed "${allowlist_changed}" \
+    --argjson grace_changed "${grace_changed}" \
+    '{
+        "version": 1,
+        "created_at": $created_at,
+        "reason": $reason,
+        "allowlist_changed": ($allowlist_changed == 1),
+        "grace_changed": ($grace_changed == 1)
+    }' >"${BACKUP_DIR}/manifest.json"
+
+restore_one() {
+    local target="$1"
+    local name="$2"
+    if [[ -f "${BACKUP_DIR}/${name}.absent" ]]; then
+        rm -f "${target}"
+    else
+        mkdir -p "$(dirname "${target}")"
+        cp -a "${BACKUP_DIR}/${name}" "${target}"
+    fi
+}
+
+rollback_files() {
+    restore_one "${ALLOWLIST_FILE}" "allowlist.conf"
+    restore_one "${GRACE_FILE}" "previous-ip-grace.json"
+    restore_one "${LAST_STATE_FILE}" "last-apply-state.json"
+}
+
+atomic_install() {
+    local source="$1"
+    local target="$2"
+    local mode="$3"
+    local temp="${target}.riph-new.$$"
+    mkdir -p "$(dirname "${target}")"
+    install -m "${mode}" "${source}" "${temp}"
+    mv -f "${temp}" "${target}"
+}
+
+atomic_install "${CANDIDATE_ALLOWLIST}" "${ALLOWLIST_FILE}" 0644
+atomic_install "${CANDIDATE_GRACE}" "${GRACE_FILE}" 0600
+atomic_install "${CANDIDATE_STATE}" "${LAST_STATE_FILE}" 0600
+
+NGINX_BIN="${RIPH_NGINX_BIN:-nginx}"
+SYSTEMCTL_BIN="${RIPH_SYSTEMCTL_BIN:-systemctl}"
+
+if ! "${NGINX_BIN}" -t; then
+    riph_log "nginx validation failed; restoring previous files"
+    rollback_files
+    if ! "${NGINX_BIN}" -t; then
+        riph_log "WARNING: restored configuration also fails nginx -t"
+    fi
+    riph_die "apply aborted; previous files restored"
+fi
+
+if (( allowlist_changed == 1 )); then
+    if ! "${SYSTEMCTL_BIN}" reload nginx; then
+        riph_log "nginx reload failed; restoring previous files"
+        rollback_files
+        if "${NGINX_BIN}" -t; then
+            "${SYSTEMCTL_BIN}" reload nginx || \
+                riph_log "WARNING: failed to reload restored Nginx configuration"
+        else
+            riph_log "WARNING: restored configuration fails nginx -t"
+        fi
+        riph_die "apply failed during reload; previous files restored"
+    fi
+    riph_log "trusted-source allowlist applied and Nginx reloaded"
+else
+    riph_log "state updated; Nginx reload not required"
+fi
+
+riph_log "backup: ${BACKUP_DIR}"

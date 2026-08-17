@@ -1,0 +1,8 @@
+# Static trusted IPv4/CIDR entries.
+# Format:
+#   IPv4[/prefix] [# comment]
+#
+# Examples only. Replace with the actual trusted VPS/server addresses
+# before deployment.
+127.0.0.1/32          # localhost
+# 203.0.113.10/32     # trusted VPS
