@@ -48,6 +48,7 @@ It never resets UFW and never deletes unrelated rules by number.
 
 Testing:
   RIPH_UFW_BIN may point to a stub executable.
+  RIPH_UFW_LOCK may override the shared project UFW lock path.
 USAGE
 }
 
@@ -90,10 +91,18 @@ done
 riph_require_cmd jq
 riph_require_cmd awk
 riph_require_cmd sort
+riph_require_cmd flock
 
 CONFIG_FILE="$(riph_root_path "${CONFIG_PATH}")"
 riph_load_config "${CONFIG_FILE}"
 riph_prepare_dirs
+
+# Fail2ban and manual-deny are two writers to UFW. Use one shared lock so a
+# numbered Fail2ban unban cannot race a manual rule insertion/deletion.
+UFW_LOCK_FILE="${RIPH_UFW_LOCK:-$(riph_root_path /run/lock/riph-ufw.lock)}"
+mkdir -p "$(dirname "${UFW_LOCK_FILE}")"
+exec 8>"${UFW_LOCK_FILE}"
+flock -w 15 8 || riph_die "timed out waiting for RIPH UFW lock"
 
 NOW_EPOCH="$(riph_now_epoch)"
 STATIC_FILE="$(riph_root_path "${RIPH_CONFIG_DIR}/trusted-static.list")"
