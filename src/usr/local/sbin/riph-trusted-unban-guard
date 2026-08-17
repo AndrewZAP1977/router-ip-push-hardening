@@ -6,6 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMMON_DEFAULT="/usr/local/libexec/riph-common.sh"
 TRUSTED_DEFAULT="/usr/local/libexec/riph-trusted.sh"
 NET_DEFAULT="/usr/local/libexec/riph-net.sh"
+MANUAL_APPLY_DEFAULT="/usr/local/sbin/riph-apply-manual-deny"
 
 if [[ -f "${SCRIPT_DIR}/../libexec/riph-common.sh" ]]; then
     # Repository/test layout.
@@ -15,6 +16,7 @@ if [[ -f "${SCRIPT_DIR}/../libexec/riph-common.sh" ]]; then
     source "${SCRIPT_DIR}/../libexec/riph-trusted.sh"
     # shellcheck source=../libexec/riph-net.sh
     source "${SCRIPT_DIR}/../libexec/riph-net.sh"
+    MANUAL_APPLY="${SCRIPT_DIR}/riph-apply-manual-deny"
 else
     # Installed layout.
     # shellcheck source=/usr/local/libexec/riph-common.sh
@@ -23,6 +25,7 @@ else
     source "${TRUSTED_DEFAULT}"
     # shellcheck source=/usr/local/libexec/riph-net.sh
     source "${NET_DEFAULT}"
+    MANUAL_APPLY="${MANUAL_APPLY_DEFAULT}"
 fi
 
 RIPH_ROOT="/"
@@ -37,7 +40,7 @@ Usage: riph-trusted-unban-guard [options]
 Options:
   --root DIR          Test root prefix (/, /tmp/* or /var/tmp/*).
   --config PATH       Config path inside root.
-  --dry-run           Report trusted bans without changing Fail2ban.
+  --dry-run           Report trusted bans without changing Fail2ban/UFW.
   --now-epoch EPOCH   Override current UTC epoch for deterministic tests.
   -h, --help          Show this help.
 
@@ -143,6 +146,15 @@ check_manual_conflicts \
     "manual-deny-all" \
     "$(riph_root_path "${RIPH_CONFIG_DIR}/manual-deny-all.list")"
 
+# New manual deny entries are strict. The guard is the recovery path when the
+# effective trusted set changes later: it suppresses/removes only project-owned
+# overlapping UFW rules while leaving the source lists intact for review.
+manual_args=(--root "${RIPH_ROOT}" --config "${CONFIG_PATH}" --protect-trusted --now-epoch "${NOW_EPOCH}")
+if (( DRY_RUN == 1 )); then
+    manual_args+=(--dry-run)
+fi
+bash "${MANUAL_APPLY}" "${manual_args[@]}"
+
 FAIL2BAN_BIN="${RIPH_FAIL2BAN_CLIENT_BIN:-fail2ban-client}"
 JAILS="${RIPH_FAIL2BAN_JAILS:-nginx-stream-sni-reject nginx-stream-private-sni-abuse}"
 read -r -a JAIL_ARRAY <<<"${JAILS}"
@@ -180,7 +192,7 @@ printf '%s\ttrusted_unbanned=%d\tmanual_conflicts=%d\n' \
     >>"${LOG_DIR}/trusted-unban-guard.log"
 
 if (( MANUAL_CONFLICTS > 0 )); then
-    riph_die "manual deny list overlaps the effective trusted set"
+    riph_log "guard protected trusted set from ${MANUAL_CONFLICTS} manual-deny conflict(s)"
 fi
 
-riph_log "guard complete: trusted_unbanned=${UNBANNED}"
+riph_log "guard complete: trusted_unbanned=${UNBANNED} manual_conflicts=${MANUAL_CONFLICTS}"
