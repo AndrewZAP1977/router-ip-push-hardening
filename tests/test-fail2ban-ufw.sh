@@ -28,6 +28,7 @@ cat >"${STATE}" <<'EOF_STATE'
 [ 1] 443/tcp DENY IN 203.0.113.44 # riph-manual-443
 [ 2] 443/tcp DENY IN 203.0.113.44 # riph-f2b-nginx-stream-sni-reject
 [ 3] 443/tcp DENY IN 198.51.100.8 # riph-f2b-nginx-stream-sni-reject
+[ 4] 443/tcp DENY IN 1203.0.113.440 # riph-f2b-nginx-stream-sni-reject
 EOF_STATE
 
 "${HELPER}" unban nginx-stream-sni-reject 203.0.113.44
@@ -35,6 +36,7 @@ EOF_STATE
 grep -Fx -- '--force delete 2' "${CALLS}" >/dev/null || { echo 'FAIL: owned Fail2ban rule not deleted' >&2; exit 1; }
 ! grep -Fx -- '--force delete 1' "${CALLS}" >/dev/null || { echo 'FAIL: manual rule was deleted' >&2; exit 1; }
 ! grep -Fx -- '--force delete 3' "${CALLS}" >/dev/null || { echo 'FAIL: another IP rule was deleted' >&2; exit 1; }
+! grep -Fx -- '--force delete 4' "${CALLS}" >/dev/null || { echo 'FAIL: source substring was treated as exact IP' >&2; exit 1; }
 
 : >"${CALLS}"
 "${HELPER}" ban nginx-stream-sni-reject 203.0.113.44
