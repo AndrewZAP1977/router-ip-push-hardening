@@ -125,7 +125,6 @@ print_file_or_empty() {
 print_effective_trusted() {
     local tmp
     tmp="$(mktemp)"
-    trap 'rm -f "${tmp}"' RETURN
     riph_write_effective_trusted_entries "${tmp}" "${STATIC_FILE}" "${GRACE_FILE}" "$(date -u '+%s')"
     if [[ -s "${tmp}" ]]; then
         column -t -s $'\t' "${tmp}" 2>/dev/null || cat "${tmp}"
@@ -133,7 +132,6 @@ print_effective_trusted() {
         printf '%s\n' '(empty)'
     fi
     rm -f "${tmp}"
-    trap - RETURN
 }
 
 print_generated_file_state() {
@@ -374,11 +372,12 @@ ufw_status_cmd() {
 timers_cmd() {
     local unit enabled active
     [[ "${RIPH_ROOT}" == "/" ]] || { printf '%s\n' 'systemd status is available only on production root.'; return 0; }
-    for unit in riph-router-ip.path riph-reconcile.timer riph-guard.timer; do
+    for unit in riph-router-ip.path riph-reconcile.timer; do
         enabled="$(systemctl is-enabled "${unit}" 2>/dev/null || true)"
         active="$(systemctl is-active "${unit}" 2>/dev/null || true)"
         printf '  %-24s enabled=%-10s active=%s\n' "${unit}" "${enabled:-unknown}" "${active:-unknown}"
     done
+    printf '  %-24s %s\n' 'trusted guard:' 'runs inside each reconcile and can also be run manually'
 }
 
 guard_log_cmd() {
