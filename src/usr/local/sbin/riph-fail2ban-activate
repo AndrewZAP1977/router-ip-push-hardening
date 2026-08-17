@@ -1,0 +1,161 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+COMMON_DEFAULT="/usr/local/libexec/riph-common.sh"
+if [[ -f "${SCRIPT_DIR}/../libexec/riph-common.sh" ]]; then
+    # shellcheck source=../libexec/riph-common.sh
+    source "${SCRIPT_DIR}/../libexec/riph-common.sh"
+else
+    # shellcheck source=/usr/local/libexec/riph-common.sh
+    source "${COMMON_DEFAULT}"
+fi
+
+RIPH_ROOT="/"
+CONFIG_PATH="/etc/router-ip-push-hardening/config.env"
+DRY_RUN=0
+
+usage() {
+    cat <<'USAGE'
+Usage: riph-fail2ban-activate [options]
+
+Safely enables only the two RIPH Fail2ban jails. The legacy Hexabyte
+nginx-stream-sni-reject jail is deliberately left active and untouched.
+
+Options:
+  --root DIR       Test root prefix.
+  --config PATH    Config path inside root.
+  --dry-run        Validate and report without changing jail files/reloading.
+  -h, --help       Show this help.
+USAGE
+}
+
+while (($#)); do
+    case "$1" in
+        --root)
+            (($# >= 2)) || riph_die "--root requires a value"
+            RIPH_ROOT="$(riph_validate_root "$2")"
+            shift 2
+            ;;
+        --config)
+            (($# >= 2)) || riph_die "--config requires a value"
+            CONFIG_PATH="$2"
+            shift 2
+            ;;
+        --dry-run)
+            DRY_RUN=1
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            riph_die "unknown argument: $1"
+            ;;
+    esac
+done
+
+CONFIG_FILE="$(riph_root_path "${CONFIG_PATH}")"
+riph_load_config "${CONFIG_FILE}"
+riph_prepare_dirs
+
+JAIL_REJECT="$(riph_root_path /etc/fail2ban/jail.d/riph-nginx-stream-sni-reject.local)"
+JAIL_PRIVATE="$(riph_root_path /etc/fail2ban/jail.d/riph-nginx-stream-private-sni-abuse.local)"
+AUDIT_LOG="$(riph_root_path "${STREAM_AUDIT_LOG:-/var/log/nginx/riph-stream-sni.log}")"
+BACKUP_ROOT="$(riph_root_path "${RIPH_STATE_DIR}/backups")"
+BACKUP_ID="fail2ban-activate-$(date -u '+%Y%m%d-%H%M%S')-$$"
+BACKUP_DIR="${BACKUP_ROOT}/${BACKUP_ID}"
+
+for file in "${JAIL_REJECT}" "${JAIL_PRIVATE}"; do
+    [[ -f "${file}" ]] || riph_die "RIPH jail file missing: ${file}"
+    grep -Eq '^enabled[[:space:]]*=[[:space:]]*(false|true)[[:space:]]*$' "${file}" \
+        || riph_die "enabled flag missing/invalid in ${file}"
+done
+
+[[ -e "${AUDIT_LOG}" ]] || riph_die "RIPH audit log does not exist yet: ${AUDIT_LOG}; validate Nginx routing first"
+
+F2B_BIN="${RIPH_FAIL2BAN_CLIENT_BIN:-fail2ban-client}"
+GUARD_BIN="${RIPH_GUARD_BIN:-${SCRIPT_DIR}/riph-trusted-unban-guard}"
+if [[ "${RIPH_ROOT}" == "/" ]]; then
+    riph_require_cmd "${F2B_BIN}"
+else
+    [[ -x "${F2B_BIN}" || "${F2B_BIN}" == */* ]] || true
+fi
+
+legacy_bans() {
+    if "${F2B_BIN}" status nginx-stream-sni-reject >/dev/null 2>&1; then
+        "${F2B_BIN}" get nginx-stream-sni-reject banip 2>/dev/null || true
+    fi
+}
+
+if [[ "${RIPH_ROOT}" == "/" ]]; then
+    "${F2B_BIN}" -t
+fi
+LEGACY_BEFORE="$(legacy_bans | tr '\n' ' ' | xargs 2>/dev/null || true)"
+
+if (( DRY_RUN == 1 )); then
+    riph_log "dry-run: would enable riph-nginx-stream-sni-reject"
+    riph_log "dry-run: would enable riph-nginx-stream-private-sni-abuse"
+    riph_log "legacy jail would remain untouched; current bans: ${LEGACY_BEFORE:-none}"
+    exit 0
+fi
+
+mkdir -p "${BACKUP_DIR}"
+cp -a "${JAIL_REJECT}" "${BACKUP_DIR}/"
+cp -a "${JAIL_PRIVATE}" "${BACKUP_DIR}/"
+
+set_enabled_true() {
+    local file="$1" tmp
+    tmp="${file}.riph-activate.$$"
+    awk '
+        BEGIN {done=0}
+        /^enabled[[:space:]]*=/ && done==0 {print "enabled = true"; done=1; next}
+        {print}
+        END {if (done==0) exit 2}
+    ' "${file}" >"${tmp}"
+    install -m 0644 "${tmp}" "${file}"
+    rm -f "${tmp}"
+}
+
+restore_jails() {
+    cp -a "${BACKUP_DIR}/$(basename "${JAIL_REJECT}")" "${JAIL_REJECT}" || true
+    cp -a "${BACKUP_DIR}/$(basename "${JAIL_PRIVATE}")" "${JAIL_PRIVATE}" || true
+}
+
+on_error() {
+    local rc=$?
+    trap - ERR
+    riph_log "activation failed; restoring disabled RIPH jail files"
+    restore_jails
+    if [[ "${RIPH_ROOT}" == "/" ]]; then
+        "${F2B_BIN}" -t >/dev/null 2>&1 || true
+        "${F2B_BIN}" reload >/dev/null 2>&1 || true
+    fi
+    exit "${rc}"
+}
+trap on_error ERR
+
+set_enabled_true "${JAIL_REJECT}"
+set_enabled_true "${JAIL_PRIVATE}"
+
+if [[ "${RIPH_ROOT}" == "/" ]]; then
+    "${F2B_BIN}" -t
+    "${F2B_BIN}" reload
+    "${F2B_BIN}" status riph-nginx-stream-sni-reject >/dev/null
+    "${F2B_BIN}" status riph-nginx-stream-private-sni-abuse >/dev/null
+
+    LEGACY_AFTER="$(legacy_bans | tr '\n' ' ' | xargs 2>/dev/null || true)"
+    if [[ "${LEGACY_AFTER}" != "${LEGACY_BEFORE}" ]]; then
+        riph_die "legacy ban list changed during RIPH activation: before='${LEGACY_BEFORE:-none}' after='${LEGACY_AFTER:-none}'"
+    fi
+fi
+
+if [[ -f "${GUARD_BIN}" || -x "${GUARD_BIN}" ]]; then
+    bash "${GUARD_BIN}" --root "${RIPH_ROOT}" --config "${CONFIG_PATH}"
+fi
+
+trap - ERR
+riph_log "RIPH Fail2ban jails activated; legacy jail remains active"
+riph_log "activation backup: ${BACKUP_DIR}"
