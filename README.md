@@ -18,13 +18,15 @@ Implemented on `agent/core-apply-v1`:
   - private SNI + trusted IP -> Xray;
   - private SNI + untrusted IP -> PROXY-protocol bridge -> fake site;
   - unknown / empty / IP-SNI -> reject upstream;
-- stable Nginx stream audit log on the external `:443` server only;
+- dedicated route-aware audit log `/var/log/nginx/riph-stream-sni.log` on external `:443` only;
+- staged legacy audit compatibility so the existing `/var/log/nginx/stream-sni.log` jail can remain active during migration;
 - transactional `riph-apply` with `flock`, backup, `nginx -t`, reload gating and rollback;
 - Router IP change detection via `systemd.path`;
 - 5-minute reconcile for grace expiry and trusted-unban protection;
-- two Fail2ban jails:
-  - reject: 3 attempts / 5 minutes / 8 hour ban;
-  - private-SNI abuse: 3 attempts / 2 minutes / 12 hour ban;
+- isolated RIPH Fail2ban jails:
+  - `riph-nginx-stream-sni-reject`: 3 attempts / 5 minutes / 8 hour ban;
+  - `riph-nginx-stream-private-sni-abuse`: 3 attempts / 2 minutes / 12 hour ban;
+- RIPH Fail2ban files install disabled and are activated only in the controlled Fail2ban phase;
 - automatic Fail2ban bans scoped to TCP/443 only;
 - dynamic Fail2ban `ignorecommand` with emergency Router-IP/last-known-good fast paths;
 - Fail2ban UFW helper that owns rules by exact `riph-f2b-<jail>` marker;
@@ -54,18 +56,25 @@ v1 must not modify:
 Automatic bans never block all ports. The automatic Fail2ban action affects only
 TCP/443 so Router IP Push over SSH can still report a changed home address.
 
-## Current state
+## Current Hexabyte migration state
 
-The implementation is **pre-production**. It has not yet been installed by this
-repository on Hexabyte. Real `/` installation remains blocked by a development
-safety gate until the controlled VPS test is performed.
+Read-only preflight confirmed the manually tested routing topology and also found
+existing legacy security components:
 
-The next production step is **read-only preflight only**. See:
+- `/etc/nginx/stream-enabled/00-sni-watch.conf`;
+- legacy log `/var/log/nginx/stream-sni.log`;
+- active legacy jail `nginx-stream-sni-reject`;
+- five existing manual UFW 443 denies.
 
-- `tools/preflight-report.sh`
-- `docs/HEXABYTE_TEST_PLAN.md`
+RIPH v1 deliberately does **not** overwrite those names. During the first controlled
+routing test, the external `:443` server writes both the legacy audit log and the new
+RIPH route-aware log. The legacy jail remains active until the explicit handover
+phase.
 
-Do not bypass the production gate merely to make the installer run.
+See `docs/HEXABYTE_LEGACY_MIGRATION.md`.
+
+The implementation is still **pre-production**. Real `/` installation remains
+blocked by a development safety gate until the remaining migration gates are passed.
 
 ## Local validation
 
@@ -115,4 +124,5 @@ sources are derived from:
 2. `/var/lib/router-ip-push/ips/<ROUTER_ID>.ipv4`;
 3. non-expired entries in `/etc/router-ip-push-hardening/previous-ip-grace.json`.
 
-See `docs/ARCHITECTURE.md` for the transaction model and safety invariants.
+See `docs/ARCHITECTURE.md`, `docs/HEXABYTE_TEST_PLAN.md` and
+`docs/HEXABYTE_LEGACY_MIGRATION.md`.
