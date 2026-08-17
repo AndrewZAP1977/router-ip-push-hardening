@@ -20,9 +20,13 @@ Options:
   --root DIR          Pass test root to apply and guard.
   --config PATH       Config path inside root.
   --reason TEXT       Human-readable apply reason.
-  --dry-run           Do not mutate Nginx or Fail2ban.
+  --dry-run           Do not mutate Nginx or Fail2ban/UFW.
   --now-epoch EPOCH   Deterministic test time.
   -h, --help          Show this help.
+
+A successful trusted/Nginx apply is never rolled back merely because the
+post-apply guard cleanup is temporarily unavailable. Guard failures are logged and
+retried by the next reconcile; run `riph-admin guard` for a strict manual check.
 USAGE
 }
 
@@ -79,5 +83,12 @@ if (( DRY_RUN == 1 )); then
     guard_args+=(--dry-run)
 fi
 
+# Trust/routing is the primary safety state. If it cannot be applied, fail hard.
 bash "${APPLY}" "${apply_args[@]}"
-bash "${GUARD}" "${guard_args[@]}"
+
+# Cleanup is secondary and retryable. Rolling back a freshly accepted Router IP
+# because Fail2ban/UFW cleanup is temporarily unavailable would be less safe than
+# keeping the new trusted state and retrying the guard on the next reconcile.
+if ! bash "${GUARD}" "${guard_args[@]}"; then
+    printf '[riph] WARNING: trusted state applied, but guard cleanup failed; will retry on next reconcile\n' >&2
+fi
