@@ -17,10 +17,10 @@ cat >"${T}/stream.log" <<'LOG'
 2026-08-17T14:00:04+00:00 src=198.51.100.7 route=www sni=nukla.layerupzap.ru upstream=127.0.0.1:7443 status=200 session=0.300
 LOG
 
-reject_out="$(fail2ban-regex "${T}/stream.log" "${ROOT}/src/etc/fail2ban/filter.d/nginx-stream-sni-reject.conf" --usedns=no -o ip | sort -u)"
+reject_out="$(fail2ban-regex "${T}/stream.log" "${ROOT}/src/etc/fail2ban/filter.d/riph-nginx-stream-sni-reject.conf" --usedns=no -o ip | sort -u)"
 [[ "${reject_out}" == '203.0.113.10' ]] || { echo "FAIL: reject filter output: ${reject_out}" >&2; exit 1; }
 
-private_out="$(fail2ban-regex "${T}/stream.log" "${ROOT}/src/etc/fail2ban/filter.d/nginx-stream-private-sni-abuse.conf" --usedns=no -o ip | sort -u)"
+private_out="$(fail2ban-regex "${T}/stream.log" "${ROOT}/src/etc/fail2ban/filter.d/riph-nginx-stream-private-sni-abuse.conf" --usedns=no -o ip | sort -u)"
 expected=$'203.0.113.11\n203.0.113.12'
 [[ "${private_out}" == "${expected}" ]] || { echo "FAIL: private filter output: ${private_out}" >&2; exit 1; }
 
