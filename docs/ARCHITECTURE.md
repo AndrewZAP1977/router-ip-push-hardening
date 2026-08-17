@@ -56,20 +56,22 @@ unknown / empty / IP-SNI
 
 ## Stable stream audit log
 
-The generated stream config owns a stable machine-readable log:
+The generated stream config owns a stable machine-readable log on the **external
+`:443` server only**:
 
 ```text
 /var/log/nginx/stream-sni.log
 ```
 
+Internal bridge sessions on 9543/9544 do not enter this audit log.
+
 Fields include:
 
 ```text
-time src=<remote IPv4> route=<final route> sni=<SNI> upstream=<addr> status=<status> session=<seconds>
+time src=<remote address> route=<final route> sni=<SNI> upstream=<addr> status=<status> session=<seconds>
 ```
 
-The important security field is the **final route**, not a regex guess about the
-original SNI:
+The important security field is the final route:
 
 - `route=reject` -> unknown/empty/IP-SNI path;
 - `route=fake_N` -> private SNI from an untrusted source;
@@ -95,10 +97,6 @@ original SNI:
 13. restore/reload the known-good backup if reload fails;
 14. record the successful state.
 
-The candidate include files must be visible at the real Nginx include path for a
-real `nginx -t`; therefore they are installed atomically before validation but do
-not become active until a successful reload. Failure restores the previous files.
-
 ## Router-IP change and periodic reconcile
 
 The existing Router IP Push receiver writes the `.ipv4` file only when the source
@@ -115,11 +113,11 @@ Router IP changes
 
 A separate `riph-reconcile.timer` runs every 5 minutes. It performs both periodic
 grace expiry and the trusted-unban guard. There is deliberately no second periodic
-guard timer because that would duplicate the same work.
+guard timer.
 
 ## Fail2ban policy
 
-Two project jails consume the controlled stream audit log:
+Two project jails consume the controlled stream audit log.
 
 ### `nginx-stream-sni-reject`
 
@@ -137,9 +135,31 @@ Two project jails consume the controlled stream audit log:
 - `bantime = 12h`;
 - action scope: TCP/443 only.
 
-Both jails use `riph-fail2ban-ignore <ip>` before banning. The helper computes the
-current effective trusted set dynamically, so current Router IP, grace IP and static
-trusted ranges are protected even before the periodic guard runs.
+Both jails use `riph-fail2ban-ignore <ip>` before banning. The helper protects trusted
+sources in three stages:
+
+1. current Router IP Push `.ipv4` files, before hardening config is parsed;
+2. last-known-good generated Nginx allowlist;
+3. normal computed effective trusted set (static + current + valid grace).
+
+This closes the short new-IP/reconcile race and protects the current trusted state
+if `config.env` is temporarily malformed.
+
+### Fail2ban UFW ownership
+
+Fail2ban uses `riph-fail2ban-ufw` rather than a generic unowned UFW delete command.
+The helper:
+
+- validates jail/address syntax;
+- creates only TCP/443 rules;
+- labels them `riph-f2b-<jail>`;
+- identifies an existing rule by exact source token + exact marker;
+- deletes only its own numbered rule(s), in descending order;
+- treats repeated bans idempotently;
+- shares one UFW mutation lock with manual-deny.
+
+Therefore a Fail2ban unban does not intentionally remove a separate
+`riph-manual-443` rule for the same source.
 
 Automatic whole-IP/all-port bans are outside v1.
 
@@ -152,6 +172,7 @@ Source lists:
 
 `riph-apply-manual-deny` owns only UFW rules recorded in its own applied-state file.
 It does not run `ufw reset` and does not delete unrelated rules by number.
+Manual-deny and Fail2ban UFW mutations are serialized by the shared project UFW lock.
 
 Normal edits are strict: a deny CIDR that overlaps the effective trusted set is
 rejected before UFW is changed.
@@ -177,10 +198,15 @@ A selected backup is restored, `nginx -t` is executed, and Nginx is reloaded. If
 restored backup fails validation or reload, the rollback operation restores its own
 safety snapshot.
 
-The installer separately creates a pre-install snapshot of installed project files
-and restores it automatically if installation fails. Manual restoration of a full
-pre-install snapshot is intentionally deferred until the first read-only Hexabyte
-preflight establishes the exact pre-existing server state.
+The installer separately creates a pre-install snapshot of every installed project
+file **plus the three Nginx runtime files** (allowlist, stream config and bridge
+config). If a later install phase such as Fail2ban validation/restart fails after
+Nginx apply, the installer restores the complete pre-install Nginx state before
+reloading restored services.
+
+Manual restoration of a full pre-install snapshot is intentionally deferred until
+the first read-only Hexabyte preflight establishes the exact pre-existing server
+state.
 
 ## Admin surface
 
@@ -202,5 +228,5 @@ It exposes:
 
 The branch remains pre-production. Real `/` installation is blocked by `install.sh`
 unless the explicit controlled-test environment variable is supplied. The gate must
-remain in place until the read-only Hexabyte preflight and planned test sequence are
-completed.
+remain in place until the read-only Hexabyte preflight and planned test sequence in
+`docs/HEXABYTE_TEST_PLAN.md` are completed.
