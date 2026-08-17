@@ -34,6 +34,7 @@ export RIPH_SYSTEMCTL_BIN="${T1}/usr/local/bin/systemctl-stub"
 [[ -x "${T1}/usr/local/sbin/riph-admin" ]] || fail 'admin not installed'
 [[ -x "${T1}/usr/local/sbin/riph-harvest" ]] || fail 'harvest not installed'
 [[ -x "${T1}/usr/local/sbin/riph-fail2ban-ignore" ]] || fail 'fail2ban ignore helper not installed'
+[[ -x "${T1}/usr/local/sbin/riph-fail2ban-ufw" ]] || fail 'fail2ban UFW helper not installed'
 [[ -f "${T1}/etc/fail2ban/jail.d/nginx-stream-sni-reject.local" ]] || fail 'reject jail not installed'
 [[ -f "${T1}/etc/fail2ban/action.d/riph-ufw-443.conf" ]] || fail 'fail2ban action not installed'
 [[ -f "${T1}/etc/systemd/system/riph-router-ip.path" ]] || fail 'router IP path unit not installed'
