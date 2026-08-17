@@ -116,6 +116,11 @@ printf '%s\n' "${PUBLIC_SNI}" >"${TMP_NAMES}"
 {
     printf '# Managed by router-ip-push-hardening. DO NOT EDIT.\n'
     printf '# Private SNI routing: trusted -> Xray, untrusted -> fake site.\n\n'
+    cat <<'EOF_LOG_FORMAT'
+log_format riph_stream_sni '$time_iso8601 src=$remote_addr route=$sni_name sni=$ssl_preread_server_name upstream=$upstream_addr status=$status session=$session_time';
+access_log /var/log/nginx/stream-sni.log riph_stream_sni;
+
+EOF_LOG_FORMAT
     printf 'map "$ssl_preread_server_name|$router_ip_push_source_allowed" $sni_name\n'
     printf '{\n'
     printf '        %-40s www;\n' "${PUBLIC_SNI}|0"
