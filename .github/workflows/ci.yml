@@ -21,26 +21,5 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y jq shellcheck fail2ban
 
-      - name: Bash syntax
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          while IFS= read -r -d '' file; do
-            bash -n "$file"
-          done < <(find src tests -type f \( -name '*.sh' -o -path '*/sbin/*' \) -print0)
-
-      - name: ShellCheck
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          mapfile -d '' files < <(find src tests -type f \( -name '*.sh' -o -path '*/sbin/*' \) -print0)
-          shellcheck "${files[@]}"
-
-      - name: Regression tests
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          for test_script in tests/test-*.sh; do
-            echo "==> ${test_script}"
-            bash "${test_script}"
-          done
+      - name: Local regression suite
+        run: bash tests/run-local.sh
