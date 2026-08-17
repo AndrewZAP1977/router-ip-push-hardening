@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+GUARD="${ROOT}/src/usr/local/sbin/riph-trusted-unban-guard"
+T="$(mktemp -d /tmp/riph-guard.XXXXXX)"
+trap 'rm -rf "${T}"' EXIT
+
+mkdir -p "${T}/etc/router-ip-push-hardening" "${T}/var/lib/router-ip-push/ips" "${T}/usr/local/bin"
+cp "${ROOT}/config/config.env.example" "${T}/etc/router-ip-push-hardening/config.env"
+printf '%s\n' '127.0.0.1/32 # localhost' >"${T}/etc/router-ip-push-hardening/trusted-static.list"
+printf '%s\n' '{"version":1,"routers":{}}' >"${T}/etc/router-ip-push-hardening/previous-ip-grace.json"
+printf '%s\n' '78.111.155.187' >"${T}/var/lib/router-ip-push/ips/AX3200.ipv4"
+: >"${T}/etc/router-ip-push-hardening/manual-deny-443.list"
+: >"${T}/etc/router-ip-push-hardening/manual-deny-all.list"
+
+LOG="${T}/f2b.log"
+cat >"${T}/usr/local/bin/f2b-stub" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == status ]]; then
+    printf '%s\n' 'Banned IP list: 78.111.155.187 203.0.113.9'
+else
+    printf '%s\n' "$*" >>"${RIPH_TEST_F2B_LOG:?}"
+fi
+EOF
+chmod +x "${T}/usr/local/bin/f2b-stub"
+export RIPH_FAIL2BAN_CLIENT_BIN="${T}/usr/local/bin/f2b-stub"
+export RIPH_TEST_F2B_LOG="${LOG}"
+
+"${GUARD}" --root "${T}" --now-epoch 1000
+grep -F 'set nginx-stream-sni-reject unbanip 78.111.155.187' "${LOG}" >/dev/null
+grep -F 'set nginx-stream-private-sni-abuse unbanip 78.111.155.187' "${LOG}" >/dev/null
+! grep -F '203.0.113.9' "${LOG}" >/dev/null
+
+printf '%s\n' '78.111.0.0/16 # trusted overlap' >"${T}/etc/router-ip-push-hardening/manual-deny-443.list"
+if "${GUARD}" --root "${T}" --dry-run --now-epoch 1000; then
+    echo 'FAIL: guard accepted trusted/manual-deny overlap' >&2
+    exit 1
+fi
+
+echo 'PASS: guard tests'
