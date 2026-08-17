@@ -32,10 +32,9 @@ grep -F 'set nginx-stream-sni-reject unbanip 78.111.155.187' "${LOG}" >/dev/null
 grep -F 'set nginx-stream-private-sni-abuse unbanip 78.111.155.187' "${LOG}" >/dev/null
 ! grep -F '203.0.113.9' "${LOG}" >/dev/null
 
+# A later trusted-set change may overlap an older manual rule. Guard recovery
+# suppresses project-owned conflicting UFW state instead of failing the timer.
 printf '%s\n' '78.111.0.0/16 # trusted overlap' >"${T}/etc/router-ip-push-hardening/manual-deny-443.list"
-if "${GUARD}" --root "${T}" --dry-run --now-epoch 1000; then
-    echo 'FAIL: guard accepted trusted/manual-deny overlap' >&2
-    exit 1
-fi
+"${GUARD}" --root "${T}" --dry-run --now-epoch 1000
 
 echo 'PASS: guard tests'
