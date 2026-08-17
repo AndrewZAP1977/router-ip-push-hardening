@@ -93,7 +93,6 @@ for required in \
     src/usr/local/sbin/riph-fail2ban-ignore \
     src/usr/local/sbin/riph-trusted-unban-guard \
     src/usr/local/sbin/riph-reconcile \
-    src/usr/local/sbin/riph-router-ip-updated \
     src/usr/local/sbin/riph-rollback \
     src/usr/local/sbin/riph-harvest \
     src/usr/local/sbin/riph-admin \
@@ -174,7 +173,6 @@ mapfile -t FILE_SPECS <<'EOF_SPECS'
 /usr/local/sbin/riph-fail2ban-ignore|src/usr/local/sbin/riph-fail2ban-ignore|0755|replace
 /usr/local/sbin/riph-trusted-unban-guard|src/usr/local/sbin/riph-trusted-unban-guard|0755|replace
 /usr/local/sbin/riph-reconcile|src/usr/local/sbin/riph-reconcile|0755|replace
-/usr/local/sbin/riph-router-ip-updated|src/usr/local/sbin/riph-router-ip-updated|0755|replace
 /usr/local/sbin/riph-rollback|src/usr/local/sbin/riph-rollback|0755|replace
 /usr/local/sbin/riph-harvest|src/usr/local/sbin/riph-harvest|0755|replace
 /usr/local/sbin/riph-admin|src/usr/local/sbin/riph-admin|0755|replace
