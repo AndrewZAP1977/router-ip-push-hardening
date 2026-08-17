@@ -39,5 +39,11 @@ jobs:
           mapfile -d '' files < <(find src tests -type f \( -name '*.sh' -o -path '*/sbin/*' \) -print0)
           shellcheck "${files[@]}"
 
-      - name: Core regression tests
-        run: bash tests/test-core.sh
+      - name: Regression tests
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          for test_script in tests/test-*.sh; do
+            echo "==> ${test_script}"
+            bash "${test_script}"
+          done
