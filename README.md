@@ -18,7 +18,7 @@ Implemented on `agent/core-apply-v1`:
   - private SNI + trusted IP -> Xray;
   - private SNI + untrusted IP -> PROXY-protocol bridge -> fake site;
   - unknown / empty / IP-SNI -> reject upstream;
-- stable Nginx stream audit log at `/var/log/nginx/stream-sni.log`;
+- stable Nginx stream audit log on the external `:443` server only;
 - transactional `riph-apply` with `flock`, backup, `nginx -t`, reload gating and rollback;
 - Router IP change detection via `systemd.path`;
 - 5-minute reconcile for grace expiry and trusted-unban protection;
@@ -26,15 +26,18 @@ Implemented on `agent/core-apply-v1`:
   - reject: 3 attempts / 5 minutes / 8 hour ban;
   - private-SNI abuse: 3 attempts / 2 minutes / 12 hour ban;
 - automatic Fail2ban bans scoped to TCP/443 only;
-- dynamic Fail2ban `ignorecommand` using the effective trusted set;
+- dynamic Fail2ban `ignorecommand` with emergency Router-IP/last-known-good fast paths;
+- Fail2ban UFW helper that owns rules by exact `riph-f2b-<jail>` marker;
 - trusted-unban guard for project Fail2ban bans and project-owned manual UFW rules;
 - manual deny 443 and explicit manual deny all-ports lists;
+- one shared UFW mutation lock across Fail2ban and manual-deny writers;
 - CIDR overlap protection against banning a trusted source;
 - stream-log harvest/checkpoint statistics;
 - interactive and command-mode `riph-admin`;
 - runtime rollback with a pre-rollback safety snapshot;
-- installer with preflight, pre-install backup and automatic restore on installation failure;
-- deterministic `/tmp` test-root support.
+- installer with preflight, project-file backup, Nginx runtime snapshot and automatic restore on installation failure;
+- deterministic `/tmp` test-root support;
+- read-only Hexabyte preflight report and gated controlled validation plan.
 
 ## Safety boundary
 
@@ -57,9 +60,12 @@ The implementation is **pre-production**. It has not yet been installed by this
 repository on Hexabyte. Real `/` installation remains blocked by a development
 safety gate until the controlled VPS test is performed.
 
-The next production step is read-only preflight and comparison with the current
-manually tested Hexabyte configuration. Do not bypass the production gate merely
-to make the installer run.
+The next production step is **read-only preflight only**. See:
+
+- `tools/preflight-report.sh`
+- `docs/HEXABYTE_TEST_PLAN.md`
+
+Do not bypass the production gate merely to make the installer run.
 
 ## Local validation
 
@@ -74,7 +80,7 @@ bash tests/run-local.sh
 
 It performs:
 
-1. `bash -n` over shell sources;
+1. `bash -n` over installer/source/tests/tools;
 2. ShellCheck when installed;
 3. all `tests/test-*.sh` regression tests.
 
