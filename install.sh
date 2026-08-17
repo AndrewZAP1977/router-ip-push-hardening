@@ -92,6 +92,8 @@ for required in \
     src/usr/local/sbin/riph-apply-manual-deny \
     src/usr/local/sbin/riph-fail2ban-ignore \
     src/usr/local/sbin/riph-fail2ban-ufw \
+    src/usr/local/sbin/riph-fail2ban-activate \
+    src/usr/local/sbin/riph-legacy-handover \
     src/usr/local/sbin/riph-trusted-unban-guard \
     src/usr/local/sbin/riph-reconcile \
     src/usr/local/sbin/riph-rollback \
@@ -184,6 +186,8 @@ mapfile -t FILE_SPECS <<'EOF_SPECS'
 /usr/local/sbin/riph-apply-manual-deny|src/usr/local/sbin/riph-apply-manual-deny|0755|replace
 /usr/local/sbin/riph-fail2ban-ignore|src/usr/local/sbin/riph-fail2ban-ignore|0755|replace
 /usr/local/sbin/riph-fail2ban-ufw|src/usr/local/sbin/riph-fail2ban-ufw|0755|replace
+/usr/local/sbin/riph-fail2ban-activate|src/usr/local/sbin/riph-fail2ban-activate|0755|replace
+/usr/local/sbin/riph-legacy-handover|src/usr/local/sbin/riph-legacy-handover|0755|replace
 /usr/local/sbin/riph-trusted-unban-guard|src/usr/local/sbin/riph-trusted-unban-guard|0755|replace
 /usr/local/sbin/riph-reconcile|src/usr/local/sbin/riph-reconcile|0755|replace
 /usr/local/sbin/riph-rollback|src/usr/local/sbin/riph-rollback|0755|replace
