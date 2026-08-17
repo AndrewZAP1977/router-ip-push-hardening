@@ -1,0 +1,234 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+COMMON_DEFAULT="/usr/local/libexec/riph-common.sh"
+if [[ -f "${SCRIPT_DIR}/../libexec/riph-common.sh" ]]; then
+    # shellcheck source=../libexec/riph-common.sh
+    source "${SCRIPT_DIR}/../libexec/riph-common.sh"
+else
+    # shellcheck source=/usr/local/libexec/riph-common.sh
+    source "${COMMON_DEFAULT}"
+fi
+
+RIPH_ROOT="/"
+CONFIG_PATH="/etc/router-ip-push-hardening/config.env"
+COMMAND="status"
+DRY_RUN=0
+
+usage() {
+    cat <<'USAGE'
+Usage: riph-legacy-handover [options] [status|quiesce|retire]
+
+status   Show overlap state. Read-only.
+quiesce  Stop feeding new external :443 events to the legacy stream log while
+         leaving the legacy jail/config active so existing 6h bans expire naturally.
+retire   Remove legacy 00-sni-watch.conf and legacy jail config from active include
+         paths. Refuses to run until both RIPH jails are active and legacy ban list is empty.
+
+Options:
+  --root DIR       Test root prefix.
+  --config PATH    Config path inside root.
+  --dry-run        Show intended mutations without applying them.
+  -h, --help       Show this help.
+USAGE
+}
+
+while (($#)); do
+    case "$1" in
+        --root)
+            (($# >= 2)) || riph_die "--root requires a value"
+            RIPH_ROOT="$(riph_validate_root "$2")"
+            shift 2
+            ;;
+        --config)
+            (($# >= 2)) || riph_die "--config requires a value"
+            CONFIG_PATH="$2"
+            shift 2
+            ;;
+        --dry-run)
+            DRY_RUN=1
+            shift
+            ;;
+        status|quiesce|retire)
+            COMMAND="$1"
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            riph_die "unknown argument: $1"
+            ;;
+    esac
+done
+
+CONFIG_FILE="$(riph_root_path "${CONFIG_PATH}")"
+riph_load_config "${CONFIG_FILE}"
+riph_prepare_dirs
+
+LEGACY_WATCH="$(riph_root_path /etc/nginx/stream-enabled/00-sni-watch.conf)"
+LEGACY_JAIL_FILE="$(riph_root_path /etc/fail2ban/jail.d/nginx-stream-sni-reject.local)"
+STREAM_FILE="$(riph_root_path "${STREAM_OUTPUT:-/etc/nginx/stream-enabled/stream.conf}")"
+BACKUP_ROOT="$(riph_root_path "${RIPH_STATE_DIR}/backups")"
+RETIRE_ROOT="$(riph_root_path "${RIPH_STATE_DIR}/runtime/legacy-retired")"
+APPLY_BIN="${RIPH_APPLY_BIN:-${SCRIPT_DIR}/riph-apply}"
+F2B_BIN="${RIPH_FAIL2BAN_CLIENT_BIN:-fail2ban-client}"
+NGINX_BIN="${RIPH_NGINX_BIN:-nginx}"
+SYSTEMCTL_BIN="${RIPH_SYSTEMCTL_BIN:-systemctl}"
+LEGACY_JAIL="nginx-stream-sni-reject"
+RIPH_JAIL_1="riph-nginx-stream-sni-reject"
+RIPH_JAIL_2="riph-nginx-stream-private-sni-abuse"
+
+jail_active() {
+    "${F2B_BIN}" status "$1" >/dev/null 2>&1
+}
+
+legacy_bans() {
+    if jail_active "${LEGACY_JAIL}"; then
+        "${F2B_BIN}" get "${LEGACY_JAIL}" banip 2>/dev/null || true
+    fi
+}
+
+compat_value() {
+    local value="${LEGACY_STREAM_AUDIT_COMPAT:-0}"
+    [[ "${value}" == 0 || "${value}" == 1 ]] || riph_die "LEGACY_STREAM_AUDIT_COMPAT must be 0 or 1"
+    printf '%s\n' "${value}"
+}
+
+print_status() {
+    local bans
+    bans="$(legacy_bans | tr '\n' ' ' | xargs 2>/dev/null || true)"
+    printf 'Legacy handover status\n======================\n'
+    printf 'compat external legacy log: %s\n' "$(compat_value)"
+    printf 'legacy 00-sni-watch.conf:    %s\n' "$([[ -f "${LEGACY_WATCH}" ]] && echo present || echo absent)"
+    printf 'legacy jail config:          %s\n' "$([[ -f "${LEGACY_JAIL_FILE}" ]] && echo present || echo absent)"
+    if jail_active "${LEGACY_JAIL}"; then
+        printf 'legacy jail runtime:         active\n'
+        printf 'legacy banned IPs:           %s\n' "${bans:-none}"
+    else
+        printf 'legacy jail runtime:         inactive\n'
+        printf 'legacy banned IPs:           none/unknown\n'
+    fi
+    printf 'RIPH reject jail:            %s\n' "$(jail_active "${RIPH_JAIL_1}" && echo active || echo inactive)"
+    printf 'RIPH private-abuse jail:     %s\n' "$(jail_active "${RIPH_JAIL_2}" && echo active || echo inactive)"
+}
+
+set_compat_zero() {
+    local tmp
+    tmp="${CONFIG_FILE}.riph-legacy.$$"
+    awk '
+        BEGIN {done=0}
+        /^LEGACY_STREAM_AUDIT_COMPAT=/ {print "LEGACY_STREAM_AUDIT_COMPAT=0"; done=1; next}
+        {print}
+        END {if (done==0) exit 2}
+    ' "${CONFIG_FILE}" >"${tmp}"
+    install -m 0600 "${tmp}" "${CONFIG_FILE}"
+    rm -f "${tmp}"
+}
+
+require_riph_jails() {
+    jail_active "${RIPH_JAIL_1}" || riph_die "RIPH jail not active: ${RIPH_JAIL_1}"
+    jail_active "${RIPH_JAIL_2}" || riph_die "RIPH jail not active: ${RIPH_JAIL_2}"
+}
+
+quiesce_cmd() {
+    require_riph_jails
+    [[ "$(compat_value)" == 1 ]] || { riph_log "legacy external logging already quiesced"; return 0; }
+    [[ -f "${LEGACY_WATCH}" ]] || riph_die "legacy watch file missing: ${LEGACY_WATCH}"
+    [[ -f "${LEGACY_JAIL_FILE}" ]] || riph_die "legacy jail file missing: ${LEGACY_JAIL_FILE}"
+    jail_active "${LEGACY_JAIL}" || riph_die "legacy jail is not active"
+
+    if (( DRY_RUN == 1 )); then
+        riph_log "dry-run: would set LEGACY_STREAM_AUDIT_COMPAT=0 and transactional riph-apply"
+        riph_log "legacy jail/config would remain active; current bans would be allowed to expire naturally"
+        return 0
+    fi
+
+    config_backup="${CONFIG_FILE}.riph-pre-quiesce.$$"
+    cp -a "${CONFIG_FILE}" "${config_backup}"
+    if ! set_compat_zero; then
+        cp -a "${config_backup}" "${CONFIG_FILE}"
+        rm -f "${config_backup}"
+        riph_die "failed to update compatibility flag"
+    fi
+    if ! bash "${APPLY_BIN}" --root "${RIPH_ROOT}" --config "${CONFIG_PATH}" --reason "quiesce legacy stream audit"; then
+        cp -a "${config_backup}" "${CONFIG_FILE}"
+        rm -f "${config_backup}"
+        riph_die "riph-apply failed; config restored"
+    fi
+    rm -f "${config_backup}"
+    riph_log "legacy external log quiesced; legacy jail left active for existing ban expiry"
+    riph_log "wait until 'riph-legacy-handover status' shows legacy banned IPs: none, then retire"
+}
+
+retire_cmd() {
+    require_riph_jails
+    [[ "$(compat_value)" == 0 ]] || riph_die "legacy external logging is still enabled; run quiesce first"
+    [[ -f "${LEGACY_WATCH}" ]] || riph_die "legacy watch file already absent"
+    [[ -f "${LEGACY_JAIL_FILE}" ]] || riph_die "legacy jail file already absent"
+    jail_active "${LEGACY_JAIL}" || riph_die "legacy jail is not active; inspect state before retirement"
+
+    bans="$(legacy_bans | tr '\n' ' ' | xargs 2>/dev/null || true)"
+    [[ -z "${bans}" ]] || riph_die "legacy jail still has banned IP(s): ${bans}; retirement refused"
+
+    if (( DRY_RUN == 1 )); then
+        riph_log "dry-run: would archive 00-sni-watch.conf and legacy jail .local"
+        riph_log "dry-run: would validate/reload Nginx and Fail2ban; legacy filter/action files stay installed"
+        return 0
+    fi
+
+    backup_id="legacy-retire-$(date -u '+%Y%m%d-%H%M%S')-$$"
+    backup_dir="${BACKUP_ROOT}/${backup_id}"
+    retire_dir="${RETIRE_ROOT}/${backup_id}"
+    mkdir -p "${backup_dir}" "${retire_dir}"
+    cp -a "${CONFIG_FILE}" "${backup_dir}/config.env"
+    cp -a "${STREAM_FILE}" "${backup_dir}/stream.conf"
+    cp -a "${LEGACY_WATCH}" "${backup_dir}/00-sni-watch.conf"
+    cp -a "${LEGACY_JAIL_FILE}" "${backup_dir}/nginx-stream-sni-reject.local"
+
+    rollback_retire() {
+        local rc=$?
+        trap - ERR
+        riph_log "legacy retirement failed; restoring active legacy files"
+        [[ -f "${retire_dir}/00-sni-watch.conf" ]] && mv -f "${retire_dir}/00-sni-watch.conf" "${LEGACY_WATCH}" || true
+        [[ -f "${retire_dir}/nginx-stream-sni-reject.local" ]] && mv -f "${retire_dir}/nginx-stream-sni-reject.local" "${LEGACY_JAIL_FILE}" || true
+        cp -a "${backup_dir}/config.env" "${CONFIG_FILE}" || true
+        cp -a "${backup_dir}/stream.conf" "${STREAM_FILE}" || true
+        if [[ "${RIPH_ROOT}" == "/" ]]; then
+            "${NGINX_BIN}" -t >/dev/null 2>&1 && "${SYSTEMCTL_BIN}" reload nginx >/dev/null 2>&1 || true
+            "${F2B_BIN}" -t >/dev/null 2>&1 && "${F2B_BIN}" reload >/dev/null 2>&1 || true
+        fi
+        exit "${rc}"
+    }
+    trap rollback_retire ERR
+
+    mv "${LEGACY_WATCH}" "${retire_dir}/00-sni-watch.conf"
+    if [[ "${RIPH_ROOT}" == "/" ]]; then
+        "${NGINX_BIN}" -t
+        "${SYSTEMCTL_BIN}" reload nginx
+    fi
+
+    mv "${LEGACY_JAIL_FILE}" "${retire_dir}/nginx-stream-sni-reject.local"
+    if [[ "${RIPH_ROOT}" == "/" ]]; then
+        "${F2B_BIN}" -t
+        "${F2B_BIN}" reload
+        ! jail_active "${LEGACY_JAIL}" || riph_die "legacy jail remained active after config retirement"
+        jail_active "${RIPH_JAIL_1}" || riph_die "RIPH reject jail lost during retirement"
+        jail_active "${RIPH_JAIL_2}" || riph_die "RIPH private-abuse jail lost during retirement"
+    fi
+
+    trap - ERR
+    riph_log "legacy stream watch/jail retired; filter/action files retained for forensic rollback"
+    riph_log "retirement backup: ${backup_dir}"
+    riph_log "retired active files: ${retire_dir}"
+}
+
+case "${COMMAND}" in
+    status) print_status ;;
+    quiesce) quiesce_cmd ;;
+    retire) retire_cmd ;;
+    *) riph_die "unsupported command: ${COMMAND}" ;;
+esac
