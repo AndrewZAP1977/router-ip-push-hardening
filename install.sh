@@ -30,7 +30,7 @@ Global options:
   -h, --help          Show this help.
 
 Development safety gate:
-  Real '/' installation is intentionally blocked while this branch is incomplete.
+  Real '/' installation is intentionally blocked until the controlled VPS test.
   Set RIPH_ALLOW_INCOMPLETE_PRODUCTION=1 only for an explicitly controlled test.
 USAGE
 }
@@ -95,6 +95,7 @@ for required in \
     src/usr/local/sbin/riph-reconcile \
     src/usr/local/sbin/riph-router-ip-updated \
     src/usr/local/sbin/riph-rollback \
+    src/usr/local/sbin/riph-harvest \
     src/usr/local/sbin/riph-admin \
     src/etc/fail2ban/filter.d/nginx-stream-sni-reject.conf \
     src/etc/fail2ban/filter.d/nginx-stream-private-sni-abuse.conf \
@@ -147,7 +148,7 @@ if [[ "${MODE}" == "check" ]]; then
 fi
 
 if [[ "${RIPH_ROOT}" == "/" && "${RIPH_ALLOW_INCOMPLETE_PRODUCTION:-0}" != "1" ]]; then
-    riph_die "production install is blocked while private v1 is incomplete; use test-root/CI"
+    riph_die "production install is blocked until the controlled VPS test; use test-root for development"
 fi
 
 STATE_DIR="$(riph_root_path "${RIPH_STATE_DIR}")"
@@ -172,6 +173,7 @@ mapfile -t FILE_SPECS <<'EOF_SPECS'
 /usr/local/sbin/riph-reconcile|src/usr/local/sbin/riph-reconcile|0755|replace
 /usr/local/sbin/riph-router-ip-updated|src/usr/local/sbin/riph-router-ip-updated|0755|replace
 /usr/local/sbin/riph-rollback|src/usr/local/sbin/riph-rollback|0755|replace
+/usr/local/sbin/riph-harvest|src/usr/local/sbin/riph-harvest|0755|replace
 /usr/local/sbin/riph-admin|src/usr/local/sbin/riph-admin|0755|replace
 /etc/systemd/system/riph-reconcile.service|src/etc/systemd/system/riph-reconcile.service|0644|replace
 /etc/systemd/system/riph-reconcile.timer|src/etc/systemd/system/riph-reconcile.timer|0644|replace
