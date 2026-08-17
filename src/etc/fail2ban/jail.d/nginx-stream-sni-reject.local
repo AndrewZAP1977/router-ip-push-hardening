@@ -1,0 +1,13 @@
+# Managed by router-ip-push-hardening.
+
+[nginx-stream-sni-reject]
+enabled = true
+filter = nginx-stream-sni-reject
+logpath = /var/log/nginx/stream-sni.log
+backend = polling
+usedns = no
+maxretry = 3
+findtime = 5m
+bantime = 8h
+ignorecommand = /usr/local/sbin/riph-fail2ban-ignore <ip>
+action = riph-ufw-443[name=nginx-stream-sni-reject]
