@@ -83,12 +83,16 @@ assert_contains "${GEN_OUT}" '5.61.39.137/32'
 assert_contains "${GEN_OUT}" '78.111.155.187/32'
 assert_contains "${GEN_OUT}" 'router-ip-push:AX3200 current'
 
-echo "TEST 2: first apply writes state and reloads once"
+echo "TEST 2: first apply writes trusted/routing state and reloads once"
 "${APPLY}" --root "${TEST_ROOT}" --reason "initial test" --now-epoch 1000
 ALLOWLIST="${TEST_ROOT}/etc/nginx/stream-enabled/05-router-ip-push-source-allow.conf"
 STATE="${TEST_ROOT}/etc/router-ip-push-hardening/last-apply-state.json"
 GRACE="${TEST_ROOT}/etc/router-ip-push-hardening/previous-ip-grace.json"
+STREAM="${TEST_ROOT}/etc/nginx/stream-enabled/stream.conf"
+BRIDGE="${TEST_ROOT}/etc/nginx/stream-enabled/06-router-ip-push-fake-site-bridges.conf"
 assert_contains "${ALLOWLIST}" '78.111.155.187/32'
+assert_contains "${STREAM}" 'treda.layerupzap.ru|1'
+assert_contains "${BRIDGE}" 'listen 127.0.0.1:9543 proxy_protocol;'
 assert_eq "$(jq -r '.routers.AX3200.current_ip' "${STATE}")" '78.111.155.187' 'first current ip'
 assert_eq "$(grep -c '^systemctl reload nginx$' "${CALL_LOG}")" '1' 'first reload count'
 
@@ -114,12 +118,14 @@ assert_not_contains "${ALLOWLIST}" '78.111.155.187/32'
 assert_eq "$(jq -r '.routers | length' "${GRACE}")" '0' 'expired grace count'
 assert_eq "$(grep -c '^systemctl reload nginx$' "${CALL_LOG}")" '3' 'expiry reload count'
 
-echo "TEST 6: failed nginx validation restores previous allowlist/state"
+echo "TEST 6: failed nginx validation restores all previous files"
 printf '%s\n' '78.111.170.99' \
     >"${TEST_ROOT}/var/lib/router-ip-push/ips/AX3200.ipv4"
 cp "${ALLOWLIST}" "${TEST_ROOT}/allowlist.before-failure"
 cp "${STATE}" "${TEST_ROOT}/state.before-failure"
 cp "${GRACE}" "${TEST_ROOT}/grace.before-failure"
+cp "${STREAM}" "${TEST_ROOT}/stream.before-failure"
+cp "${BRIDGE}" "${TEST_ROOT}/bridge.before-failure"
 export RIPH_TEST_NGINX_EXIT=1
 if "${APPLY}" --root "${TEST_ROOT}" --reason "expected failure" --now-epoch 20000; then
     fail "apply unexpectedly succeeded while nginx stub failed"
@@ -128,5 +134,27 @@ unset RIPH_TEST_NGINX_EXIT
 cmp -s "${ALLOWLIST}" "${TEST_ROOT}/allowlist.before-failure" || fail "allowlist rollback mismatch"
 cmp -s "${STATE}" "${TEST_ROOT}/state.before-failure" || fail "state rollback mismatch"
 cmp -s "${GRACE}" "${TEST_ROOT}/grace.before-failure" || fail "grace rollback mismatch"
+cmp -s "${STREAM}" "${TEST_ROOT}/stream.before-failure" || fail "stream rollback mismatch"
+cmp -s "${BRIDGE}" "${TEST_ROOT}/bridge.before-failure" || fail "bridge rollback mismatch"
+
+echo "TEST 7: routing-only config change triggers reload"
+sed -i 's/PUBLIC_UPSTREAM="127.0.0.1:7443"/PUBLIC_UPSTREAM="127.0.0.1:7555"/' \
+    "${TEST_ROOT}/etc/router-ip-push-hardening/config.env"
+"${APPLY}" --root "${TEST_ROOT}" --reason "routing change" --now-epoch 21000
+assert_contains "${STREAM}" 'server 127.0.0.1:7555;'
+assert_eq "$(grep -c '^systemctl reload nginx$' "${CALL_LOG}")" '4' 'routing reload count'
+
+echo "TEST 8: failed routing validation restores previous routing"
+cp "${STREAM}" "${TEST_ROOT}/stream.before-routing-failure"
+cp "${STATE}" "${TEST_ROOT}/state.before-routing-failure"
+sed -i 's/PUBLIC_UPSTREAM="127.0.0.1:7555"/PUBLIC_UPSTREAM="127.0.0.1:7666"/' \
+    "${TEST_ROOT}/etc/router-ip-push-hardening/config.env"
+export RIPH_TEST_NGINX_EXIT=1
+if "${APPLY}" --root "${TEST_ROOT}" --reason "routing failure" --now-epoch 22000; then
+    fail "routing apply unexpectedly succeeded while nginx stub failed"
+fi
+unset RIPH_TEST_NGINX_EXIT
+cmp -s "${STREAM}" "${TEST_ROOT}/stream.before-routing-failure" || fail "routing stream rollback mismatch"
+cmp -s "${STATE}" "${TEST_ROOT}/state.before-routing-failure" || fail "routing state rollback mismatch"
 
 echo "PASS: core tests"
