@@ -7,7 +7,7 @@ T="$(mktemp -d /tmp/riph-harvest.XXXXXX)"
 trap 'rm -rf "${T}"' EXIT
 mkdir -p "${T}/etc/router-ip-push-hardening" "${T}/var/log/nginx"
 cp "${ROOT}/config/config.env.example" "${T}/etc/router-ip-push-hardening/config.env"
-LOG="${T}/var/log/nginx/stream-sni.log"
+LOG="${T}/var/log/nginx/riph-stream-sni.log"
 cat >"${LOG}" <<'LOG1'
 2026-08-17T14:00:00+00:00 src=203.0.113.10 route=reject sni=- upstream=127.0.0.1:9 status=502 session=0.001
 2026-08-17T14:00:01+00:00 src=203.0.113.11 route=fake_1 sni=treda.layerupzap.ru upstream=127.0.0.1:9543 status=200 session=1.000
@@ -15,6 +15,7 @@ LOG1
 
 OUT="${T}/out.txt"
 "${HARVEST}" --root "${T}" --all >"${OUT}"
+grep -F 'log: /var/log/nginx/riph-stream-sni.log' "${OUT}" >/dev/null
 grep -F 'total: 2' "${OUT}" >/dev/null
 grep -F 'reject: 1' "${OUT}" >/dev/null
 grep -F 'fake: 1' "${OUT}" >/dev/null
