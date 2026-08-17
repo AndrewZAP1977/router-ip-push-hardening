@@ -29,6 +29,7 @@ RIPH_ROOT="/"
 CONFIG_PATH="/etc/router-ip-push-hardening/config.env"
 RIPH_NOW_EPOCH_OVERRIDE=""
 DRY_RUN=0
+PROTECT_TRUSTED=0
 
 usage() {
     cat <<'USAGE'
@@ -38,6 +39,7 @@ Options:
   --root DIR          Test root prefix (/, /tmp/* or /var/tmp/*).
   --config PATH       Config path inside root.
   --dry-run           Validate and print the UFW delta only.
+  --protect-trusted   Exclude overlapping rules from applied state instead of failing.
   --now-epoch EPOCH   Override current UTC epoch for deterministic tests.
   -h, --help          Show this help.
 
@@ -63,6 +65,10 @@ while (($#)); do
             ;;
         --dry-run)
             DRY_RUN=1
+            shift
+            ;;
+        --protect-trusted)
+            PROTECT_TRUSTED=1
             shift
             ;;
         --now-epoch)
@@ -110,7 +116,7 @@ riph_write_effective_trusted_entries \
 parse_deny_file() {
     local scope="$1"
     local file="$2"
-    local raw line cidr line_no=0 trusted_cidr _comment
+    local raw line cidr line_no=0 trusted_cidr _comment conflict
     [[ -f "${file}" ]] || return 0
 
     while IFS= read -r raw || [[ -n "${raw}" ]]; do
@@ -122,12 +128,19 @@ parse_deny_file() {
             || riph_die "${file}:${line_no}: invalid IPv4/CIDR: ${cidr}"
         cidr="$(riph_normalize_ipv4_cidr "${cidr}")"
 
+        conflict=0
         while IFS=$'\t' read -r trusted_cidr _comment; do
             [[ -n "${trusted_cidr}" ]] || continue
             if riph_ipv4_cidr_overlap "${cidr}" "${trusted_cidr}"; then
+                if (( PROTECT_TRUSTED == 1 )); then
+                    riph_log "protect-trusted: suppressing ${scope} ${cidr}; overlaps ${trusted_cidr}"
+                    conflict=1
+                    break
+                fi
                 riph_die "${scope} ${cidr} overlaps effective trusted ${trusted_cidr}"
             fi
         done <"${TRUSTED_ENTRIES}"
+        (( conflict == 0 )) || continue
 
         printf '%s\t%s\n' "${scope}" "${cidr}" >>"${DESIRED}"
     done <"${file}"
