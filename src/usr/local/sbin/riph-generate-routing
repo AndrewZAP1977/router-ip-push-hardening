@@ -1,0 +1,230 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+COMMON_DEFAULT="/usr/local/libexec/riph-common.sh"
+if [[ -f "${SCRIPT_DIR}/../libexec/riph-common.sh" ]]; then
+    # shellcheck source=../libexec/riph-common.sh
+    source "${SCRIPT_DIR}/../libexec/riph-common.sh"
+else
+    # shellcheck source=/usr/local/libexec/riph-common.sh
+    source "${COMMON_DEFAULT}"
+fi
+
+RIPH_ROOT="/"
+CONFIG_PATH="/etc/router-ip-push-hardening/config.env"
+STREAM_OUTPUT_OVERRIDE=""
+BRIDGE_OUTPUT_OVERRIDE=""
+PRINT_STDOUT=0
+
+usage() {
+    cat <<'USAGE'
+Usage: riph-generate-routing [options]
+
+Options:
+  --root DIR             Test root prefix (/, /tmp/* or /var/tmp/*).
+  --config PATH          Config path inside root.
+  --stream-output PATH   Override stream.conf output path inside root.
+  --bridge-output PATH   Override bridge output path inside root.
+  --stdout               Print both rendered configs to stdout.
+  -h, --help             Show this help.
+USAGE
+}
+
+while (($#)); do
+    case "$1" in
+        --root)
+            (($# >= 2)) || riph_die "--root requires a value"
+            RIPH_ROOT="$(riph_validate_root "$2")"
+            shift 2
+            ;;
+        --config)
+            (($# >= 2)) || riph_die "--config requires a value"
+            CONFIG_PATH="$2"
+            shift 2
+            ;;
+        --stream-output)
+            (($# >= 2)) || riph_die "--stream-output requires a value"
+            STREAM_OUTPUT_OVERRIDE="$2"
+            shift 2
+            ;;
+        --bridge-output)
+            (($# >= 2)) || riph_die "--bridge-output requires a value"
+            BRIDGE_OUTPUT_OVERRIDE="$2"
+            shift 2
+            ;;
+        --stdout)
+            PRINT_STDOUT=1
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            riph_die "unknown argument: $1"
+            ;;
+    esac
+done
+
+CONFIG_FILE="$(riph_root_path "${CONFIG_PATH}")"
+riph_load_config "${CONFIG_FILE}"
+
+is_hostname() {
+    local host="$1" label
+    [[ ${#host} -le 253 && "${host}" == *.* ]] || return 1
+    IFS=. read -r -a labels <<<"${host}"
+    for label in "${labels[@]}"; do
+        [[ -n "${label}" && ${#label} -le 63 ]] || return 1
+        [[ "${label}" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] || return 1
+    done
+}
+
+validate_loopback_upstream() {
+    local name="$1" value="$2" host port
+    [[ "${value}" == *:* ]] || riph_die "${name} must be HOST:PORT"
+    host="${value%:*}"
+    port="${value##*:}"
+    [[ "${host}" == "127.0.0.1" ]] || riph_die "${name} must use 127.0.0.1"
+    [[ "${port}" =~ ^[0-9]{1,5}$ ]] || riph_die "${name} has invalid port: ${port}"
+    (( 10#${port} >= 1 && 10#${port} <= 65535 )) || riph_die "${name} port out of range: ${port}"
+}
+
+PUBLIC_SNI="${PUBLIC_SNI:-}"
+PUBLIC_UPSTREAM="${PUBLIC_UPSTREAM:-127.0.0.1:7443}"
+PRIVATE_ROUTE_COUNT="${PRIVATE_ROUTE_COUNT:-0}"
+REJECT_UPSTREAM="${REJECT_UPSTREAM:-127.0.0.1:9}"
+STREAM_OUTPUT="${STREAM_OUTPUT_OVERRIDE:-${STREAM_OUTPUT:-/etc/nginx/stream-enabled/stream.conf}}"
+BRIDGE_OUTPUT="${BRIDGE_OUTPUT_OVERRIDE:-${BRIDGE_OUTPUT:-/etc/nginx/stream-enabled/06-router-ip-push-fake-site-bridges.conf}}"
+
+[[ -n "${PUBLIC_SNI}" ]] || riph_die "PUBLIC_SNI is empty"
+is_hostname "${PUBLIC_SNI}" || riph_die "invalid PUBLIC_SNI: ${PUBLIC_SNI}"
+validate_loopback_upstream PUBLIC_UPSTREAM "${PUBLIC_UPSTREAM}"
+validate_loopback_upstream REJECT_UPSTREAM "${REJECT_UPSTREAM}"
+[[ "${PRIVATE_ROUTE_COUNT}" =~ ^[0-9]+$ ]] || riph_die "PRIVATE_ROUTE_COUNT must be an integer"
+(( PRIVATE_ROUTE_COUNT >= 1 && PRIVATE_ROUTE_COUNT <= 20 )) || riph_die "PRIVATE_ROUTE_COUNT must be 1..20"
+[[ "${STREAM_OUTPUT}" == /* && "${BRIDGE_OUTPUT}" == /* ]] || riph_die "routing output paths must be absolute"
+
+TMP_STREAM="$(mktemp)"
+TMP_BRIDGE="$(mktemp)"
+TMP_NAMES="$(mktemp)"
+trap 'rm -f "${TMP_STREAM}" "${TMP_BRIDGE}" "${TMP_NAMES}"' EXIT
+
+printf '%s\n' "${PUBLIC_SNI}" >"${TMP_NAMES}"
+
+{
+    printf '# Managed by router-ip-push-hardening. DO NOT EDIT.\n'
+    printf '# Private SNI routing: trusted -> Xray, untrusted -> fake site.\n\n'
+    printf 'map "$ssl_preread_server_name|$router_ip_push_source_allowed" $sni_name\n'
+    printf '{\n'
+    printf '        %-40s www;\n' "${PUBLIC_SNI}|0"
+    printf '        %-40s www;\n' "${PUBLIC_SNI}|1"
+} >"${TMP_STREAM}"
+
+: >"${TMP_BRIDGE}"
+printf '# Managed by router-ip-push-hardening. DO NOT EDIT.\n' >>"${TMP_BRIDGE}"
+printf '# PROXY-protocol bridges for untrusted private SNI fake sites.\n\n' >>"${TMP_BRIDGE}"
+
+for ((i = 1; i <= PRIVATE_ROUTE_COUNT; i++)); do
+    sni_var="PRIVATE_SNI_${i}"
+    xray_var="XRAY_UPSTREAM_${i}"
+    fake_var="FAKE_SITE_UPSTREAM_${i}"
+    bridge_var="BRIDGE_LISTEN_${i}"
+    sni="${!sni_var:-}"
+    xray="${!xray_var:-}"
+    fake="${!fake_var:-}"
+    bridge="${!bridge_var:-}"
+
+    [[ -n "${sni}" ]] || riph_die "${sni_var} is empty"
+    is_hostname "${sni}" || riph_die "invalid ${sni_var}: ${sni}"
+    if grep -Fqx -- "${sni}" "${TMP_NAMES}"; then
+        riph_die "duplicate routing SNI: ${sni}"
+    fi
+    printf '%s\n' "${sni}" >>"${TMP_NAMES}"
+
+    validate_loopback_upstream "${xray_var}" "${xray}"
+    validate_loopback_upstream "${fake_var}" "${fake}"
+    validate_loopback_upstream "${bridge_var}" "${bridge}"
+
+    printf '        %-40s xray_%d;\n' "${sni}|1" "${i}" >>"${TMP_STREAM}"
+    printf '        %-40s fake_%d;\n' "${sni}|0" "${i}" >>"${TMP_STREAM}"
+
+    cat >>"${TMP_BRIDGE}" <<EOF_BRIDGE
+server
+{
+        listen ${bridge} proxy_protocol;
+        proxy_connect_timeout 5s;
+        proxy_timeout 1h;
+        tcp_nodelay on;
+        proxy_pass ${fake};
+}
+
+EOF_BRIDGE
+done
+
+cat >>"${TMP_STREAM}" <<'EOF_MAP_END'
+        default                                  reject;
+}
+
+EOF_MAP_END
+
+cat >>"${TMP_STREAM}" <<EOF_PUBLIC
+upstream www
+{
+        server ${PUBLIC_UPSTREAM};
+}
+
+EOF_PUBLIC
+
+for ((i = 1; i <= PRIVATE_ROUTE_COUNT; i++)); do
+    xray_var="XRAY_UPSTREAM_${i}"
+    bridge_var="BRIDGE_LISTEN_${i}"
+    xray="${!xray_var}"
+    bridge="${!bridge_var}"
+    cat >>"${TMP_STREAM}" <<EOF_UPSTREAM
+upstream xray_${i}
+{
+        server ${xray};
+}
+
+upstream fake_${i}
+{
+        server ${bridge};
+}
+
+EOF_UPSTREAM
+done
+
+cat >>"${TMP_STREAM}" <<EOF_REJECT
+upstream reject
+{
+        server ${REJECT_UPSTREAM};
+}
+
+server
+{
+        proxy_protocol on;
+        proxy_connect_timeout 5s;
+        proxy_timeout 1h;
+        tcp_nodelay on;
+        set_real_ip_from unix:;
+        listen 443;
+        listen [::]:443;
+        proxy_pass \$sni_name;
+        ssl_preread on;
+}
+EOF_REJECT
+
+STREAM_FILE="$(riph_root_path "${STREAM_OUTPUT}")"
+BRIDGE_FILE="$(riph_root_path "${BRIDGE_OUTPUT}")"
+mkdir -p "$(dirname "${STREAM_FILE}")" "$(dirname "${BRIDGE_FILE}")"
+install -m 0644 "${TMP_STREAM}" "${STREAM_FILE}"
+install -m 0644 "${TMP_BRIDGE}" "${BRIDGE_FILE}"
+
+if (( PRINT_STDOUT == 1 )); then
+    printf '%s\n' '--- stream.conf ---'
+    cat "${TMP_STREAM}"
+    printf '%s\n' '--- bridges.conf ---'
+    cat "${TMP_BRIDGE}"
+fi
