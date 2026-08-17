@@ -7,11 +7,11 @@ cd "${ROOT}"
 printf '%s\n' '==> Bash syntax'
 while IFS= read -r -d '' file; do
     bash -n "${file}"
-done < <(find install.sh src tests -type f \( -name '*.sh' -o -path '*/sbin/*' \) -print0)
+done < <(find install.sh src tests tools -type f \( -name '*.sh' -o -path '*/sbin/*' \) -print0)
 
 if command -v shellcheck >/dev/null 2>&1; then
     printf '%s\n' '==> ShellCheck'
-    mapfile -d '' shell_files < <(find install.sh src tests -type f \( -name '*.sh' -o -path '*/sbin/*' \) -print0)
+    mapfile -d '' shell_files < <(find install.sh src tests tools -type f \( -name '*.sh' -o -path '*/sbin/*' \) -print0)
     shellcheck "${shell_files[@]}"
 else
     printf '%s\n' '==> ShellCheck: SKIP (not installed)'
