@@ -1,0 +1,15 @@
+# Managed by router-ip-push-hardening.
+# Installed disabled; Phase 7 explicitly activates project jails after routing checks.
+# Name/log are intentionally isolated from the legacy Hexabyte jail.
+
+[riph-nginx-stream-sni-reject]
+enabled = false
+filter = riph-nginx-stream-sni-reject
+logpath = /var/log/nginx/riph-stream-sni.log
+backend = polling
+usedns = no
+maxretry = 3
+findtime = 5m
+bantime = 8h
+ignorecommand = /usr/local/sbin/riph-fail2ban-ignore <ip>
+action = riph-ufw-443[name=riph-nginx-stream-sni-reject]
