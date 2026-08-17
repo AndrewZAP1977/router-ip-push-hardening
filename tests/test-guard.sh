@@ -28,8 +28,8 @@ export RIPH_FAIL2BAN_CLIENT_BIN="${T}/usr/local/bin/f2b-stub"
 export RIPH_TEST_F2B_LOG="${LOG}"
 
 "${GUARD}" --root "${T}" --now-epoch 1000
-grep -F 'set nginx-stream-sni-reject unbanip 78.111.155.187' "${LOG}" >/dev/null
-grep -F 'set nginx-stream-private-sni-abuse unbanip 78.111.155.187' "${LOG}" >/dev/null
+grep -F 'set riph-nginx-stream-sni-reject unbanip 78.111.155.187' "${LOG}" >/dev/null
+grep -F 'set riph-nginx-stream-private-sni-abuse unbanip 78.111.155.187' "${LOG}" >/dev/null
 ! grep -F '203.0.113.9' "${LOG}" >/dev/null
 
 # A later trusted-set change may overlap an older manual rule. Guard recovery
