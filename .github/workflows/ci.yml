@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  shell:
+    name: Bash / ShellCheck / tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq shellcheck
+
+      - name: Bash syntax
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          while IFS= read -r -d '' file; do
+            bash -n "$file"
+          done < <(find src tests -type f \( -name '*.sh' -o -path '*/sbin/*' \) -print0)
+
+      - name: ShellCheck
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mapfile -d '' files < <(find src tests -type f \( -name '*.sh' -o -path '*/sbin/*' \) -print0)
+          shellcheck "${files[@]}"
+
+      - name: Core regression tests
+        run: bash tests/test-core.sh
