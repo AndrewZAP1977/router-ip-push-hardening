@@ -32,6 +32,9 @@ export RIPH_SYSTEMCTL_BIN="${T1}/usr/local/bin/systemctl-stub"
 "${INSTALLER}" --root "${T1}" --check >/dev/null
 "${INSTALLER}" --root "${T1}" --install --apply >/dev/null
 [[ -x "${T1}/usr/local/sbin/riph-admin" ]] || fail 'admin not installed'
+[[ -x "${T1}/usr/local/sbin/riph-fail2ban-ignore" ]] || fail 'fail2ban ignore helper not installed'
+[[ -f "${T1}/etc/fail2ban/jail.d/nginx-stream-sni-reject.local" ]] || fail 'reject jail not installed'
+[[ -f "${T1}/etc/fail2ban/action.d/riph-ufw-443.conf" ]] || fail 'fail2ban action not installed'
 [[ -f "${T1}/etc/nginx/stream-enabled/stream.conf" ]] || fail 'stream config not applied'
 grep -F 'treda.layerupzap.ru|1' "${T1}/etc/nginx/stream-enabled/stream.conf" >/dev/null || fail 'private routing missing'
 
@@ -49,5 +52,6 @@ unset RIPH_TEST_NGINX_EXIT
 grep -Fx 'PREEXISTING_ADMIN_SENTINEL' "${T2}/usr/local/sbin/riph-admin" >/dev/null || fail 'preexisting admin was not restored'
 [[ ! -e "${T2}/etc/router-ip-push-hardening/config.env" ]] || fail 'new config was not removed by install rollback'
 [[ ! -e "${T2}/etc/systemd/system/riph-reconcile.timer" ]] || fail 'new systemd unit was not removed by install rollback'
+[[ ! -e "${T2}/etc/fail2ban/jail.d/nginx-stream-sni-reject.local" ]] || fail 'new Fail2ban jail was not removed by install rollback'
 
 echo 'PASS: installer tests'
