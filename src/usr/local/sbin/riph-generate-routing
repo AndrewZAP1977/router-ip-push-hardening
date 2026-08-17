@@ -97,6 +97,7 @@ PRIVATE_ROUTE_COUNT="${PRIVATE_ROUTE_COUNT:-0}"
 REJECT_UPSTREAM="${REJECT_UPSTREAM:-127.0.0.1:9}"
 STREAM_OUTPUT="${STREAM_OUTPUT_OVERRIDE:-${STREAM_OUTPUT:-/etc/nginx/stream-enabled/stream.conf}}"
 BRIDGE_OUTPUT="${BRIDGE_OUTPUT_OVERRIDE:-${BRIDGE_OUTPUT:-/etc/nginx/stream-enabled/06-router-ip-push-fake-site-bridges.conf}}"
+STREAM_AUDIT_LOG="${STREAM_AUDIT_LOG:-/var/log/nginx/riph-stream-sni.log}"
 
 [[ -n "${PUBLIC_SNI}" ]] || riph_die "PUBLIC_SNI is empty"
 is_hostname "${PUBLIC_SNI}" || riph_die "invalid PUBLIC_SNI: ${PUBLIC_SNI}"
@@ -104,7 +105,8 @@ validate_loopback_upstream PUBLIC_UPSTREAM "${PUBLIC_UPSTREAM}"
 validate_loopback_upstream REJECT_UPSTREAM "${REJECT_UPSTREAM}"
 [[ "${PRIVATE_ROUTE_COUNT}" =~ ^[0-9]+$ ]] || riph_die "PRIVATE_ROUTE_COUNT must be an integer"
 (( PRIVATE_ROUTE_COUNT >= 1 && PRIVATE_ROUTE_COUNT <= 20 )) || riph_die "PRIVATE_ROUTE_COUNT must be 1..20"
-[[ "${STREAM_OUTPUT}" == /* && "${BRIDGE_OUTPUT}" == /* ]] || riph_die "routing output paths must be absolute"
+[[ "${STREAM_OUTPUT}" == /* && "${BRIDGE_OUTPUT}" == /* && "${STREAM_AUDIT_LOG}" == /* ]] \
+    || riph_die "routing/log output paths must be absolute"
 
 TMP_STREAM="$(mktemp)"
 TMP_BRIDGE="$(mktemp)"
@@ -208,7 +210,7 @@ upstream reject
 
 server
 {
-        access_log /var/log/nginx/stream-sni.log riph_stream_sni;
+        access_log ${STREAM_AUDIT_LOG} riph_stream_sni;
         proxy_protocol on;
         proxy_connect_timeout 5s;
         proxy_timeout 1h;
