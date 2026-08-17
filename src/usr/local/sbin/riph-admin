@@ -35,6 +35,8 @@ Commands:
   apply
   reconcile
   guard
+  guard-log
+  timers
   manual-deny-apply
   backups
   rollback ID|latest
@@ -44,6 +46,13 @@ Commands:
   deny443-remove CIDR
   denyall-add CIDR [comment]
   denyall-remove CIDR
+  fail2ban-status
+  fail2ban-unban IP
+  fail2ban-reload
+  ufw-status
+  harvest [--all] [--top N]
+  harvest-checkpoint
+  recent-log [LINES]
   menu                 Interactive menu (default)
 USAGE
 }
@@ -77,10 +86,15 @@ CONFIG_FILE="$(riph_root_path "${CONFIG_PATH}")"
 riph_load_config "${CONFIG_FILE}"
 riph_prepare_dirs
 CONFIG_DIR="$(riph_root_path "${RIPH_CONFIG_DIR}")"
+STATE_DIR="$(riph_root_path "${RIPH_STATE_DIR}")"
 STATIC_FILE="${CONFIG_DIR}/trusted-static.list"
 GRACE_FILE="${CONFIG_DIR}/previous-ip-grace.json"
 MANUAL_443_FILE="${CONFIG_DIR}/manual-deny-443.list"
 MANUAL_ALL_FILE="${CONFIG_DIR}/manual-deny-all.list"
+ALLOWLIST_FILE="$(riph_root_path "${ALLOWLIST_OUTPUT}")"
+STREAM_FILE="$(riph_root_path "${STREAM_OUTPUT:-/etc/nginx/stream-enabled/stream.conf}")"
+BRIDGE_FILE="$(riph_root_path "${BRIDGE_OUTPUT:-/etc/nginx/stream-enabled/06-router-ip-push-fake-site-bridges.conf}")"
+STREAM_LOG="$(riph_root_path /var/log/nginx/stream-sni.log)"
 
 resolve_tool() {
     local name="$1"
@@ -96,11 +110,40 @@ RECONCILE="$(resolve_tool riph-reconcile)"
 GUARD="$(resolve_tool riph-trusted-unban-guard)"
 MANUAL_APPLY="$(resolve_tool riph-apply-manual-deny)"
 ROLLBACK="$(resolve_tool riph-rollback)"
+HARVEST="$(resolve_tool riph-harvest)"
 common_args=(--root "${RIPH_ROOT}" --config "${CONFIG_PATH}")
 
 print_file_or_empty() {
     local file="$1"
-    if [[ -s "${file}" ]]; then cat "${file}"; else printf '%s\n' '(empty)'; fi
+    if [[ -s "${file}" ]]; then
+        cat "${file}"
+    else
+        printf '%s\n' '(empty)'
+    fi
+}
+
+print_effective_trusted() {
+    local tmp
+    tmp="$(mktemp)"
+    trap 'rm -f "${tmp}"' RETURN
+    riph_write_effective_trusted_entries "${tmp}" "${STATIC_FILE}" "${GRACE_FILE}" "$(date -u '+%s')"
+    if [[ -s "${tmp}" ]]; then
+        column -t -s $'\t' "${tmp}" 2>/dev/null || cat "${tmp}"
+    else
+        printf '%s\n' '(empty)'
+    fi
+    rm -f "${tmp}"
+    trap - RETURN
+}
+
+print_generated_file_state() {
+    local label="$1" file="$2"
+    if [[ -f "${file}" ]]; then
+        printf '  %-12s %s bytes=%s sha256=%s\n' \
+            "${label}:" "${file}" "$(stat -c '%s' "${file}")" "$(sha256sum "${file}" | awk '{print $1}')"
+    else
+        printf '  %-12s %s (missing)\n' "${label}:" "${file}"
+    fi
 }
 
 status_cmd() {
@@ -119,18 +162,50 @@ status_cmd() {
             printf '  %-16s current=(missing)\n' "${router_id}"
         fi
     done
-    printf '\nStatic trusted:\n'; print_file_or_empty "${STATIC_FILE}"
+
+    printf '\nEffective trusted set:\n'
+    print_effective_trusted
+
+    printf '\nStatic trusted source file:\n'
+    print_file_or_empty "${STATIC_FILE}"
+
     printf '\nPrevious-IP grace:\n'
-    if [[ -f "${GRACE_FILE}" ]]; then jq . "${GRACE_FILE}" 2>/dev/null || cat "${GRACE_FILE}"; else printf '%s\n' '(missing)'; fi
+    if [[ -f "${GRACE_FILE}" ]]; then
+        jq . "${GRACE_FILE}" 2>/dev/null || cat "${GRACE_FILE}"
+    else
+        printf '%s\n' '(missing)'
+    fi
+
     printf '\nLast apply state:\n'
-    if [[ -f "${CONFIG_DIR}/last-apply-state.json" ]]; then jq . "${CONFIG_DIR}/last-apply-state.json" 2>/dev/null || cat "${CONFIG_DIR}/last-apply-state.json"; else printf '%s\n' '(not applied yet)'; fi
-    printf '\nManual deny 443:\n'; print_file_or_empty "${MANUAL_443_FILE}"
-    printf '\nManual deny all:\n'; print_file_or_empty "${MANUAL_ALL_FILE}"
+    if [[ -f "${CONFIG_DIR}/last-apply-state.json" ]]; then
+        jq . "${CONFIG_DIR}/last-apply-state.json" 2>/dev/null || cat "${CONFIG_DIR}/last-apply-state.json"
+    else
+        printf '%s\n' '(not applied yet)'
+    fi
+
+    printf '\nGenerated Nginx files:\n'
+    print_generated_file_state allowlist "${ALLOWLIST_FILE}"
+    print_generated_file_state stream "${STREAM_FILE}"
+    print_generated_file_state bridges "${BRIDGE_FILE}"
+
+    printf '\nManual deny 443:\n'
+    print_file_or_empty "${MANUAL_443_FILE}"
+    printf '\nManual deny all:\n'
+    print_file_or_empty "${MANUAL_ALL_FILE}"
+
     if [[ "${RIPH_ROOT}" == "/" ]]; then
         printf '\nNginx validation:\n'
-        if nginx -t; then printf '%s\n' 'OK'; else printf '%s\n' 'FAILED'; fi
+        if nginx -t; then
+            printf '%s\n' 'OK'
+        else
+            printf '%s\n' 'FAILED'
+        fi
+        printf '\nFail2ban:\n'
+        fail2ban_status_cmd || true
+        printf '\nTimers/watch:\n'
+        timers_cmd || true
     else
-        printf '\nNginx validation: skipped for test root %s\n' "${RIPH_ROOT}"
+        printf '\nNginx/Fail2ban/systemd runtime checks: skipped for test root %s\n' "${RIPH_ROOT}"
     fi
 }
 
@@ -157,78 +232,250 @@ edit_list_transaction() {
     local mode="$1" file="$2" value="$3" comment="$4" apply_tool="$5" reason="$6"
     local normalized backup tmp raw line current
     normalized="$(normalize_list_value "${value}")"
-    mkdir -p "$(dirname "${file}")"; touch "${file}"
-    backup="${file}.riph-admin-backup.$$"; cp -a "${file}" "${backup}"
+    mkdir -p "$(dirname "${file}")"
+    touch "${file}"
+    backup="${file}.riph-admin-backup.$$"
+    cp -a "${file}" "${backup}"
     tmp="${file}.riph-admin-new.$$"
+
     if [[ "${mode}" == add ]]; then
-        if list_contains_cidr "${file}" "${normalized}"; then rm -f "${backup}"; riph_log "already present: ${normalized}"; return 0; fi
+        if list_contains_cidr "${file}" "${normalized}"; then
+            rm -f "${backup}"
+            riph_log "already present: ${normalized}"
+            return 0
+        fi
         cp -a "${file}" "${tmp}"
         if [[ -n "${comment}" ]]; then
-            comment="${comment//$'\n'/ }"; printf '%s # %s\n' "${normalized}" "${comment}" >>"${tmp}"
-        else printf '%s\n' "${normalized}" >>"${tmp}"; fi
+            comment="${comment//$'\n'/ }"
+            printf '%s # %s\n' "${normalized}" "${comment}" >>"${tmp}"
+        else
+            printf '%s\n' "${normalized}" >>"${tmp}"
+        fi
     else
         : >"${tmp}"
         while IFS= read -r raw || [[ -n "${raw}" ]]; do
             line="${raw#"${raw%%[![:space:]]*}"}"
-            if [[ -z "${line}" || "${line:0:1}" == "#" ]]; then printf '%s\n' "${raw}" >>"${tmp}"; continue; fi
+            if [[ -z "${line}" || "${line:0:1}" == "#" ]]; then
+                printf '%s\n' "${raw}" >>"${tmp}"
+                continue
+            fi
             current="${line%%[[:space:]]*}"
-            if riph_is_ipv4_cidr "${current}" && [[ "$(riph_normalize_ipv4_cidr "${current}")" == "${normalized}" ]]; then continue; fi
+            if riph_is_ipv4_cidr "${current}" \
+                && [[ "$(riph_normalize_ipv4_cidr "${current}")" == "${normalized}" ]]; then
+                continue
+            fi
             printf '%s\n' "${raw}" >>"${tmp}"
         done <"${file}"
-        if cmp -s "${file}" "${tmp}"; then rm -f "${backup}" "${tmp}"; riph_log "not present: ${normalized}"; return 0; fi
+        if cmp -s "${file}" "${tmp}"; then
+            rm -f "${backup}" "${tmp}"
+            riph_log "not present: ${normalized}"
+            return 0
+        fi
     fi
-    install -m 0600 "${tmp}" "${file}"; rm -f "${tmp}"
+
+    install -m 0600 "${tmp}" "${file}"
+    rm -f "${tmp}"
     if [[ "${apply_tool}" == "${APPLY}" || "${apply_tool}" == "${RECONCILE}" ]]; then
-        if ! bash "${apply_tool}" "${common_args[@]}" --reason "${reason}"; then cp -a "${backup}" "${file}"; rm -f "${backup}"; riph_die "apply failed; list restored"; fi
+        if ! bash "${apply_tool}" "${common_args[@]}" --reason "${reason}"; then
+            cp -a "${backup}" "${file}"
+            rm -f "${backup}"
+            riph_die "apply failed; list restored"
+        fi
     else
-        if ! bash "${apply_tool}" "${common_args[@]}"; then cp -a "${backup}" "${file}"; rm -f "${backup}"; riph_die "apply failed; list restored"; fi
+        if ! bash "${apply_tool}" "${common_args[@]}"; then
+            cp -a "${backup}" "${file}"
+            rm -f "${backup}"
+            riph_die "apply failed; list restored"
+        fi
     fi
-    rm -f "${backup}"; riph_log "list updated: ${normalized}"
+    rm -f "${backup}"
+    riph_log "list updated: ${normalized}"
 }
 
-trusted_add() { (($# >= 1)) || riph_die "trusted-add requires CIDR"; edit_list_transaction add "${STATIC_FILE}" "$1" "${2:-}" "${RECONCILE}" "static trusted added: $1"; }
-trusted_remove() { (($# >= 1)) || riph_die "trusted-remove requires CIDR"; edit_list_transaction remove "${STATIC_FILE}" "$1" "" "${RECONCILE}" "static trusted removed: $1"; }
-deny_add() { local file="$1" scope="$2" value="$3" comment="$4"; edit_list_transaction add "${file}" "${value}" "${comment}" "${MANUAL_APPLY}" "manual deny ${scope} added: ${value}"; }
-deny_remove() { local file="$1" scope="$2" value="$3"; edit_list_transaction remove "${file}" "${value}" "" "${MANUAL_APPLY}" "manual deny ${scope} removed: ${value}"; }
-rollback_cmd() { (($# >= 1)) || riph_die "rollback requires backup ID or latest"; if [[ "$1" == latest ]]; then bash "${ROLLBACK}" "${common_args[@]}" --latest; else bash "${ROLLBACK}" "${common_args[@]}" --backup "$1"; fi; }
+trusted_add() {
+    (($# >= 1)) || riph_die "trusted-add requires CIDR"
+    edit_list_transaction add "${STATIC_FILE}" "$1" "${2:-}" "${RECONCILE}" "static trusted added: $1"
+}
+
+trusted_remove() {
+    (($# >= 1)) || riph_die "trusted-remove requires CIDR"
+    edit_list_transaction remove "${STATIC_FILE}" "$1" "" "${RECONCILE}" "static trusted removed: $1"
+}
+
+deny_add() {
+    local file="$1" scope="$2" value="$3" comment="$4"
+    edit_list_transaction add "${file}" "${value}" "${comment}" "${MANUAL_APPLY}" "manual deny ${scope} added: ${value}"
+}
+
+deny_remove() {
+    local file="$1" scope="$2" value="$3"
+    edit_list_transaction remove "${file}" "${value}" "" "${MANUAL_APPLY}" "manual deny ${scope} removed: ${value}"
+}
+
+rollback_cmd() {
+    (($# >= 1)) || riph_die "rollback requires backup ID or latest"
+    if [[ "$1" == latest ]]; then
+        bash "${ROLLBACK}" "${common_args[@]}" --latest
+    else
+        bash "${ROLLBACK}" "${common_args[@]}" --backup "$1"
+    fi
+}
+
+fail2ban_status_cmd() {
+    local jail output
+    [[ "${RIPH_ROOT}" == "/" ]] || { printf '%s\n' 'Fail2ban status is available only on production root.'; return 0; }
+    if ! command -v fail2ban-client >/dev/null 2>&1; then
+        printf '%s\n' 'fail2ban-client not found'
+        return 1
+    fi
+    read -r -a jails <<<"${RIPH_FAIL2BAN_JAILS:-nginx-stream-sni-reject nginx-stream-private-sni-abuse}"
+    for jail in "${jails[@]}"; do
+        printf '\n[%s]\n' "${jail}"
+        if output="$(LC_ALL=C fail2ban-client status "${jail}" 2>&1)"; then
+            printf '%s\n' "${output}"
+        else
+            printf '%s\n' "${output}"
+        fi
+    done
+}
+
+fail2ban_unban_cmd() {
+    local ip="$1" jail
+    [[ "${RIPH_ROOT}" == "/" ]] || riph_die "Fail2ban unban is available only on production root"
+    riph_is_ipv4 "${ip}" || riph_die "invalid IPv4: ${ip}"
+    read -r -a jails <<<"${RIPH_FAIL2BAN_JAILS:-nginx-stream-sni-reject nginx-stream-private-sni-abuse}"
+    for jail in "${jails[@]}"; do
+        if fail2ban-client status "${jail}" >/dev/null 2>&1; then
+            fail2ban-client set "${jail}" unbanip "${ip}" >/dev/null || true
+        fi
+    done
+    riph_log "requested unban of ${ip} from project jails"
+}
+
+fail2ban_reload_cmd() {
+    [[ "${RIPH_ROOT}" == "/" ]] || riph_die "Fail2ban reload is available only on production root"
+    fail2ban-client -t
+    fail2ban-client reload
+    bash "${GUARD}" "${common_args[@]}"
+}
+
+ufw_status_cmd() {
+    [[ "${RIPH_ROOT}" == "/" ]] || { printf '%s\n' 'UFW status is available only on production root.'; return 0; }
+    if ! command -v ufw >/dev/null 2>&1; then
+        printf '%s\n' 'ufw not found'
+        return 1
+    fi
+    printf 'Relevant UFW rules (443 / riph):\n'
+    LC_ALL=C ufw status numbered | awk 'NR <= 4 || /443|riph-|Fail2Ban/'
+    printf '\nProject-owned manual-deny applied state:\n'
+    print_file_or_empty "${STATE_DIR}/runtime/manual-deny-applied.tsv"
+}
+
+timers_cmd() {
+    local unit enabled active
+    [[ "${RIPH_ROOT}" == "/" ]] || { printf '%s\n' 'systemd status is available only on production root.'; return 0; }
+    for unit in riph-router-ip.path riph-reconcile.timer riph-guard.timer; do
+        enabled="$(systemctl is-enabled "${unit}" 2>/dev/null || true)"
+        active="$(systemctl is-active "${unit}" 2>/dev/null || true)"
+        printf '  %-24s enabled=%-10s active=%s\n' "${unit}" "${enabled:-unknown}" "${active:-unknown}"
+    done
+}
+
+guard_log_cmd() {
+    local file="${STATE_DIR}/logs/trusted-unban-guard.log"
+    if [[ -f "${file}" ]]; then
+        tail -n 50 "${file}"
+    else
+        printf '%s\n' '(guard log not created yet)'
+    fi
+}
+
+recent_log_cmd() {
+    local lines="${1:-50}"
+    [[ "${lines}" =~ ^[1-9][0-9]*$ ]] || riph_die "LINES must be a positive integer"
+    if [[ -f "${STREAM_LOG}" ]]; then
+        tail -n "${lines}" "${STREAM_LOG}"
+    else
+        printf '%s\n' '(stream-sni.log not created yet)'
+    fi
+}
+
+harvest_cmd() {
+    [[ -f "${HARVEST}" ]] || riph_die "riph-harvest not found: ${HARVEST}"
+    bash "${HARVEST}" "${common_args[@]}" "${COMMAND_ARGS[@]}"
+}
+
+harvest_checkpoint_cmd() {
+    [[ -f "${HARVEST}" ]] || riph_die "riph-harvest not found: ${HARVEST}"
+    bash "${HARVEST}" "${common_args[@]}" --checkpoint
+}
 
 interactive_menu() {
-    local choice value comment backup_id confirm
+    local choice value comment backup_id confirm lines ip
     while true; do
         cat <<'MENU'
 
 Router IP Push Hardening
 ========================
-1. Status
-2. Apply / regenerate trusted + routing
-3. Reconcile
-4. Run trusted-unban guard
-5. Apply manual deny lists
-6. Add static trusted CIDR
-7. Remove static trusted CIDR
-8. Add manual deny 443 CIDR
-9. Remove manual deny 443 CIDR
-10. List backups
-11. Rollback
-0. Exit
+ 1. Status
+ 2. Apply / regenerate trusted + routing
+ 3. Reconcile
+ 4. Run trusted-unban guard
+ 5. Guard log
+ 6. Timers / Router-IP watch
+ 7. Apply manual deny lists
+ 8. Add static trusted CIDR
+ 9. Remove static trusted CIDR
+10. Add manual deny 443 CIDR
+11. Remove manual deny 443 CIDR
+12. Add manual deny ALL CIDR
+13. Remove manual deny ALL CIDR
+14. Fail2ban status
+15. Fail2ban unban IP
+16. Fail2ban validate + reload
+17. UFW relevant status
+18. Harvest since checkpoint
+19. Set harvest checkpoint
+20. Recent stream log
+21. List backups
+22. Rollback
+ 0. Exit
 MENU
-        printf 'Choice: '; IFS= read -r choice || return 0
+        printf 'Choice: '
+        IFS= read -r choice || return 0
         case "${choice}" in
             1) status_cmd ;;
             2) bash "${APPLY}" "${common_args[@]}" --reason "interactive apply" ;;
             3) bash "${RECONCILE}" "${common_args[@]}" --reason "interactive reconcile" ;;
             4) bash "${GUARD}" "${common_args[@]}" ;;
-            5) bash "${MANUAL_APPLY}" "${common_args[@]}" ;;
-            6) printf 'CIDR/IP: '; IFS= read -r value; printf 'Comment (optional): '; IFS= read -r comment; trusted_add "${value}" "${comment}" ;;
-            7) printf 'CIDR/IP: '; IFS= read -r value; trusted_remove "${value}" ;;
-            8) printf 'CIDR/IP: '; IFS= read -r value; printf 'Comment (optional): '; IFS= read -r comment; deny_add "${MANUAL_443_FILE}" 443 "${value}" "${comment}" ;;
-            9) printf 'CIDR/IP: '; IFS= read -r value; deny_remove "${MANUAL_443_FILE}" 443 "${value}" ;;
-            10) bash "${ROLLBACK}" "${common_args[@]}" --list ;;
-            11)
+            5) guard_log_cmd ;;
+            6) timers_cmd ;;
+            7) bash "${MANUAL_APPLY}" "${common_args[@]}" ;;
+            8) printf 'CIDR/IP: '; IFS= read -r value; printf 'Comment (optional): '; IFS= read -r comment; trusted_add "${value}" "${comment}" ;;
+            9) printf 'CIDR/IP: '; IFS= read -r value; trusted_remove "${value}" ;;
+            10) printf 'CIDR/IP: '; IFS= read -r value; printf 'Comment (optional): '; IFS= read -r comment; deny_add "${MANUAL_443_FILE}" 443 "${value}" "${comment}" ;;
+            11) printf 'CIDR/IP: '; IFS= read -r value; deny_remove "${MANUAL_443_FILE}" 443 "${value}" ;;
+            12) printf 'CIDR/IP: '; IFS= read -r value; printf 'Comment (optional): '; IFS= read -r comment; deny_add "${MANUAL_ALL_FILE}" all "${value}" "${comment}" ;;
+            13) printf 'CIDR/IP: '; IFS= read -r value; deny_remove "${MANUAL_ALL_FILE}" all "${value}" ;;
+            14) fail2ban_status_cmd ;;
+            15) printf 'IPv4: '; IFS= read -r ip; fail2ban_unban_cmd "${ip}" ;;
+            16) fail2ban_reload_cmd ;;
+            17) ufw_status_cmd ;;
+            18) COMMAND_ARGS=(); harvest_cmd ;;
+            19) harvest_checkpoint_cmd ;;
+            20) printf 'Lines [50]: '; IFS= read -r lines; recent_log_cmd "${lines:-50}" ;;
+            21) bash "${ROLLBACK}" "${common_args[@]}" --list ;;
+            22)
                 bash "${ROLLBACK}" "${common_args[@]}" --list
-                printf 'Backup ID (or latest): '; IFS= read -r backup_id
-                printf 'Type ROLLBACK to confirm: '; IFS= read -r confirm
-                if [[ "${confirm}" == ROLLBACK ]]; then rollback_cmd "${backup_id}"; else printf '%s\n' 'Cancelled.'; fi
+                printf 'Backup ID (or latest): '
+                IFS= read -r backup_id
+                printf 'Type ROLLBACK to confirm: '
+                IFS= read -r confirm
+                if [[ "${confirm}" == ROLLBACK ]]; then
+                    rollback_cmd "${backup_id}"
+                else
+                    printf '%s\n' 'Cancelled.'
+                fi
                 ;;
             0) return 0 ;;
             *) printf '%s\n' 'Unknown choice.' ;;
@@ -241,15 +488,39 @@ case "${COMMAND}" in
     apply) bash "${APPLY}" "${common_args[@]}" --reason "admin apply" ;;
     reconcile) bash "${RECONCILE}" "${common_args[@]}" --reason "admin reconcile" ;;
     guard) bash "${GUARD}" "${common_args[@]}" ;;
+    guard-log) guard_log_cmd ;;
+    timers) timers_cmd ;;
     manual-deny-apply) bash "${MANUAL_APPLY}" "${common_args[@]}" ;;
     backups) bash "${ROLLBACK}" "${common_args[@]}" --list ;;
     rollback) rollback_cmd "${COMMAND_ARGS[@]}" ;;
     trusted-add) trusted_add "${COMMAND_ARGS[@]}" ;;
     trusted-remove) trusted_remove "${COMMAND_ARGS[@]}" ;;
-    deny443-add) ((${#COMMAND_ARGS[@]} >= 1)) || riph_die "deny443-add requires CIDR"; deny_add "${MANUAL_443_FILE}" 443 "${COMMAND_ARGS[0]}" "${COMMAND_ARGS[1]:-}" ;;
-    deny443-remove) ((${#COMMAND_ARGS[@]} >= 1)) || riph_die "deny443-remove requires CIDR"; deny_remove "${MANUAL_443_FILE}" 443 "${COMMAND_ARGS[0]}" ;;
-    denyall-add) ((${#COMMAND_ARGS[@]} >= 1)) || riph_die "denyall-add requires CIDR"; deny_add "${MANUAL_ALL_FILE}" all "${COMMAND_ARGS[0]}" "${COMMAND_ARGS[1]:-}" ;;
-    denyall-remove) ((${#COMMAND_ARGS[@]} >= 1)) || riph_die "denyall-remove requires CIDR"; deny_remove "${MANUAL_ALL_FILE}" all "${COMMAND_ARGS[0]}" ;;
+    deny443-add)
+        ((${#COMMAND_ARGS[@]} >= 1)) || riph_die "deny443-add requires CIDR"
+        deny_add "${MANUAL_443_FILE}" 443 "${COMMAND_ARGS[0]}" "${COMMAND_ARGS[1]:-}"
+        ;;
+    deny443-remove)
+        ((${#COMMAND_ARGS[@]} >= 1)) || riph_die "deny443-remove requires CIDR"
+        deny_remove "${MANUAL_443_FILE}" 443 "${COMMAND_ARGS[0]}"
+        ;;
+    denyall-add)
+        ((${#COMMAND_ARGS[@]} >= 1)) || riph_die "denyall-add requires CIDR"
+        deny_add "${MANUAL_ALL_FILE}" all "${COMMAND_ARGS[0]}" "${COMMAND_ARGS[1]:-}"
+        ;;
+    denyall-remove)
+        ((${#COMMAND_ARGS[@]} >= 1)) || riph_die "denyall-remove requires CIDR"
+        deny_remove "${MANUAL_ALL_FILE}" all "${COMMAND_ARGS[0]}"
+        ;;
+    fail2ban-status) fail2ban_status_cmd ;;
+    fail2ban-unban)
+        ((${#COMMAND_ARGS[@]} == 1)) || riph_die "fail2ban-unban requires exactly one IPv4"
+        fail2ban_unban_cmd "${COMMAND_ARGS[0]}"
+        ;;
+    fail2ban-reload) fail2ban_reload_cmd ;;
+    ufw-status) ufw_status_cmd ;;
+    harvest) harvest_cmd ;;
+    harvest-checkpoint) harvest_checkpoint_cmd ;;
+    recent-log) recent_log_cmd "${COMMAND_ARGS[0]:-50}" ;;
     menu) interactive_menu ;;
     *) riph_die "unknown command: ${COMMAND}" ;;
 esac
