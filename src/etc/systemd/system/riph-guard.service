@@ -1,0 +1,8 @@
+[Unit]
+Description=Router IP Push Hardening trusted-unban guard
+After=network-online.target fail2ban.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/riph-trusted-unban-guard
