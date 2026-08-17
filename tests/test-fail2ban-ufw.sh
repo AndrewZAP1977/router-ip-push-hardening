@@ -20,7 +20,7 @@ exit 0
 EOF_STUB
 chmod +x "${T}/ufw-stub"
 export RIPH_UFW_BIN="${T}/ufw-stub"
-export RIPH_F2B_UFW_LOCK="${T}/ufw.lock"
+export RIPH_UFW_LOCK="${T}/ufw.lock"
 export RIPH_TEST_UFW_STATE="${STATE}"
 export RIPH_TEST_UFW_CALLS="${CALLS}"
 
