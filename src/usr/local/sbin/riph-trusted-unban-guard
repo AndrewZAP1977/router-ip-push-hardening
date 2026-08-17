@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+COMMON_DEFAULT="/usr/local/libexec/riph-common.sh"
+TRUSTED_DEFAULT="/usr/local/libexec/riph-trusted.sh"
+NET_DEFAULT="/usr/local/libexec/riph-net.sh"
+
+if [[ -f "${SCRIPT_DIR}/../libexec/riph-common.sh" ]]; then
+    # Repository/test layout.
+    # shellcheck source=../libexec/riph-common.sh
+    source "${SCRIPT_DIR}/../libexec/riph-common.sh"
+    # shellcheck source=../libexec/riph-trusted.sh
+    source "${SCRIPT_DIR}/../libexec/riph-trusted.sh"
+    # shellcheck source=../libexec/riph-net.sh
+    source "${SCRIPT_DIR}/../libexec/riph-net.sh"
+else
+    # Installed layout.
+    # shellcheck source=/usr/local/libexec/riph-common.sh
+    source "${COMMON_DEFAULT}"
+    # shellcheck source=/usr/local/libexec/riph-trusted.sh
+    source "${TRUSTED_DEFAULT}"
+    # shellcheck source=/usr/local/libexec/riph-net.sh
+    source "${NET_DEFAULT}"
+fi
+
+RIPH_ROOT="/"
+CONFIG_PATH="/etc/router-ip-push-hardening/config.env"
+RIPH_NOW_EPOCH_OVERRIDE=""
+DRY_RUN=0
+
+usage() {
+    cat <<'USAGE'
+Usage: riph-trusted-unban-guard [options]
+
+Options:
+  --root DIR          Test root prefix (/, /tmp/* or /var/tmp/*).
+  --config PATH       Config path inside root.
+  --dry-run           Report trusted bans without changing Fail2ban.
+  --now-epoch EPOCH   Override current UTC epoch for deterministic tests.
+  -h, --help          Show this help.
+
+Testing:
+  RIPH_FAIL2BAN_CLIENT_BIN may point to a stub executable.
+USAGE
+}
+
+while (($#)); do
+    case "$1" in
+        --root)
+            (($# >= 2)) || riph_die "--root requires a value"
+            RIPH_ROOT="$(riph_validate_root "$2")"
+            shift 2
+            ;;
+        --config)
+            (($# >= 2)) || riph_die "--config requires a value"
+            CONFIG_PATH="$2"
+            shift 2
+            ;;
+        --dry-run)
+            DRY_RUN=1
+            shift
+            ;;
+        --now-epoch)
+            (($# >= 2)) || riph_die "--now-epoch requires a value"
+            [[ "$2" =~ ^[0-9]+$ ]] || riph_die "--now-epoch must be an integer"
+            RIPH_NOW_EPOCH_OVERRIDE="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            riph_die "unknown argument: $1"
+            ;;
+    esac
+done
+
+riph_require_cmd jq
+riph_require_cmd awk
+
+CONFIG_FILE="$(riph_root_path "${CONFIG_PATH}")"
+riph_load_config "${CONFIG_FILE}"
+riph_prepare_dirs
+
+STATIC_FILE="$(riph_root_path "${RIPH_CONFIG_DIR}/trusted-static.list")"
+GRACE_FILE="$(riph_root_path "${RIPH_CONFIG_DIR}/previous-ip-grace.json")"
+NOW_EPOCH="$(riph_now_epoch)"
+RUNTIME_DIR="$(riph_root_path "${RIPH_STATE_DIR}/runtime")"
+LOG_DIR="$(riph_root_path "${RIPH_STATE_DIR}/logs")"
+mkdir -p "${RUNTIME_DIR}" "${LOG_DIR}"
+
+TRUSTED_ENTRIES="${RUNTIME_DIR}/trusted-guard.$$.tsv"
+trap 'rm -f "${TRUSTED_ENTRIES}"' EXIT
+riph_write_effective_trusted_entries \
+    "${TRUSTED_ENTRIES}" "${STATIC_FILE}" "${GRACE_FILE}" "${NOW_EPOCH}"
+
+ip_is_trusted() {
+    local ip="$1"
+    local cidr _comment
+    while IFS=$'\t' read -r cidr _comment; do
+        [[ -n "${cidr}" ]] || continue
+        if riph_ipv4_in_cidr "${ip}" "${cidr}"; then
+            return 0
+        fi
+    done <"${TRUSTED_ENTRIES}"
+    return 1
+}
+
+check_manual_conflicts() {
+    local list_name="$1"
+    local file="$2"
+    local raw line deny_cidr trusted_cidr _comment
+    local line_no=0
+    [[ -f "${file}" ]] || return 0
+
+    while IFS= read -r raw || [[ -n "${raw}" ]]; do
+        ((line_no += 1))
+        line="${raw#"${raw%%[![:space:]]*}"}"
+        [[ -z "${line}" || "${line:0:1}" == "#" ]] && continue
+        deny_cidr="${line%%[[:space:]]*}"
+        riph_is_ipv4_cidr "${deny_cidr}" \
+            || riph_die "${file}:${line_no}: invalid IPv4/CIDR: ${deny_cidr}"
+        deny_cidr="$(riph_normalize_ipv4_cidr "${deny_cidr}")"
+
+        while IFS=$'\t' read -r trusted_cidr _comment; do
+            [[ -n "${trusted_cidr}" ]] || continue
+            if riph_ipv4_cidr_overlap "${deny_cidr}" "${trusted_cidr}"; then
+                riph_log "WARNING: ${list_name} ${deny_cidr} overlaps trusted ${trusted_cidr}"
+                MANUAL_CONFLICTS=$((MANUAL_CONFLICTS + 1))
+            fi
+        done <"${TRUSTED_ENTRIES}"
+    done <"${file}"
+}
+
+MANUAL_CONFLICTS=0
+check_manual_conflicts \
+    "manual-deny-443" \
+    "$(riph_root_path "${RIPH_CONFIG_DIR}/manual-deny-443.list")"
+check_manual_conflicts \
+    "manual-deny-all" \
+    "$(riph_root_path "${RIPH_CONFIG_DIR}/manual-deny-all.list")"
+
+FAIL2BAN_BIN="${RIPH_FAIL2BAN_CLIENT_BIN:-fail2ban-client}"
+JAILS="${RIPH_FAIL2BAN_JAILS:-nginx-stream-sni-reject nginx-stream-private-sni-abuse}"
+read -r -a JAIL_ARRAY <<<"${JAILS}"
+UNBANNED=0
+
+if ! command -v "${FAIL2BAN_BIN}" >/dev/null 2>&1 && [[ ! -x "${FAIL2BAN_BIN}" ]]; then
+    riph_log "Fail2ban client not available; unban scan skipped"
+else
+    for jail in "${JAIL_ARRAY[@]}"; do
+        [[ "${jail}" =~ ^[A-Za-z0-9._-]+$ ]] || riph_die "invalid Fail2ban jail name: ${jail}"
+        if ! status_output="$(LC_ALL=C "${FAIL2BAN_BIN}" status "${jail}" 2>/dev/null)"; then
+            riph_log "Fail2ban jail not active: ${jail}"
+            continue
+        fi
+
+        banned_line="$(awk -F 'Banned IP list:[[:space:]]*' 'NF > 1 {print $2}' <<<"${status_output}")"
+        read -r -a BANNED_IPS <<<"${banned_line}"
+        for banned_ip in "${BANNED_IPS[@]}"; do
+            riph_is_ipv4 "${banned_ip}" || continue
+            if ip_is_trusted "${banned_ip}"; then
+                if (( DRY_RUN == 1 )); then
+                    riph_log "dry-run: would unban trusted ${banned_ip} from ${jail}"
+                else
+                    "${FAIL2BAN_BIN}" set "${jail}" unbanip "${banned_ip}" >/dev/null
+                    riph_log "unbanned trusted ${banned_ip} from ${jail}"
+                fi
+                UNBANNED=$((UNBANNED + 1))
+            fi
+        done
+    done
+fi
+
+printf '%s\ttrusted_unbanned=%d\tmanual_conflicts=%d\n' \
+    "$(riph_utc_iso_from_epoch "${NOW_EPOCH}")" "${UNBANNED}" "${MANUAL_CONFLICTS}" \
+    >>"${LOG_DIR}/trusted-unban-guard.log"
+
+if (( MANUAL_CONFLICTS > 0 )); then
+    riph_die "manual deny list overlaps the effective trusted set"
+fi
+
+riph_log "guard complete: trusted_unbanned=${UNBANNED}"
