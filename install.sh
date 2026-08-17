@@ -52,11 +52,25 @@ while (($#)); do
             MODE="install"
             shift
             ;;
-        --apply) DO_APPLY=1; shift ;;
-        --enable-timers) ENABLE_TIMERS=1; shift ;;
-        --replace-config) REPLACE_CONFIG=1; shift ;;
-        -h|--help) usage; exit 0 ;;
-        *) riph_die "unknown argument: $1" ;;
+        --apply)
+            DO_APPLY=1
+            shift
+            ;;
+        --enable-timers)
+            ENABLE_TIMERS=1
+            shift
+            ;;
+        --replace-config)
+            REPLACE_CONFIG=1
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            riph_die "unknown argument: $1"
+            ;;
     esac
 done
 
@@ -76,11 +90,17 @@ for required in \
     src/usr/local/sbin/riph-generate-allowlist \
     src/usr/local/sbin/riph-generate-routing \
     src/usr/local/sbin/riph-apply-manual-deny \
+    src/usr/local/sbin/riph-fail2ban-ignore \
     src/usr/local/sbin/riph-trusted-unban-guard \
     src/usr/local/sbin/riph-reconcile \
     src/usr/local/sbin/riph-router-ip-updated \
     src/usr/local/sbin/riph-rollback \
-    src/usr/local/sbin/riph-admin; do
+    src/usr/local/sbin/riph-admin \
+    src/etc/fail2ban/filter.d/nginx-stream-sni-reject.conf \
+    src/etc/fail2ban/filter.d/nginx-stream-private-sni-abuse.conf \
+    src/etc/fail2ban/action.d/riph-ufw-443.conf \
+    src/etc/fail2ban/jail.d/nginx-stream-sni-reject.local \
+    src/etc/fail2ban/jail.d/nginx-stream-private-sni-abuse.local; do
     [[ -f "${SCRIPT_DIR}/${required}" ]] || riph_die "repository is incomplete: ${required}"
 done
 
@@ -100,6 +120,8 @@ preflight() {
         riph_require_cmd nginx
         riph_require_cmd systemctl
         riph_require_cmd ufw
+        riph_require_cmd fail2ban-client
+        riph_require_cmd fail2ban-regex
         [[ -f /etc/nginx/nginx.conf ]] || riph_die "/etc/nginx/nginx.conf is missing"
         grep -F 'include /etc/nginx/stream-enabled/*.conf;' /etc/nginx/nginx.conf >/dev/null \
             || riph_die "nginx.conf does not include /etc/nginx/stream-enabled/*.conf"
@@ -134,6 +156,8 @@ BACKUP_ID="$(date -u '+%Y%m%d-%H%M%S')-$$"
 BACKUP_DIR="${INSTALL_BACKUP_ROOT}/${BACKUP_ID}"
 mkdir -p "${BACKUP_DIR}"
 
+# destination|source|mode|policy
+# policy=replace: always install; policy=seed: install only if missing unless --replace-config.
 mapfile -t FILE_SPECS <<'EOF_SPECS'
 /usr/local/libexec/riph-common.sh|src/usr/local/libexec/riph-common.sh|0644|replace
 /usr/local/libexec/riph-trusted.sh|src/usr/local/libexec/riph-trusted.sh|0644|replace
@@ -142,6 +166,7 @@ mapfile -t FILE_SPECS <<'EOF_SPECS'
 /usr/local/sbin/riph-generate-allowlist|src/usr/local/sbin/riph-generate-allowlist|0755|replace
 /usr/local/sbin/riph-generate-routing|src/usr/local/sbin/riph-generate-routing|0755|replace
 /usr/local/sbin/riph-apply-manual-deny|src/usr/local/sbin/riph-apply-manual-deny|0755|replace
+/usr/local/sbin/riph-fail2ban-ignore|src/usr/local/sbin/riph-fail2ban-ignore|0755|replace
 /usr/local/sbin/riph-trusted-unban-guard|src/usr/local/sbin/riph-trusted-unban-guard|0755|replace
 /usr/local/sbin/riph-reconcile|src/usr/local/sbin/riph-reconcile|0755|replace
 /usr/local/sbin/riph-router-ip-updated|src/usr/local/sbin/riph-router-ip-updated|0755|replace
@@ -151,6 +176,11 @@ mapfile -t FILE_SPECS <<'EOF_SPECS'
 /etc/systemd/system/riph-reconcile.timer|src/etc/systemd/system/riph-reconcile.timer|0644|replace
 /etc/systemd/system/riph-guard.service|src/etc/systemd/system/riph-guard.service|0644|replace
 /etc/systemd/system/riph-guard.timer|src/etc/systemd/system/riph-guard.timer|0644|replace
+/etc/fail2ban/filter.d/nginx-stream-sni-reject.conf|src/etc/fail2ban/filter.d/nginx-stream-sni-reject.conf|0644|replace
+/etc/fail2ban/filter.d/nginx-stream-private-sni-abuse.conf|src/etc/fail2ban/filter.d/nginx-stream-private-sni-abuse.conf|0644|replace
+/etc/fail2ban/action.d/riph-ufw-443.conf|src/etc/fail2ban/action.d/riph-ufw-443.conf|0644|replace
+/etc/fail2ban/jail.d/nginx-stream-sni-reject.local|src/etc/fail2ban/jail.d/nginx-stream-sni-reject.local|0644|replace
+/etc/fail2ban/jail.d/nginx-stream-private-sni-abuse.local|src/etc/fail2ban/jail.d/nginx-stream-private-sni-abuse.local|0644|replace
 /etc/router-ip-push-hardening/config.env|config/config.env.example|0600|seed
 /etc/router-ip-push-hardening/trusted-static.list|config/trusted-static.list.example|0600|seed
 /etc/router-ip-push-hardening/previous-ip-grace.json|config/previous-ip-grace.json.example|0600|seed
@@ -187,10 +217,27 @@ restore_install_backup() {
 }
 
 INSTALL_STARTED=0
+restore_runtime_services_after_error() {
+    [[ "${RIPH_ROOT}" == "/" ]] || return 0
+    if nginx -t >/dev/null 2>&1; then
+        systemctl reload nginx >/dev/null 2>&1 || riph_log "WARNING: failed to reload restored Nginx state"
+    else
+        riph_log "WARNING: restored Nginx state fails nginx -t"
+    fi
+    if fail2ban-client -t >/dev/null 2>&1; then
+        systemctl restart fail2ban >/dev/null 2>&1 || riph_log "WARNING: failed to restart restored Fail2ban state"
+    else
+        riph_log "WARNING: restored Fail2ban state fails validation"
+    fi
+}
+
 on_install_error() {
     local rc=$?
     trap - ERR
-    if (( INSTALL_STARTED == 1 )); then restore_install_backup || true; fi
+    if (( INSTALL_STARTED == 1 )); then
+        restore_install_backup || true
+        restore_runtime_services_after_error || true
+    fi
     exit "${rc}"
 }
 trap on_install_error ERR
@@ -214,7 +261,9 @@ for spec in "${FILE_SPECS[@]}"; do
     IFS='|' read -r logical source_rel mode policy <<<"${spec}"
     target="$(riph_root_path "${logical}")"
     source_file="${SCRIPT_DIR}/${source_rel}"
-    if [[ "${policy}" == seed && -e "${target}" && "${REPLACE_CONFIG}" != "1" ]]; then continue; fi
+    if [[ "${policy}" == seed && -e "${target}" && "${REPLACE_CONFIG}" != "1" ]]; then
+        continue
+    fi
     mkdir -p "$(dirname "${target}")"
     temp="${target}.riph-install.$$"
     install -m "${mode}" "${source_file}" "${temp}"
@@ -225,6 +274,11 @@ if (( DO_APPLY == 1 )); then
     installed_apply="$(riph_root_path /usr/local/sbin/riph-apply)"
     installed_guard="$(riph_root_path /usr/local/sbin/riph-trusted-unban-guard)"
     bash "${installed_apply}" --root "${RIPH_ROOT}" --reason "initial hardening install"
+    if [[ "${RIPH_ROOT}" == "/" ]]; then
+        touch /var/log/nginx/stream-sni.log
+        fail2ban-client -t
+        systemctl restart fail2ban
+    fi
     bash "${installed_guard}" --root "${RIPH_ROOT}"
 fi
 
