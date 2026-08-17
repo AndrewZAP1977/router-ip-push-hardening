@@ -5,17 +5,20 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMMON_DEFAULT="/usr/local/libexec/riph-common.sh"
 GENERATOR_DEFAULT="/usr/local/sbin/riph-generate-allowlist"
+ROUTING_GENERATOR_DEFAULT="/usr/local/sbin/riph-generate-routing"
 
 if [[ -f "${SCRIPT_DIR}/../libexec/riph-common.sh" ]]; then
     # Repository/test layout.
     # shellcheck source=../libexec/riph-common.sh
     source "${SCRIPT_DIR}/../libexec/riph-common.sh"
     GENERATOR="${SCRIPT_DIR}/riph-generate-allowlist"
+    ROUTING_GENERATOR="${SCRIPT_DIR}/riph-generate-routing"
 else
     # Installed layout.
     # shellcheck source=/usr/local/libexec/riph-common.sh
     source "${COMMON_DEFAULT}"
     GENERATOR="${GENERATOR_DEFAULT}"
+    ROUTING_GENERATOR="${ROUTING_GENERATOR_DEFAULT}"
 fi
 
 RIPH_ROOT="/"
@@ -92,13 +95,15 @@ riph_prepare_dirs
 STATE_DIR="$(riph_root_path "${RIPH_STATE_DIR}")"
 CONFIG_DIR="$(riph_root_path "${RIPH_CONFIG_DIR}")"
 ALLOWLIST_FILE="$(riph_root_path "${ALLOWLIST_OUTPUT}")"
+STREAM_FILE="$(riph_root_path "${STREAM_OUTPUT:-/etc/nginx/stream-enabled/stream.conf}")"
+BRIDGE_FILE="$(riph_root_path "${BRIDGE_OUTPUT:-/etc/nginx/stream-enabled/06-router-ip-push-fake-site-bridges.conf}")"
 GRACE_FILE="${CONFIG_DIR}/previous-ip-grace.json"
 LAST_STATE_FILE="${CONFIG_DIR}/last-apply-state.json"
 LOCK_FILE="${STATE_DIR}/locks/apply.lock"
 RUNTIME_DIR="${STATE_DIR}/runtime"
 BACKUP_ROOT="${STATE_DIR}/backups"
 
-mkdir -p "${CONFIG_DIR}" "$(dirname "${ALLOWLIST_FILE}")"
+mkdir -p "${CONFIG_DIR}" "$(dirname "${ALLOWLIST_FILE}")" "$(dirname "${STREAM_FILE}")" "$(dirname "${BRIDGE_FILE}")"
 
 exec 9>"${LOCK_FILE}"
 if ! flock -n 9; then
@@ -117,6 +122,8 @@ trap cleanup EXIT
 
 CANDIDATE_GRACE="${RUN_DIR}/previous-ip-grace.json"
 CANDIDATE_ALLOWLIST="${RUN_DIR}/05-router-ip-push-source-allow.conf"
+CANDIDATE_STREAM="${RUN_DIR}/stream.conf"
+CANDIDATE_BRIDGE="${RUN_DIR}/06-router-ip-push-fake-site-bridges.conf"
 CANDIDATE_STATE="${RUN_DIR}/last-apply-state.json"
 CURRENT_ROUTERS_JSON="${RUN_DIR}/current-routers.json"
 
@@ -242,26 +249,49 @@ trap 'rm -f "${GEN_GRACE_VISIBLE}" "${GEN_ALLOWLIST_VISIBLE}"; cleanup' EXIT
 mv "${GEN_ALLOWLIST_VISIBLE}" "${CANDIDATE_ALLOWLIST}"
 rm -f "${GEN_GRACE_VISIBLE}"
 
+ROUTE_STREAM_LOGICAL="${RIPH_STATE_DIR}/runtime/generated-stream.candidate.$$.conf"
+ROUTE_BRIDGE_LOGICAL="${RIPH_STATE_DIR}/runtime/generated-bridges.candidate.$$.conf"
+ROUTE_STREAM_VISIBLE="$(riph_root_path "${ROUTE_STREAM_LOGICAL}")"
+ROUTE_BRIDGE_VISIBLE="$(riph_root_path "${ROUTE_BRIDGE_LOGICAL}")"
+trap 'rm -f "${GEN_GRACE_VISIBLE}" "${GEN_ALLOWLIST_VISIBLE}" "${ROUTE_STREAM_VISIBLE}" "${ROUTE_BRIDGE_VISIBLE}"; cleanup' EXIT
+"${ROUTING_GENERATOR}" \
+    --root "${RIPH_ROOT}" \
+    --config "${CONFIG_PATH}" \
+    --stream-output "${ROUTE_STREAM_LOGICAL}" \
+    --bridge-output "${ROUTE_BRIDGE_LOGICAL}" >/dev/null
+mv "${ROUTE_STREAM_VISIBLE}" "${CANDIDATE_STREAM}"
+mv "${ROUTE_BRIDGE_VISIBLE}" "${CANDIDATE_BRIDGE}"
+
 ALLOWLIST_SHA="$(riph_sha256_file "${CANDIDATE_ALLOWLIST}")"
+STREAM_SHA="$(riph_sha256_file "${CANDIDATE_STREAM}")"
+BRIDGE_SHA="$(riph_sha256_file "${CANDIDATE_BRIDGE}")"
 
 jq -n \
     --arg applied_at "${NOW_ISO}" \
     --arg reason "${REASON}" \
-    --arg sha "${ALLOWLIST_SHA}" \
+    --arg allowlist_sha "${ALLOWLIST_SHA}" \
+    --arg stream_sha "${STREAM_SHA}" \
+    --arg bridge_sha "${BRIDGE_SHA}" \
     --slurpfile current "${CURRENT_ROUTERS_JSON}" \
     '{
         "version": 1,
         "applied_at": $applied_at,
         "reason": $reason,
-        "allowlist_sha256": $sha,
+        "allowlist_sha256": $allowlist_sha,
+        "stream_sha256": $stream_sha,
+        "bridge_sha256": $bridge_sha,
         "routers": $current[0].routers
     }' >"${CANDIDATE_STATE}"
 
 allowlist_changed=1
+stream_changed=1
+bridge_changed=1
 grace_changed=1
 state_semantic_changed=1
 
 [[ -f "${ALLOWLIST_FILE}" ]] && cmp -s "${ALLOWLIST_FILE}" "${CANDIDATE_ALLOWLIST}" && allowlist_changed=0
+[[ -f "${STREAM_FILE}" ]] && cmp -s "${STREAM_FILE}" "${CANDIDATE_STREAM}" && stream_changed=0
+[[ -f "${BRIDGE_FILE}" ]] && cmp -s "${BRIDGE_FILE}" "${CANDIDATE_BRIDGE}" && bridge_changed=0
 [[ -f "${GRACE_FILE}" ]] && cmp -s "${GRACE_FILE}" "${CANDIDATE_GRACE}" && grace_changed=0
 
 if [[ -f "${LAST_STATE_FILE}" ]]; then
@@ -273,18 +303,25 @@ if [[ -f "${LAST_STATE_FILE}" ]]; then
     fi
 fi
 
-if (( allowlist_changed == 0 && grace_changed == 0 && state_semantic_changed == 0 )); then
-    riph_log "no effective trusted-set change; nothing to apply"
+if (( allowlist_changed == 0 && stream_changed == 0 && bridge_changed == 0 && grace_changed == 0 && state_semantic_changed == 0 )); then
+    riph_log "no trusted/routing state change; nothing to apply"
     exit 0
 fi
 
 if (( DRY_RUN == 1 )); then
-    riph_log "dry-run: allowlist_changed=${allowlist_changed} grace_changed=${grace_changed} state_changed=${state_semantic_changed}"
-    if [[ -f "${ALLOWLIST_FILE}" ]]; then
-        diff -u "${ALLOWLIST_FILE}" "${CANDIDATE_ALLOWLIST}" || true
-    else
-        cat "${CANDIDATE_ALLOWLIST}"
-    fi
+    riph_log "dry-run: allowlist_changed=${allowlist_changed} stream_changed=${stream_changed} bridge_changed=${bridge_changed} grace_changed=${grace_changed} state_changed=${state_semantic_changed}"
+    for pair in \
+        "${ALLOWLIST_FILE}|${CANDIDATE_ALLOWLIST}" \
+        "${STREAM_FILE}|${CANDIDATE_STREAM}" \
+        "${BRIDGE_FILE}|${CANDIDATE_BRIDGE}"; do
+        current="${pair%%|*}"
+        candidate="${pair#*|}"
+        if [[ -f "${current}" ]]; then
+            diff -u "${current}" "${candidate}" || true
+        else
+            cat "${candidate}"
+        fi
+    done
     exit 0
 fi
 
@@ -303,6 +340,8 @@ backup_one() {
 }
 
 backup_one "${ALLOWLIST_FILE}" "allowlist.conf"
+backup_one "${STREAM_FILE}" "stream.conf"
+backup_one "${BRIDGE_FILE}" "bridges.conf"
 backup_one "${GRACE_FILE}" "previous-ip-grace.json"
 backup_one "${LAST_STATE_FILE}" "last-apply-state.json"
 
@@ -310,12 +349,16 @@ jq -n \
     --arg created_at "${NOW_ISO}" \
     --arg reason "${REASON}" \
     --argjson allowlist_changed "${allowlist_changed}" \
+    --argjson stream_changed "${stream_changed}" \
+    --argjson bridge_changed "${bridge_changed}" \
     --argjson grace_changed "${grace_changed}" \
     '{
         "version": 1,
         "created_at": $created_at,
         "reason": $reason,
         "allowlist_changed": ($allowlist_changed == 1),
+        "stream_changed": ($stream_changed == 1),
+        "bridge_changed": ($bridge_changed == 1),
         "grace_changed": ($grace_changed == 1)
     }' >"${BACKUP_DIR}/manifest.json"
 
@@ -332,6 +375,8 @@ restore_one() {
 
 rollback_files() {
     restore_one "${ALLOWLIST_FILE}" "allowlist.conf"
+    restore_one "${STREAM_FILE}" "stream.conf"
+    restore_one "${BRIDGE_FILE}" "bridges.conf"
     restore_one "${GRACE_FILE}" "previous-ip-grace.json"
     restore_one "${LAST_STATE_FILE}" "last-apply-state.json"
 }
@@ -347,6 +392,8 @@ atomic_install() {
 }
 
 atomic_install "${CANDIDATE_ALLOWLIST}" "${ALLOWLIST_FILE}" 0644
+atomic_install "${CANDIDATE_STREAM}" "${STREAM_FILE}" 0644
+atomic_install "${CANDIDATE_BRIDGE}" "${BRIDGE_FILE}" 0644
 atomic_install "${CANDIDATE_GRACE}" "${GRACE_FILE}" 0600
 atomic_install "${CANDIDATE_STATE}" "${LAST_STATE_FILE}" 0600
 
@@ -362,7 +409,9 @@ if ! "${NGINX_BIN}" -t; then
     riph_die "apply aborted; previous files restored"
 fi
 
-if (( allowlist_changed == 1 )); then
+nginx_changed=$(( allowlist_changed || stream_changed || bridge_changed ))
+
+if (( nginx_changed == 1 )); then
     if ! "${SYSTEMCTL_BIN}" reload nginx; then
         riph_log "nginx reload failed; restoring previous files"
         rollback_files
@@ -374,7 +423,7 @@ if (( allowlist_changed == 1 )); then
         fi
         riph_die "apply failed during reload; previous files restored"
     fi
-    riph_log "trusted-source allowlist applied and Nginx reloaded"
+    riph_log "trusted/routing Nginx configuration applied and reloaded"
 else
     riph_log "state updated; Nginx reload not required"
 fi
