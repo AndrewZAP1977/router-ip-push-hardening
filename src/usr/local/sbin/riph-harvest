@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+COMMON_DEFAULT="/usr/local/libexec/riph-common.sh"
+if [[ -f "${SCRIPT_DIR}/../libexec/riph-common.sh" ]]; then
+    # shellcheck source=../libexec/riph-common.sh
+    source "${SCRIPT_DIR}/../libexec/riph-common.sh"
+else
+    # shellcheck source=/usr/local/libexec/riph-common.sh
+    source "${COMMON_DEFAULT}"
+fi
+
+RIPH_ROOT="/"
+CONFIG_PATH="/etc/router-ip-push-hardening/config.env"
+LOGICAL_LOG="/var/log/nginx/stream-sni.log"
+MODE="report"
+ALL_LOG=0
+TOP_N=10
+
+usage() {
+    cat <<'USAGE'
+Usage: riph-harvest [options]
+
+Options:
+  --root DIR          Test root prefix.
+  --config PATH       Config path inside root.
+  --log PATH          Stream audit log path inside root.
+  --checkpoint        Store current inode/byte offset and exit.
+  --all               Analyze the whole current log, ignoring checkpoint.
+  --top N             Number of top IP/SNI/route rows (default 10).
+  -h, --help          Show this help.
+USAGE
+}
+
+while (($#)); do
+    case "$1" in
+        --root)
+            (($# >= 2)) || riph_die "--root requires a value"
+            RIPH_ROOT="$(riph_validate_root "$2")"
+            shift 2
+            ;;
+        --config)
+            (($# >= 2)) || riph_die "--config requires a value"
+            CONFIG_PATH="$2"
+            shift 2
+            ;;
+        --log)
+            (($# >= 2)) || riph_die "--log requires a value"
+            LOGICAL_LOG="$2"
+            shift 2
+            ;;
+        --checkpoint)
+            MODE="checkpoint"
+            shift
+            ;;
+        --all)
+            ALL_LOG=1
+            shift
+            ;;
+        --top)
+            (($# >= 2)) || riph_die "--top requires a value"
+            [[ "$2" =~ ^[1-9][0-9]*$ ]] || riph_die "--top must be a positive integer"
+            TOP_N="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            riph_die "unknown argument: $1"
+            ;;
+    esac
+done
+
+[[ "${LOGICAL_LOG}" == /* ]] || riph_die "log path must be absolute"
+riph_require_cmd jq
+riph_require_cmd stat
+riph_require_cmd tail
+riph_require_cmd awk
+riph_require_cmd sort
+riph_require_cmd uniq
+
+CONFIG_FILE="$(riph_root_path "${CONFIG_PATH}")"
+riph_load_config "${CONFIG_FILE}"
+riph_prepare_dirs
+LOG_FILE="$(riph_root_path "${LOGICAL_LOG}")"
+CHECKPOINT_FILE="$(riph_root_path "${RIPH_STATE_DIR}/runtime/harvest-checkpoint.json")"
+mkdir -p "$(dirname "${CHECKPOINT_FILE}")"
+
+[[ -f "${LOG_FILE}" ]] || riph_die "stream audit log not found: ${LOG_FILE}"
+INODE="$(stat -c '%i' "${LOG_FILE}")"
+SIZE="$(stat -c '%s' "${LOG_FILE}")"
+
+if [[ "${MODE}" == checkpoint ]]; then
+    tmp="${CHECKPOINT_FILE}.tmp.$$"
+    jq -n \
+        --arg log "${LOGICAL_LOG}" \
+        --arg inode "${INODE}" \
+        --argjson offset "${SIZE}" \
+        --arg created_at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+        '{version:1,log:$log,inode:$inode,offset:$offset,created_at:$created_at}' >"${tmp}"
+    install -m 0600 "${tmp}" "${CHECKPOINT_FILE}"
+    rm -f "${tmp}"
+    riph_log "harvest checkpoint set at byte ${SIZE} (inode ${INODE})"
+    exit 0
+fi
+
+INPUT="$(mktemp)"
+trap 'rm -f "${INPUT}"' EXIT
+REPORT_MODE="all"
+if (( ALL_LOG == 0 )) && [[ -f "${CHECKPOINT_FILE}" ]]; then
+    jq -e '.version == 1 and (.inode | type == "string") and (.offset | type == "number")' "${CHECKPOINT_FILE}" >/dev/null \
+        || riph_die "invalid harvest checkpoint: ${CHECKPOINT_FILE}"
+    OLD_INODE="$(jq -r '.inode' "${CHECKPOINT_FILE}")"
+    OLD_OFFSET="$(jq -r '.offset' "${CHECKPOINT_FILE}")"
+    if [[ "${OLD_INODE}" == "${INODE}" && "${OLD_OFFSET}" =~ ^[0-9]+$ ]] && (( SIZE >= OLD_OFFSET )); then
+        START=$(( OLD_OFFSET + 1 ))
+        tail -c "+${START}" "${LOG_FILE}" >"${INPUT}"
+        REPORT_MODE="since-checkpoint"
+    else
+        cp -a "${LOG_FILE}" "${INPUT}"
+        REPORT_MODE="rotation-fallback-full-current-log"
+    fi
+else
+    cp -a "${LOG_FILE}" "${INPUT}"
+fi
+
+TOTAL="$(awk 'NF {n++} END {print n+0}' "${INPUT}")"
+REJECT="$(awk '$0 ~ /(^|[[:space:]])route=reject([[:space:]]|$)/ {n++} END {print n+0}' "${INPUT}")"
+FAKE="$(awk '$0 ~ /(^|[[:space:]])route=fake_[0-9]+([[:space:]]|$)/ {n++} END {print n+0}' "${INPUT}")"
+XRAY="$(awk '$0 ~ /(^|[[:space:]])route=xray_[0-9]+([[:space:]]|$)/ {n++} END {print n+0}' "${INPUT}")"
+WWW="$(awk '$0 ~ /(^|[[:space:]])route=www([[:space:]]|$)/ {n++} END {print n+0}' "${INPUT}")"
+
+printf 'RIPH stream harvest\n===================\n'
+printf 'mode: %s\n' "${REPORT_MODE}"
+printf 'total: %s\nreject: %s\nfake: %s\nxray: %s\nwww: %s\n' "${TOTAL}" "${REJECT}" "${FAKE}" "${XRAY}" "${WWW}"
+
+field_top() {
+    local key="$1" title="$2"
+    printf '\n%s:\n' "${title}"
+    awk -v key="${key}" '
+        {
+            for (i = 1; i <= NF; i++) {
+                prefix = key "="
+                if (index($i, prefix) == 1) {
+                    print substr($i, length(prefix) + 1)
+                    break
+                }
+            }
+        }
+    ' "${INPUT}" | sort | uniq -c | sort -nr | head -n "${TOP_N}" || true
+}
+
+field_top route 'Top routes'
+field_top src 'Top source IPs'
+field_top sni 'Top SNI'
