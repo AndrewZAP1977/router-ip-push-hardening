@@ -1,0 +1,5 @@
+# Manual TCP/443-only deny list.
+# One IPv4 or CIDR per line. Comments are allowed.
+# Example:
+# 45.148.10.0/24     # aggressive SNI scanner
+# 199.45.154.0/23    # scanner range
