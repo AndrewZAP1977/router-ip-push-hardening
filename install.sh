@@ -22,7 +22,7 @@ Modes (choose one):
 
 Install options:
   --apply             After file installation, run transactional apply + guard.
-  --enable-timers     Enable Router-IP watch, reconcile and guard timers after successful apply.
+  --enable-timers     Enable Router-IP watch and 5-minute reconcile after successful apply.
   --replace-config    Replace config/list files with repository examples (backed up).
 
 Global options:
@@ -102,6 +102,9 @@ for required in \
     src/etc/fail2ban/action.d/riph-ufw-443.conf \
     src/etc/fail2ban/jail.d/nginx-stream-sni-reject.local \
     src/etc/fail2ban/jail.d/nginx-stream-private-sni-abuse.local \
+    src/etc/systemd/system/riph-reconcile.service \
+    src/etc/systemd/system/riph-reconcile.timer \
+    src/etc/systemd/system/riph-guard.service \
     src/etc/systemd/system/riph-router-ip.path; do
     [[ -f "${SCRIPT_DIR}/${required}" ]] || riph_die "repository is incomplete: ${required}"
 done
@@ -178,7 +181,6 @@ mapfile -t FILE_SPECS <<'EOF_SPECS'
 /etc/systemd/system/riph-reconcile.service|src/etc/systemd/system/riph-reconcile.service|0644|replace
 /etc/systemd/system/riph-reconcile.timer|src/etc/systemd/system/riph-reconcile.timer|0644|replace
 /etc/systemd/system/riph-guard.service|src/etc/systemd/system/riph-guard.service|0644|replace
-/etc/systemd/system/riph-guard.timer|src/etc/systemd/system/riph-guard.timer|0644|replace
 /etc/systemd/system/riph-router-ip.path|src/etc/systemd/system/riph-router-ip.path|0644|replace
 /etc/fail2ban/filter.d/nginx-stream-sni-reject.conf|src/etc/fail2ban/filter.d/nginx-stream-sni-reject.conf|0644|replace
 /etc/fail2ban/filter.d/nginx-stream-private-sni-abuse.conf|src/etc/fail2ban/filter.d/nginx-stream-private-sni-abuse.conf|0644|replace
@@ -289,7 +291,7 @@ fi
 if (( ENABLE_TIMERS == 1 )); then
     [[ "${RIPH_ROOT}" == "/" ]] || riph_die "--enable-timers is only valid for real production root"
     systemctl daemon-reload
-    systemctl enable --now riph-router-ip.path riph-reconcile.timer riph-guard.timer
+    systemctl enable --now riph-router-ip.path riph-reconcile.timer
 fi
 
 trap - ERR
