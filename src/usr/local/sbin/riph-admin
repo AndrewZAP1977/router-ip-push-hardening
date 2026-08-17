@@ -94,7 +94,7 @@ MANUAL_ALL_FILE="${CONFIG_DIR}/manual-deny-all.list"
 ALLOWLIST_FILE="$(riph_root_path "${ALLOWLIST_OUTPUT}")"
 STREAM_FILE="$(riph_root_path "${STREAM_OUTPUT:-/etc/nginx/stream-enabled/stream.conf}")"
 BRIDGE_FILE="$(riph_root_path "${BRIDGE_OUTPUT:-/etc/nginx/stream-enabled/06-router-ip-push-fake-site-bridges.conf}")"
-STREAM_LOG="$(riph_root_path /var/log/nginx/stream-sni.log)"
+STREAM_LOG="$(riph_root_path "${STREAM_AUDIT_LOG:-/var/log/nginx/riph-stream-sni.log}")"
 
 resolve_tool() {
     local name="$1"
@@ -198,7 +198,7 @@ status_cmd() {
         else
             printf '%s\n' 'FAILED'
         fi
-        printf '\nFail2ban:\n'
+        printf '\nFail2ban (RIPH jails only):\n'
         fail2ban_status_cmd || true
         printf '\nTimers/watch:\n'
         timers_cmd || true
@@ -326,7 +326,7 @@ fail2ban_status_cmd() {
         printf '%s\n' 'fail2ban-client not found'
         return 1
     fi
-    read -r -a jails <<<"${RIPH_FAIL2BAN_JAILS:-nginx-stream-sni-reject nginx-stream-private-sni-abuse}"
+    read -r -a jails <<<"${RIPH_FAIL2BAN_JAILS:-riph-nginx-stream-sni-reject riph-nginx-stream-private-sni-abuse}"
     for jail in "${jails[@]}"; do
         printf '\n[%s]\n' "${jail}"
         if output="$(LC_ALL=C fail2ban-client status "${jail}" 2>&1)"; then
@@ -341,13 +341,13 @@ fail2ban_unban_cmd() {
     local ip="$1" jail
     [[ "${RIPH_ROOT}" == "/" ]] || riph_die "Fail2ban unban is available only on production root"
     riph_is_ipv4 "${ip}" || riph_die "invalid IPv4: ${ip}"
-    read -r -a jails <<<"${RIPH_FAIL2BAN_JAILS:-nginx-stream-sni-reject nginx-stream-private-sni-abuse}"
+    read -r -a jails <<<"${RIPH_FAIL2BAN_JAILS:-riph-nginx-stream-sni-reject riph-nginx-stream-private-sni-abuse}"
     for jail in "${jails[@]}"; do
         if fail2ban-client status "${jail}" >/dev/null 2>&1; then
             fail2ban-client set "${jail}" unbanip "${ip}" >/dev/null || true
         fi
     done
-    riph_log "requested unban of ${ip} from project jails"
+    riph_log "requested unban of ${ip} from RIPH jails"
 }
 
 fail2ban_reload_cmd() {
@@ -395,7 +395,7 @@ recent_log_cmd() {
     if [[ -f "${STREAM_LOG}" ]]; then
         tail -n "${lines}" "${STREAM_LOG}"
     else
-        printf '%s\n' '(stream-sni.log not created yet)'
+        printf '(RIPH stream audit log not created yet: %s)\n' "${STREAM_LOG}"
     fi
 }
 
@@ -429,13 +429,13 @@ Router IP Push Hardening
 11. Remove manual deny 443 CIDR
 12. Add manual deny ALL CIDR
 13. Remove manual deny ALL CIDR
-14. Fail2ban status
-15. Fail2ban unban IP
+14. RIPH Fail2ban status
+15. RIPH Fail2ban unban IP
 16. Fail2ban validate + reload
 17. UFW relevant status
 18. Harvest since checkpoint
 19. Set harvest checkpoint
-20. Recent stream log
+20. Recent RIPH stream log
 21. List backups
 22. Rollback
  0. Exit
