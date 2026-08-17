@@ -1,0 +1,13 @@
+# Managed by router-ip-push-hardening.
+
+[nginx-stream-private-sni-abuse]
+enabled = true
+filter = nginx-stream-private-sni-abuse
+logpath = /var/log/nginx/stream-sni.log
+backend = polling
+usedns = no
+maxretry = 3
+findtime = 2m
+bantime = 12h
+ignorecommand = /usr/local/sbin/riph-fail2ban-ignore <ip>
+action = riph-ufw-443[name=nginx-stream-private-sni-abuse]
