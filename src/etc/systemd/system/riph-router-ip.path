@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch Router IP Push current-IP changes
+
+[Path]
+PathChanged=/var/lib/router-ip-push/ips
+Unit=riph-reconcile.service
+
+[Install]
+WantedBy=multi-user.target
