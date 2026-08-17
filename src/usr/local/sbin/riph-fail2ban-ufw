@@ -6,7 +6,7 @@ MODE="${1:-}"
 JAIL="${2:-}"
 IP="${3:-}"
 UFW_BIN="${RIPH_UFW_BIN:-ufw}"
-LOCK_FILE="${RIPH_F2B_UFW_LOCK:-/run/lock/riph-f2b-ufw.lock}"
+LOCK_FILE="${RIPH_UFW_LOCK:-/run/lock/riph-ufw.lock}"
 
 [[ "${MODE}" == ban || "${MODE}" == unban ]] || { echo 'invalid mode' >&2; exit 2; }
 [[ "${JAIL}" =~ ^[A-Za-z0-9._-]{1,80}$ ]] || { echo 'invalid jail name' >&2; exit 2; }
@@ -28,7 +28,9 @@ find_owned_rule_numbers() {
     local line
     LC_ALL=C "${UFW_BIN}" status numbered 2>/dev/null \
         | while IFS= read -r line; do
-            [[ "${line}" == *"${IP}"* ]] || continue
+            # Source address is rendered as a whitespace-delimited token by
+            # `ufw status numbered`; do not use substring matching here.
+            [[ " ${line} " == *" ${IP} "* ]] || continue
             [[ "${line}" == *"# ${MARKER}"* ]] || continue
             if [[ "${line}" =~ ^[[:space:]]*\[[[:space:]]*([0-9]+)\] ]]; then
                 printf '%s\n' "${BASH_REMATCH[1]}"
