@@ -1,0 +1,8 @@
+[Unit]
+Description=Router IP Push Hardening reconcile
+After=network-online.target nginx.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/riph-reconcile --reason "periodic reconcile"
