@@ -12,6 +12,9 @@ cp "${ROOT}/config/config.env.example" "${T}/etc/router-ip-push-hardening/config
 
 STREAM="${T}/etc/nginx/stream-enabled/stream.conf"
 BRIDGE="${T}/etc/nginx/stream-enabled/06-router-ip-push-fake-site-bridges.conf"
+grep -F 'log_format riph_stream_sni' "${STREAM}" >/dev/null
+grep -F 'src=$remote_addr route=$sni_name' "${STREAM}" >/dev/null
+grep -F 'access_log /var/log/nginx/stream-sni.log riph_stream_sni;' "${STREAM}" >/dev/null
 grep -F 'nukla.layerupzap.ru|0' "${STREAM}" >/dev/null
 grep -F 'nukla.layerupzap.ru|1' "${STREAM}" >/dev/null
 grep -F 'treda.layerupzap.ru|1' "${STREAM}" >/dev/null
