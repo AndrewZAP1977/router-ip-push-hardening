@@ -14,7 +14,7 @@ fi
 
 RIPH_ROOT="/"
 CONFIG_PATH="/etc/router-ip-push-hardening/config.env"
-LOGICAL_LOG="/var/log/nginx/stream-sni.log"
+LOGICAL_LOG=""
 MODE="report"
 ALL_LOG=0
 TOP_N=10
@@ -26,7 +26,7 @@ Usage: riph-harvest [options]
 Options:
   --root DIR          Test root prefix.
   --config PATH       Config path inside root.
-  --log PATH          Stream audit log path inside root.
+  --log PATH          Override stream audit log path inside root.
   --checkpoint        Store current inode/byte offset and exit.
   --all               Analyze the whole current log, ignoring checkpoint.
   --top N             Number of top IP/SNI/route rows (default 10).
@@ -75,7 +75,6 @@ while (($#)); do
     esac
 done
 
-[[ "${LOGICAL_LOG}" == /* ]] || riph_die "log path must be absolute"
 riph_require_cmd jq
 riph_require_cmd stat
 riph_require_cmd tail
@@ -85,6 +84,8 @@ riph_require_cmd uniq
 
 CONFIG_FILE="$(riph_root_path "${CONFIG_PATH}")"
 riph_load_config "${CONFIG_FILE}"
+LOGICAL_LOG="${LOGICAL_LOG:-${STREAM_AUDIT_LOG:-/var/log/nginx/riph-stream-sni.log}}"
+[[ "${LOGICAL_LOG}" == /* ]] || riph_die "log path must be absolute"
 riph_prepare_dirs
 LOG_FILE="$(riph_root_path "${LOGICAL_LOG}")"
 CHECKPOINT_FILE="$(riph_root_path "${RIPH_STATE_DIR}/runtime/harvest-checkpoint.json")"
@@ -135,7 +136,7 @@ XRAY="$(awk '$0 ~ /(^|[[:space:]])route=xray_[0-9]+([[:space:]]|$)/ {n++} END {p
 WWW="$(awk '$0 ~ /(^|[[:space:]])route=www([[:space:]]|$)/ {n++} END {print n+0}' "${INPUT}")"
 
 printf 'RIPH stream harvest\n===================\n'
-printf 'mode: %s\n' "${REPORT_MODE}"
+printf 'log: %s\nmode: %s\n' "${LOGICAL_LOG}" "${REPORT_MODE}"
 printf 'total: %s\nreject: %s\nfake: %s\nxray: %s\nwww: %s\n' "${TOTAL}" "${REJECT}" "${FAKE}" "${XRAY}" "${WWW}"
 
 field_top() {
