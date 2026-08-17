@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+APPLY="${SCRIPT_DIR}/riph-apply"
+GUARD="${SCRIPT_DIR}/riph-trusted-unban-guard"
+
+RIPH_ROOT="/"
+CONFIG_PATH="/etc/router-ip-push-hardening/config.env"
+REASON="periodic reconcile"
+NOW_EPOCH=""
+DRY_RUN=0
+
+usage() {
+    cat <<'USAGE'
+Usage: riph-reconcile [options]
+
+Options:
+  --root DIR          Pass test root to apply and guard.
+  --config PATH       Config path inside root.
+  --reason TEXT       Human-readable apply reason.
+  --dry-run           Do not mutate Nginx or Fail2ban.
+  --now-epoch EPOCH   Deterministic test time.
+  -h, --help          Show this help.
+USAGE
+}
+
+while (($#)); do
+    case "$1" in
+        --root)
+            (($# >= 2)) || { echo "ERROR: --root requires a value" >&2; exit 1; }
+            RIPH_ROOT="$2"
+            shift 2
+            ;;
+        --config)
+            (($# >= 2)) || { echo "ERROR: --config requires a value" >&2; exit 1; }
+            CONFIG_PATH="$2"
+            shift 2
+            ;;
+        --reason)
+            (($# >= 2)) || { echo "ERROR: --reason requires a value" >&2; exit 1; }
+            REASON="$2"
+            shift 2
+            ;;
+        --dry-run)
+            DRY_RUN=1
+            shift
+            ;;
+        --now-epoch)
+            (($# >= 2)) || { echo "ERROR: --now-epoch requires a value" >&2; exit 1; }
+            [[ "$2" =~ ^[0-9]+$ ]] || { echo "ERROR: --now-epoch must be an integer" >&2; exit 1; }
+            NOW_EPOCH="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "ERROR: unknown argument: $1" >&2
+            exit 1
+            ;;
+    esac
+done
+
+[[ -x "${APPLY}" || -f "${APPLY}" ]] || { echo "ERROR: riph-apply not found: ${APPLY}" >&2; exit 1; }
+[[ -x "${GUARD}" || -f "${GUARD}" ]] || { echo "ERROR: guard not found: ${GUARD}" >&2; exit 1; }
+
+apply_args=(--root "${RIPH_ROOT}" --config "${CONFIG_PATH}" --reason "${REASON}")
+guard_args=(--root "${RIPH_ROOT}" --config "${CONFIG_PATH}")
+
+if [[ -n "${NOW_EPOCH}" ]]; then
+    apply_args+=(--now-epoch "${NOW_EPOCH}")
+    guard_args+=(--now-epoch "${NOW_EPOCH}")
+fi
+if (( DRY_RUN == 1 )); then
+    apply_args+=(--dry-run)
+    guard_args+=(--dry-run)
+fi
+
+bash "${APPLY}" "${apply_args[@]}"
+bash "${GUARD}" "${guard_args[@]}"
