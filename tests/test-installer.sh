@@ -7,7 +7,7 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 
 make_root() {
     local t="$1"
-    mkdir -p "${t}/var/lib/router-ip-push/ips" "${t}/usr/local/bin"
+    mkdir -p "${t}/var/lib/router-ip-push/ips" "${t}/usr/local/bin" "${t}/etc/nginx/stream-enabled"
     printf '%s\n' '78.111.155.187' >"${t}/var/lib/router-ip-push/ips/AX3200.ipv4"
     cat >"${t}/usr/local/bin/nginx-stub" <<'EOF_STUB'
 #!/usr/bin/env bash
@@ -25,6 +25,7 @@ T2="$(mktemp -d /tmp/riph-installer-fail.XXXXXX)"
 trap 'rm -rf "${T1}" "${T2}"' EXIT
 make_root "${T1}"
 make_root "${T2}"
+printf '%s\n' 'PREINSTALL_STREAM_SENTINEL' >"${T1}/etc/nginx/stream-enabled/stream.conf"
 
 echo 'TEST I1: test-root install + apply'
 export RIPH_NGINX_BIN="${T1}/usr/local/bin/nginx-stub"
@@ -41,6 +42,9 @@ export RIPH_SYSTEMCTL_BIN="${T1}/usr/local/bin/systemctl-stub"
 [[ ! -e "${T1}/etc/systemd/system/riph-guard.timer" ]] || fail 'redundant guard timer was installed'
 [[ -f "${T1}/etc/nginx/stream-enabled/stream.conf" ]] || fail 'stream config not applied'
 grep -F 'treda.layerupzap.ru|1' "${T1}/etc/nginx/stream-enabled/stream.conf" >/dev/null || fail 'private routing missing'
+backup_stream="$(find "${T1}/var/lib/router-ip-push-hardening/install-backups" -path '*/files/etc/nginx/stream-enabled/stream.conf' -type f | head -n 1)"
+[[ -n "${backup_stream}" ]] || fail 'install backup did not capture pre-install stream.conf'
+grep -Fx 'PREINSTALL_STREAM_SENTINEL' "${backup_stream}" >/dev/null || fail 'pre-install stream snapshot mismatch'
 
 echo 'TEST I2: failed apply restores pre-install files'
 mkdir -p "${T2}/usr/local/sbin"
