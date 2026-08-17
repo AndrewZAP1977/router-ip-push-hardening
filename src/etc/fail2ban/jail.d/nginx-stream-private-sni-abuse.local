@@ -1,7 +1,8 @@
 # Managed by router-ip-push-hardening.
+# Installed disabled; Phase 7 explicitly activates project jails after routing checks.
 
 [nginx-stream-private-sni-abuse]
-enabled = true
+enabled = false
 filter = nginx-stream-private-sni-abuse
 logpath = /var/log/nginx/stream-sni.log
 backend = polling
