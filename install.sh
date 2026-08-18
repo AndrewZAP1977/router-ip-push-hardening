@@ -13,6 +13,23 @@ ENABLE_TIMERS=0
 REPLACE_CONFIG=0
 TEMP_HOTFIX_ACTIVE=0
 HANDOVER_OWNS_TIMERS=0
+INSTALL_STARTED=0
+INSTALL_COMMITTED=0
+
+HOTFIX_PATH_UNIT="router-ip-push-nginx-hotfix.path"
+HOTFIX_TIMER_UNIT="router-ip-push-nginx-hotfix.timer"
+HOTFIX_SERVICE_UNIT="router-ip-push-nginx-hotfix.service"
+RIPH_PATH_UNIT="riph-router-ip.path"
+RIPH_TIMER_UNIT="riph-reconcile.timer"
+
+HOTFIX_PATH_WAS_ENABLED=""
+HOTFIX_PATH_WAS_ACTIVE=""
+HOTFIX_TIMER_WAS_ENABLED=""
+HOTFIX_TIMER_WAS_ACTIVE=""
+RIPH_PATH_WAS_ENABLED=""
+RIPH_PATH_WAS_ACTIVE=""
+RIPH_TIMER_WAS_ENABLED=""
+RIPH_TIMER_WAS_ACTIVE=""
 
 usage() {
     cat <<'USAGE'
@@ -122,6 +139,29 @@ done
 CONFIG_SOURCE="${SCRIPT_DIR}/config/config.env.example"
 riph_load_config "${CONFIG_SOURCE}"
 
+unit_state() {
+    local verb="$1" unit="$2"
+    systemctl "${verb}" "${unit}" 2>/dev/null || true
+}
+
+capture_production_unit_states() {
+    HOTFIX_PATH_WAS_ENABLED="$(unit_state is-enabled "${HOTFIX_PATH_UNIT}")"
+    HOTFIX_PATH_WAS_ACTIVE="$(unit_state is-active "${HOTFIX_PATH_UNIT}")"
+    HOTFIX_TIMER_WAS_ENABLED="$(unit_state is-enabled "${HOTFIX_TIMER_UNIT}")"
+    HOTFIX_TIMER_WAS_ACTIVE="$(unit_state is-active "${HOTFIX_TIMER_UNIT}")"
+    RIPH_PATH_WAS_ENABLED="$(unit_state is-enabled "${RIPH_PATH_UNIT}")"
+    RIPH_PATH_WAS_ACTIVE="$(unit_state is-active "${RIPH_PATH_UNIT}")"
+    RIPH_TIMER_WAS_ENABLED="$(unit_state is-enabled "${RIPH_TIMER_UNIT}")"
+    RIPH_TIMER_WAS_ACTIVE="$(unit_state is-active "${RIPH_TIMER_UNIT}")"
+
+    if [[ "${HOTFIX_PATH_WAS_ENABLED}" == enabled || "${HOTFIX_PATH_WAS_ACTIVE}" == active \
+       || "${HOTFIX_TIMER_WAS_ENABLED}" == enabled || "${HOTFIX_TIMER_WAS_ACTIVE}" == active \
+       || "$(unit_state is-active "${HOTFIX_SERVICE_UNIT}")" == active ]]; then
+        TEMP_HOTFIX_ACTIVE=1
+        riph_log "temporary Router IP Push Nginx hotfix detected; allowlist ownership handover is required"
+    fi
+}
+
 preflight() {
     local router_id ip_file ip
     riph_require_cmd jq
@@ -144,14 +184,7 @@ preflight() {
         fail2ban-client -t
         LC_ALL=C ufw status | grep -Fqx 'Status: active' \
             || riph_die "UFW must already be active; installer will not enable/reset it"
-
-        if systemctl is-active --quiet router-ip-push-nginx-hotfix.path \
-            || systemctl is-active --quiet router-ip-push-nginx-hotfix.timer \
-            || systemctl is-enabled --quiet router-ip-push-nginx-hotfix.path \
-            || systemctl is-enabled --quiet router-ip-push-nginx-hotfix.timer; then
-            TEMP_HOTFIX_ACTIVE=1
-            riph_log "temporary Router IP Push Nginx hotfix detected; allowlist ownership handover is required"
-        fi
+        capture_production_unit_states
     fi
 
     for router_id in "${RIPH_ROUTER_IDS[@]}"; do
@@ -266,7 +299,37 @@ restore_install_backup() {
     done
 }
 
-INSTALL_STARTED=0
+restore_unit_state() {
+    local unit="$1" was_enabled="$2" was_active="$3"
+
+    if [[ "${was_enabled}" == enabled ]]; then
+        systemctl enable "${unit}" >/dev/null 2>&1 || true
+    else
+        systemctl disable "${unit}" >/dev/null 2>&1 || true
+    fi
+
+    if [[ "${was_active}" == active ]]; then
+        systemctl start "${unit}" >/dev/null 2>&1 || true
+    else
+        systemctl stop "${unit}" >/dev/null 2>&1 || true
+    fi
+}
+
+restore_production_unit_states_after_error() {
+    [[ "${RIPH_ROOT}" == "/" ]] || return 0
+
+    systemctl daemon-reload >/dev/null 2>&1 || true
+
+    # Remove any partially-enabled RIPH automatic writers before restoring the
+    # temporary owner. This prevents error recovery itself from creating two
+    # simultaneous allowlist writers.
+    systemctl disable --now "${RIPH_PATH_UNIT}" "${RIPH_TIMER_UNIT}" >/dev/null 2>&1 || true
+    restore_unit_state "${RIPH_PATH_UNIT}" "${RIPH_PATH_WAS_ENABLED}" "${RIPH_PATH_WAS_ACTIVE}"
+    restore_unit_state "${RIPH_TIMER_UNIT}" "${RIPH_TIMER_WAS_ENABLED}" "${RIPH_TIMER_WAS_ACTIVE}"
+    restore_unit_state "${HOTFIX_PATH_UNIT}" "${HOTFIX_PATH_WAS_ENABLED}" "${HOTFIX_PATH_WAS_ACTIVE}"
+    restore_unit_state "${HOTFIX_TIMER_UNIT}" "${HOTFIX_TIMER_WAS_ENABLED}" "${HOTFIX_TIMER_WAS_ACTIVE}"
+}
+
 restore_runtime_services_after_error() {
     [[ "${RIPH_ROOT}" == "/" ]] || return 0
     if nginx -t >/dev/null 2>&1; then
@@ -276,16 +339,38 @@ restore_runtime_services_after_error() {
     fi
 }
 
-on_install_error() {
-    local rc=$?
-    trap - ERR
-    if (( INSTALL_STARTED == 1 )); then
-        restore_install_backup || true
-        restore_runtime_services_after_error || true
+resync_temporary_hotfix_after_error() {
+    local hotfix=/usr/local/sbin/router-ip-push-nginx-hotfix
+    [[ "${RIPH_ROOT}" == "/" ]] || return 0
+    (( TEMP_HOTFIX_ACTIVE == 1 )) || return 0
+
+    if [[ -x "${hotfix}" ]]; then
+        if ! "${hotfix}"; then
+            riph_log "WARNING: temporary Router IP Push Nginx hotfix failed after install rollback"
+        fi
+    else
+        riph_log "WARNING: temporary hotfix was active before install but ${hotfix} is unavailable after rollback"
     fi
+}
+
+restore_install_on_exit() {
+    local rc=$?
+    trap - EXIT
+
+    if (( rc != 0 && INSTALL_STARTED == 1 && INSTALL_COMMITTED == 0 )); then
+        restore_install_backup || true
+        restore_production_unit_states_after_error || true
+        restore_runtime_services_after_error || true
+        # The ISP/Router IP may have changed while installation was in progress.
+        # A pre-install Nginx snapshot can therefore be stale by the time it is
+        # restored. Re-run the original temporary owner once so the recovered
+        # allowlist converges to the current Router IP before returning failure.
+        resync_temporary_hotfix_after_error || true
+    fi
+
     exit "${rc}"
 }
-trap on_install_error ERR
+trap restore_install_on_exit EXIT
 
 for spec in "${FILE_SPECS[@]}"; do
     IFS='|' read -r logical source_rel mode policy <<<"${spec}"
@@ -345,7 +430,8 @@ if (( ENABLE_TIMERS == 1 && HANDOVER_OWNS_TIMERS == 0 )); then
     systemctl enable --now riph-router-ip.path riph-reconcile.timer
 fi
 
-trap - ERR
+INSTALL_COMMITTED=1
+trap - EXIT
 riph_log "files installed successfully"
 riph_log "install backup: ${BACKUP_DIR}"
 if (( DO_APPLY == 0 )); then
