@@ -26,8 +26,12 @@ nginx-stream-sni-reject jail is deliberately left active and untouched.
 Options:
   --root DIR       Test root prefix.
   --config PATH    Config path inside root.
-  --dry-run        Validate and report without changing jail files/reloading.
+  --dry-run        Validate/report without changing jail files or reloading.
   -h, --help       Show this help.
+
+Production activation is refused until RIPH owns the allowlist, its path/timer are
+active, the current Router IP is in the active allowlist and the installed filters
+pass a local fail2ban-regex compatibility check.
 USAGE
 }
 
@@ -63,7 +67,11 @@ riph_prepare_dirs
 
 JAIL_REJECT="$(riph_root_path /etc/fail2ban/jail.d/riph-nginx-stream-sni-reject.local)"
 JAIL_PRIVATE="$(riph_root_path /etc/fail2ban/jail.d/riph-nginx-stream-private-sni-abuse.local)"
+FILTER_REJECT="$(riph_root_path /etc/fail2ban/filter.d/riph-nginx-stream-sni-reject.conf)"
+FILTER_PRIVATE="$(riph_root_path /etc/fail2ban/filter.d/riph-nginx-stream-private-sni-abuse.conf)"
 AUDIT_LOG="$(riph_root_path "${STREAM_AUDIT_LOG:-/var/log/nginx/riph-stream-sni.log}")"
+ALLOWLIST_FILE="$(riph_root_path "${ALLOWLIST_OUTPUT}")"
+STREAM_FILE="$(riph_root_path "${STREAM_OUTPUT:-/etc/nginx/stream-enabled/stream.conf}")"
 BACKUP_ROOT="$(riph_root_path "${RIPH_STATE_DIR}/backups")"
 BACKUP_ID="fail2ban-activate-$(date -u '+%Y%m%d-%H%M%S')-$$"
 BACKUP_DIR="${BACKUP_ROOT}/${BACKUP_ID}"
@@ -76,18 +84,26 @@ for file in "${JAIL_REJECT}" "${JAIL_PRIVATE}"; do
     grep -Eq '^enabled[[:space:]]*=[[:space:]]*(false|true)[[:space:]]*$' "${file}" \
         || riph_die "enabled flag missing/invalid in ${file}"
 done
-
+for file in "${FILTER_REJECT}" "${FILTER_PRIVATE}"; do
+    [[ -f "${file}" ]] || riph_die "RIPH filter file missing: ${file}"
+done
 [[ -e "${AUDIT_LOG}" ]] || riph_die "RIPH audit log does not exist yet: ${AUDIT_LOG}; validate Nginx routing first"
 
 F2B_BIN="${RIPH_FAIL2BAN_CLIENT_BIN:-fail2ban-client}"
+F2B_REGEX_BIN="${RIPH_FAIL2BAN_REGEX_BIN:-fail2ban-regex}"
+SYSTEMCTL_BIN="${RIPH_SYSTEMCTL_BIN:-systemctl}"
+NGINX_BIN="${RIPH_NGINX_BIN:-nginx}"
 GUARD_BIN="${RIPH_GUARD_BIN:-${SCRIPT_DIR}/riph-trusted-unban-guard}"
-if [[ "${RIPH_ROOT}" == "/" ]]; then
-    if [[ "${F2B_BIN}" == */* ]]; then
-        [[ -x "${F2B_BIN}" ]] || riph_die "Fail2ban client not executable: ${F2B_BIN}"
+IGNORE_BIN="${RIPH_IGNORE_BIN:-${SCRIPT_DIR}/riph-fail2ban-ignore}"
+
+require_executable_or_command() {
+    local value="$1"
+    if [[ "${value}" == */* ]]; then
+        [[ -x "${value}" ]] || riph_die "required executable not found: ${value}"
     else
-        riph_require_cmd "${F2B_BIN}"
+        riph_require_cmd "${value}"
     fi
-fi
+}
 
 jail_active() {
     "${F2B_BIN}" status "$1" >/dev/null 2>&1
@@ -99,13 +115,97 @@ legacy_bans() {
     fi
 }
 
+unit_is_enabled_active() {
+    local unit="$1"
+    "${SYSTEMCTL_BIN}" is-enabled --quiet "${unit}" >/dev/null 2>&1 \
+        && "${SYSTEMCTL_BIN}" is-active --quiet "${unit}" >/dev/null 2>&1
+}
+
+temporary_hotfix_owns_allowlist() {
+    local unit
+    for unit in router-ip-push-nginx-hotfix.path router-ip-push-nginx-hotfix.timer; do
+        if "${SYSTEMCTL_BIN}" is-enabled --quiet "${unit}" >/dev/null 2>&1 \
+            || "${SYSTEMCTL_BIN}" is-active --quiet "${unit}" >/dev/null 2>&1; then
+            return 0
+        fi
+    done
+    if "${SYSTEMCTL_BIN}" is-active --quiet router-ip-push-nginx-hotfix.service >/dev/null 2>&1; then
+        return 0
+    fi
+    return 1
+}
+
+validate_current_router_protection() {
+    local router_id current_ip
+
+    [[ -f "${ALLOWLIST_FILE}" ]] || riph_die "active RIPH allowlist missing: ${ALLOWLIST_FILE}"
+    for router_id in "${RIPH_ROUTER_IDS[@]}"; do
+        if current_ip="$(riph_current_router_ip "${router_id}")"; then
+            grep -Eq "^[[:space:]]*${current_ip//./\\.}/32[[:space:]]+1;" "${ALLOWLIST_FILE}" \
+                || riph_die "current ${router_id} IP ${current_ip} is absent from active allowlist"
+            bash "${IGNORE_BIN}" --root "${RIPH_ROOT}" --config "${CONFIG_PATH}" "${current_ip}" \
+                || riph_die "Fail2ban ignore helper does not protect current ${router_id} IP ${current_ip}"
+        elif [[ "${REQUIRE_ROUTER_IP:-1}" == 1 ]]; then
+            riph_die "current Router IP is missing during Fail2ban activation: ${router_id}"
+        fi
+    done
+}
+
+validate_installed_filters() {
+    local t reject_out private_out
+    t="$(mktemp -d /tmp/riph-f2b-activate-regex.XXXXXX)"
+    cat >"${t}/sample.log" <<'EOF_LOG'
+2026-08-17T14:00:00+00:00 src=203.0.113.10 route=reject sni=- upstream=127.0.0.1:9 status=502 session=0.001
+2026-08-17T14:00:01+00:00 src=203.0.113.11 route=fake_1 sni=treda.layerupzap.ru upstream=127.0.0.1:9543 status=200 session=1.000
+2026-08-17T14:00:02+00:00 src=203.0.113.12 route=fake_2 sni=trongo.layerupzap.ru upstream=127.0.0.1:9544 status=200 session=1.100
+2026-08-17T14:00:03+00:00 src=198.51.100.7 route=www sni=nukla.layerupzap.ru upstream=127.0.0.1:7443 status=200 session=0.300
+EOF_LOG
+
+    reject_out="$("${F2B_REGEX_BIN}" "${t}/sample.log" "${FILTER_REJECT}" --usedns=no -o ip | sort -u)"
+    private_out="$("${F2B_REGEX_BIN}" "${t}/sample.log" "${FILTER_PRIVATE}" --usedns=no -o ip | sort -u)"
+    rm -rf "${t}"
+
+    [[ "${reject_out}" == '203.0.113.10' ]] \
+        || riph_die "installed reject filter compatibility check failed: ${reject_out:-no match}"
+    [[ "${private_out}" == $'203.0.113.11\n203.0.113.12' ]] \
+        || riph_die "installed private-abuse filter compatibility check failed: ${private_out:-no match}"
+}
+
+production_readiness() {
+    require_executable_or_command "${F2B_BIN}"
+    require_executable_or_command "${F2B_REGEX_BIN}"
+    require_executable_or_command "${SYSTEMCTL_BIN}"
+    require_executable_or_command "${NGINX_BIN}"
+    require_executable_or_command "${IGNORE_BIN}"
+    riph_require_cmd sort
+
+    temporary_hotfix_owns_allowlist \
+        && riph_die "temporary Router IP Push Nginx hotfix still owns the allowlist; Fail2ban activation is premature"
+    unit_is_enabled_active riph-router-ip.path \
+        || riph_die "riph-router-ip.path must be enabled and active before Fail2ban activation"
+    unit_is_enabled_active riph-reconcile.timer \
+        || riph_die "riph-reconcile.timer must be enabled and active before Fail2ban activation"
+
+    "${NGINX_BIN}" -t
+    [[ -f "${STREAM_FILE}" ]] || riph_die "active RIPH stream config missing: ${STREAM_FILE}"
+    grep -Fq "access_log ${STREAM_AUDIT_LOG:-/var/log/nginx/riph-stream-sni.log} riph_stream_sni;" "${STREAM_FILE}" \
+        || riph_die "active stream config does not contain the RIPH route-aware audit log"
+
+    validate_current_router_protection
+    validate_installed_filters
+    "${F2B_BIN}" -t
+}
+
+# Production/test-production readiness is deliberately enforced before any jail
+# backup or mutation. Normal test-root unit tests can exercise the transaction in
+# isolation; RIPH_TEST_PRODUCTION_READINESS=1 enables the full gate in a temp root.
+if [[ "${RIPH_ROOT}" == "/" || "${RIPH_TEST_PRODUCTION_READINESS:-0}" == 1 ]]; then
+    production_readiness
+fi
+
 LEGACY_ACTIVE_BEFORE=0
 if jail_active "${LEGACY_JAIL}"; then
     LEGACY_ACTIVE_BEFORE=1
-fi
-
-if [[ "${RIPH_ROOT}" == "/" ]]; then
-    "${F2B_BIN}" -t
 fi
 LEGACY_BEFORE="$(legacy_bans | tr '\n' ' ' | xargs 2>/dev/null || true)"
 
@@ -167,8 +267,8 @@ set_enabled_true "${JAIL_PRIVATE}"
 
 if [[ "${RIPH_ROOT}" == "/" ]]; then
     "${F2B_BIN}" -t
-    # Upstream Fail2Ban reload updates configuration without server/jail restart,
-    # so the existing legacy jail is not intentionally stopped/unbanned here.
+    # Ordinary Fail2ban reload updates configuration without a server/jail restart;
+    # the existing legacy jail is deliberately not stopped/unbanned here.
     "${F2B_BIN}" reload
     jail_active "${RIPH_JAIL_REJECT}" || riph_die "RIPH jail not active after reload: ${RIPH_JAIL_REJECT}"
     jail_active "${RIPH_JAIL_PRIVATE}" || riph_die "RIPH jail not active after reload: ${RIPH_JAIL_PRIVATE}"
@@ -179,10 +279,6 @@ if [[ "${RIPH_ROOT}" == "/" ]]; then
 
     LEGACY_AFTER="$(legacy_bans | tr '\n' ' ' | xargs 2>/dev/null || true)"
     if [[ "${LEGACY_AFTER}" != "${LEGACY_BEFORE}" ]]; then
-        # The legacy jail is still running. Its list can legitimately change while
-        # this command executes because a 6h ban expires or a new reject is seen.
-        # Record the transition, but do not treat that natural runtime activity as
-        # proof that the RIPH reload damaged legacy state.
         riph_log "legacy ban list changed while activation ran: before='${LEGACY_BEFORE:-none}' after='${LEGACY_AFTER:-none}'"
     fi
 fi
