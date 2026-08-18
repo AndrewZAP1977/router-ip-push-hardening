@@ -1,0 +1,333 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+COMMON_DEFAULT="/usr/local/libexec/riph-common.sh"
+TRUSTED_DEFAULT="/usr/local/libexec/riph-trusted.sh"
+NET_DEFAULT="/usr/local/libexec/riph-net.sh"
+
+if [[ -f "${SCRIPT_DIR}/../libexec/riph-common.sh" ]]; then
+    # Repository/test layout.
+    # shellcheck source=../libexec/riph-common.sh
+    source "${SCRIPT_DIR}/../libexec/riph-common.sh"
+    # shellcheck source=../libexec/riph-trusted.sh
+    source "${SCRIPT_DIR}/../libexec/riph-trusted.sh"
+    # shellcheck source=../libexec/riph-net.sh
+    source "${SCRIPT_DIR}/../libexec/riph-net.sh"
+else
+    # Installed layout.
+    # shellcheck source=/usr/local/libexec/riph-common.sh
+    source "${COMMON_DEFAULT}"
+    # shellcheck source=/usr/local/libexec/riph-trusted.sh
+    source "${TRUSTED_DEFAULT}"
+    # shellcheck source=/usr/local/libexec/riph-net.sh
+    source "${NET_DEFAULT}"
+fi
+
+RIPH_ROOT="/"
+CONFIG_PATH="/etc/router-ip-push-hardening/config.env"
+RIPH_NOW_EPOCH_OVERRIDE=""
+DRY_RUN=0
+PROTECT_TRUSTED=0
+
+usage() {
+    cat <<'USAGE'
+Usage: riph-apply-manual-deny [options]
+
+Options:
+  --root DIR          Test root prefix (/, /tmp/* or /var/tmp/*).
+  --config PATH       Config path inside root.
+  --dry-run           Validate and print the UFW delta only.
+  --protect-trusted   Exclude overlapping rules from applied state instead of failing.
+  --now-epoch EPOCH   Override current UTC epoch for deterministic tests.
+  -h, --help          Show this help.
+
+The command manages only rules recorded in its own applied-state file.
+It never resets UFW and never deletes unrelated rules by number.
+
+Testing:
+  RIPH_UFW_BIN may point to a stub executable.
+  RIPH_UFW_LOCK may override the shared project UFW lock path.
+USAGE
+}
+
+while (($#)); do
+    case "$1" in
+        --root)
+            (($# >= 2)) || riph_die "--root requires a value"
+            RIPH_ROOT="$(riph_validate_root "$2")"
+            shift 2
+            ;;
+        --config)
+            (($# >= 2)) || riph_die "--config requires a value"
+            CONFIG_PATH="$2"
+            shift 2
+            ;;
+        --dry-run)
+            DRY_RUN=1
+            shift
+            ;;
+        --protect-trusted)
+            PROTECT_TRUSTED=1
+            shift
+            ;;
+        --now-epoch)
+            (($# >= 2)) || riph_die "--now-epoch requires a value"
+            [[ "$2" =~ ^[0-9]+$ ]] || riph_die "--now-epoch must be an integer"
+            RIPH_NOW_EPOCH_OVERRIDE="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            riph_die "unknown argument: $1"
+            ;;
+    esac
+done
+
+riph_require_cmd jq
+riph_require_cmd awk
+riph_require_cmd sort
+riph_require_cmd flock
+
+CONFIG_FILE="$(riph_root_path "${CONFIG_PATH}")"
+riph_load_config "${CONFIG_FILE}"
+riph_prepare_dirs
+
+# Fail2ban and manual-deny are two writers to UFW. Use one shared lock so a
+# numbered Fail2ban unban cannot race a manual rule insertion/deletion.
+UFW_LOCK_FILE="${RIPH_UFW_LOCK:-$(riph_root_path /run/lock/riph-ufw.lock)}"
+mkdir -p "$(dirname "${UFW_LOCK_FILE}")"
+exec 8>"${UFW_LOCK_FILE}"
+flock -w 15 8 || riph_die "timed out waiting for RIPH UFW lock"
+
+UFW_BIN="${RIPH_UFW_BIN:-ufw}"
+if ! command -v "${UFW_BIN}" >/dev/null 2>&1 && [[ ! -x "${UFW_BIN}" ]]; then
+    riph_die "ufw executable not found: ${UFW_BIN}"
+fi
+
+NOW_EPOCH="$(riph_now_epoch)"
+STATIC_FILE="$(riph_root_path "${RIPH_CONFIG_DIR}/trusted-static.list")"
+GRACE_FILE="$(riph_root_path "${RIPH_CONFIG_DIR}/previous-ip-grace.json")"
+DENY_443_FILE="$(riph_root_path "${RIPH_CONFIG_DIR}/manual-deny-443.list")"
+DENY_ALL_FILE="$(riph_root_path "${RIPH_CONFIG_DIR}/manual-deny-all.list")"
+RUNTIME_DIR="$(riph_root_path "${RIPH_STATE_DIR}/runtime")"
+STATE_FILE="${RUNTIME_DIR}/manual-deny-applied.tsv"
+mkdir -p "${RUNTIME_DIR}"
+
+TRUSTED_ENTRIES="${RUNTIME_DIR}/manual-deny-trusted.$$.tsv"
+DESIRED="${RUNTIME_DIR}/manual-deny-desired.$$.tsv"
+OLD_STATE="${RUNTIME_DIR}/manual-deny-old.$$.tsv"
+trap 'rm -f "${TRUSTED_ENTRIES}" "${DESIRED}" "${OLD_STATE}"' EXIT
+
+riph_write_effective_trusted_entries \
+    "${TRUSTED_ENTRIES}" "${STATIC_FILE}" "${GRACE_FILE}" "${NOW_EPOCH}"
+
+: >"${DESIRED}"
+parse_deny_file() {
+    local scope="$1"
+    local file="$2"
+    local raw line cidr line_no=0 trusted_cidr _comment conflict
+    [[ -f "${file}" ]] || return 0
+
+    while IFS= read -r raw || [[ -n "${raw}" ]]; do
+        ((line_no += 1))
+        line="${raw#"${raw%%[![:space:]]*}"}"
+        [[ -z "${line}" || "${line:0:1}" == "#" ]] && continue
+        cidr="${line%%[[:space:]]*}"
+        riph_is_ipv4_cidr "${cidr}" \
+            || riph_die "${file}:${line_no}: invalid IPv4/CIDR: ${cidr}"
+        cidr="$(riph_normalize_ipv4_cidr "${cidr}")"
+
+        conflict=0
+        while IFS=$'\t' read -r trusted_cidr _comment; do
+            [[ -n "${trusted_cidr}" ]] || continue
+            if riph_ipv4_cidr_overlap "${cidr}" "${trusted_cidr}"; then
+                if (( PROTECT_TRUSTED == 1 )); then
+                    riph_log "protect-trusted: suppressing ${scope} ${cidr}; overlaps ${trusted_cidr}"
+                    conflict=1
+                    break
+                fi
+                riph_die "${scope} ${cidr} overlaps effective trusted ${trusted_cidr}"
+            fi
+        done <"${TRUSTED_ENTRIES}"
+        (( conflict == 0 )) || continue
+
+        printf '%s\t%s\n' "${scope}" "${cidr}" >>"${DESIRED}"
+    done <"${file}"
+}
+
+parse_deny_file 443 "${DENY_443_FILE}"
+parse_deny_file all "${DENY_ALL_FILE}"
+sort -u -o "${DESIRED}" "${DESIRED}"
+
+if [[ -f "${STATE_FILE}" ]]; then
+    cp -a "${STATE_FILE}" "${OLD_STATE}"
+else
+    : >"${OLD_STATE}"
+fi
+
+validate_state_file() {
+    local file="$1"
+    local scope cidr extra
+    while IFS=$'\t' read -r scope cidr extra; do
+        [[ -n "${scope:-}" ]] || continue
+        [[ -z "${extra:-}" ]] || riph_die "invalid manual-deny applied state row"
+        [[ "${scope}" == "443" || "${scope}" == "all" ]] \
+            || riph_die "invalid manual-deny applied scope: ${scope}"
+        riph_is_ipv4_cidr "${cidr}" || riph_die "invalid manual-deny applied CIDR: ${cidr}"
+    done <"${file}"
+}
+validate_state_file "${OLD_STATE}"
+
+ufw_owned_rule_present() {
+    local scope="$1" cidr="$2" marker source line status
+    marker="riph-manual-${scope}"
+    source="${cidr}"
+    [[ "${source}" == */32 ]] && source="${source%/32}"
+
+    if ! status="$(LC_ALL=C "${UFW_BIN}" status numbered 2>/dev/null)"; then
+        riph_die "failed to inspect UFW numbered rules; refusing to trust manual-deny ownership state"
+    fi
+
+    while IFS= read -r line; do
+        [[ " ${line} " == *" ${source} "* || " ${line} " == *" ${cidr} "* ]] || continue
+        [[ "${line}" == *"# ${marker}"* ]] || continue
+        [[ "${line}" =~ [[:space:]]DENY[[:space:]]+IN[[:space:]] ]] || continue
+        if [[ "${scope}" == 443 ]]; then
+            [[ "${line}" =~ [[:space:]]443/tcp([[:space:]]|$) ]] || continue
+        fi
+        return 0
+    done <<<"${status}"
+    return 1
+}
+
+# The state file is an ownership claim, not merely desired configuration. Refuse
+# to trust it unless every recorded row has a physically visible project marker.
+# This catches UFW's successful duplicate no-op behavior where it can print
+# "Skipping adding existing rule" while leaving an older unmarked rule intact.
+while IFS=$'\t' read -r scope cidr; do
+    [[ -n "${scope:-}" ]] || continue
+    ufw_owned_rule_present "${scope}" "${cidr}" \
+        || riph_die "manual-deny ownership drift: state claims ${scope} ${cidr}, but no matching RIPH-marked UFW rule exists"
+done <"${OLD_STATE}"
+
+REMOVALS="${RUNTIME_DIR}/manual-deny-remove.$$.tsv"
+ADDITIONS="${RUNTIME_DIR}/manual-deny-add.$$.tsv"
+trap 'rm -f "${TRUSTED_ENTRIES}" "${DESIRED}" "${OLD_STATE}" "${REMOVALS}" "${ADDITIONS}"' EXIT
+: >"${REMOVALS}"
+: >"${ADDITIONS}"
+
+while IFS= read -r row; do
+    [[ -n "${row}" ]] || continue
+    grep -Fqx -- "${row}" "${DESIRED}" || printf '%s\n' "${row}" >>"${REMOVALS}"
+done <"${OLD_STATE}"
+while IFS= read -r row; do
+    [[ -n "${row}" ]] || continue
+    grep -Fqx -- "${row}" "${OLD_STATE}" || printf '%s\n' "${row}" >>"${ADDITIONS}"
+done <"${DESIRED}"
+
+if [[ ! -s "${REMOVALS}" && ! -s "${ADDITIONS}" ]]; then
+    riph_log "manual deny state already matches desired lists and owned UFW rules"
+    exit 0
+fi
+
+print_delta() {
+    local prefix="$1" file="$2" scope cidr
+    while IFS=$'\t' read -r scope cidr; do
+        [[ -n "${scope}" ]] || continue
+        printf '%s %s %s\n' "${prefix}" "${scope}" "${cidr}"
+    done <"${file}"
+}
+
+if (( DRY_RUN == 1 )); then
+    print_delta REMOVE "${REMOVALS}"
+    print_delta ADD "${ADDITIONS}"
+    exit 0
+fi
+
+ufw_add() {
+    local scope="$1" cidr="$2" output
+    if [[ "${scope}" == "443" ]]; then
+        if ! output="$(LC_ALL=C "${UFW_BIN}" prepend deny proto tcp from "${cidr}" to any port 443 \
+            comment riph-manual-443 2>&1)"; then
+            printf '%s\n' "${output}" >&2
+            return 1
+        fi
+    else
+        if ! output="$(LC_ALL=C "${UFW_BIN}" prepend deny from "${cidr}" comment riph-manual-all 2>&1)"; then
+            printf '%s\n' "${output}" >&2
+            return 1
+        fi
+    fi
+
+    if [[ "${output}" == *"Skipping adding existing rule"* ]]; then
+        printf '%s\n' "${output}" >&2
+        return 1
+    fi
+
+    ufw_owned_rule_present "${scope}" "${cidr}" || {
+        printf 'UFW add returned success but RIPH-owned rule is not visible: %s %s\n' "${scope}" "${cidr}" >&2
+        return 1
+    }
+}
+
+ufw_delete() {
+    local scope="$1" cidr="$2"
+    if [[ "${scope}" == "443" ]]; then
+        LC_ALL=C "${UFW_BIN}" --force delete deny proto tcp from "${cidr}" to any port 443 \
+            comment riph-manual-443
+    else
+        LC_ALL=C "${UFW_BIN}" --force delete deny from "${cidr}" comment riph-manual-all
+    fi
+
+    if ufw_owned_rule_present "${scope}" "${cidr}"; then
+        printf 'UFW delete returned success but RIPH-owned rule is still visible: %s %s\n' "${scope}" "${cidr}" >&2
+        return 1
+    fi
+}
+
+DONE_REMOVALS="${RUNTIME_DIR}/manual-deny-done-remove.$$.tsv"
+DONE_ADDITIONS="${RUNTIME_DIR}/manual-deny-done-add.$$.tsv"
+: >"${DONE_REMOVALS}"
+: >"${DONE_ADDITIONS}"
+trap 'rm -f "${TRUSTED_ENTRIES}" "${DESIRED}" "${OLD_STATE}" "${REMOVALS}" "${ADDITIONS}" "${DONE_REMOVALS}" "${DONE_ADDITIONS}"' EXIT
+
+rollback_ufw_delta() {
+    local scope cidr
+    riph_log "attempting manual-deny UFW rollback"
+    while IFS=$'\t' read -r scope cidr; do
+        [[ -n "${scope}" ]] || continue
+        ufw_delete "${scope}" "${cidr}" >/dev/null 2>&1 || true
+    done <"${DONE_ADDITIONS}"
+    while IFS=$'\t' read -r scope cidr; do
+        [[ -n "${scope}" ]] || continue
+        ufw_add "${scope}" "${cidr}" >/dev/null 2>&1 || true
+    done <"${DONE_REMOVALS}"
+}
+
+while IFS=$'\t' read -r scope cidr; do
+    [[ -n "${scope}" ]] || continue
+    if ! ufw_delete "${scope}" "${cidr}" >/dev/null; then
+        rollback_ufw_delta
+        riph_die "failed to remove managed UFW deny: ${scope} ${cidr}"
+    fi
+    printf '%s\t%s\n' "${scope}" "${cidr}" >>"${DONE_REMOVALS}"
+done <"${REMOVALS}"
+
+while IFS=$'\t' read -r scope cidr; do
+    [[ -n "${scope}" ]] || continue
+    if ! ufw_add "${scope}" "${cidr}" >/dev/null; then
+        rollback_ufw_delta
+        riph_die "failed to add managed UFW deny: ${scope} ${cidr}"
+    fi
+    printf '%s\t%s\n' "${scope}" "${cidr}" >>"${DONE_ADDITIONS}"
+done <"${ADDITIONS}"
+
+STATE_TMP="${STATE_FILE}.tmp.$$"
+install -m 0600 "${DESIRED}" "${STATE_TMP}"
+mv -f "${STATE_TMP}" "${STATE_FILE}"
+riph_log "manual deny applied: additions=$(wc -l <"${ADDITIONS}") removals=$(wc -l <"${REMOVALS}")"

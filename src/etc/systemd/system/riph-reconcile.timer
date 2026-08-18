@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Router IP Push Hardening reconcile every minute
+
+[Timer]
+OnActiveSec=1min
+OnUnitActiveSec=1min
+AccuracySec=5s
+Unit=riph-reconcile.service
+
+[Install]
+WantedBy=timers.target

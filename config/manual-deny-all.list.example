@@ -1,0 +1,3 @@
+# Manual all-ports deny list.
+# Use only for exceptional cases: an all-ports deny may also affect management traffic.
+# One IPv4 or CIDR per line. Comments are allowed.

@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+COMMON_DEFAULT="/usr/local/libexec/riph-common.sh"
+TRUSTED_DEFAULT="/usr/local/libexec/riph-trusted.sh"
+NET_DEFAULT="/usr/local/libexec/riph-net.sh"
+
+if [[ -f "${SCRIPT_DIR}/../libexec/riph-common.sh" ]]; then
+    # Repository/test layout.
+    # shellcheck source=../libexec/riph-common.sh
+    source "${SCRIPT_DIR}/../libexec/riph-common.sh"
+    # shellcheck source=../libexec/riph-trusted.sh
+    source "${SCRIPT_DIR}/../libexec/riph-trusted.sh"
+    # shellcheck source=../libexec/riph-net.sh
+    source "${SCRIPT_DIR}/../libexec/riph-net.sh"
+else
+    # Installed layout.
+    # shellcheck source=/usr/local/libexec/riph-common.sh
+    source "${COMMON_DEFAULT}"
+    # shellcheck source=/usr/local/libexec/riph-trusted.sh
+    source "${TRUSTED_DEFAULT}"
+    # shellcheck source=/usr/local/libexec/riph-net.sh
+    source "${NET_DEFAULT}"
+fi
+
+RIPH_ROOT="/"
+CONFIG_PATH="/etc/router-ip-push-hardening/config.env"
+IP=""
+
+while (($#)); do
+    case "$1" in
+        --root)
+            (($# >= 2)) || exit 2
+            RIPH_ROOT="$(riph_validate_root "$2")"
+            shift 2
+            ;;
+        --config)
+            (($# >= 2)) || exit 2
+            CONFIG_PATH="$2"
+            shift 2
+            ;;
+        -h|--help)
+            echo 'Usage: riph-fail2ban-ignore [--root DIR] [--config PATH] IP'
+            exit 0
+            ;;
+        *)
+            [[ -z "${IP}" ]] || exit 2
+            IP="$1"
+            shift
+            ;;
+    esac
+done
+
+[[ -n "${IP}" ]] || exit 2
+riph_is_ipv4 "${IP}" || exit 1
+
+# Emergency fast path #1: protect every currently reported Router IP Push IPv4
+# before loading hardening config. This closes the short race between the receiver
+# writing a new address and riph-reconcile rebuilding the Nginx allowlist, and it
+# still works if config.env is temporarily malformed.
+DEFAULT_ROUTER_IP_DIR="$(riph_root_path /var/lib/router-ip-push/ips)"
+if [[ -d "${DEFAULT_ROUTER_IP_DIR}" ]]; then
+    for ip_file in "${DEFAULT_ROUTER_IP_DIR}"/*.ipv4; do
+        [[ -f "${ip_file}" ]] || continue
+        current="$(tr -d '[:space:]' <"${ip_file}" 2>/dev/null || true)"
+        if [[ "${current}" == "${IP}" ]]; then
+            exit 0
+        fi
+    done
+fi
+
+# Emergency fast path #2: the generated allowlist is a last-known-good artifact
+# because riph-apply only leaves it installed after successful validation/reload.
+# Protect an address already present there even if current config/state parsing fails.
+DEFAULT_ALLOWLIST="$(riph_root_path /etc/nginx/stream-enabled/05-router-ip-push-source-allow.conf)"
+if [[ -f "${DEFAULT_ALLOWLIST}" ]]; then
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        [[ "${line}" =~ ^[[:space:]]*([0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2})[[:space:]]+1\; ]] || continue
+        cidr="${BASH_REMATCH[1]}"
+        if riph_is_ipv4_cidr "${cidr}" && riph_ipv4_in_cidr "${IP}" "${cidr}"; then
+            exit 0
+        fi
+    done <"${DEFAULT_ALLOWLIST}"
+fi
+
+riph_require_cmd jq
+riph_require_cmd awk
+
+CONFIG_FILE="$(riph_root_path "${CONFIG_PATH}")"
+riph_load_config "${CONFIG_FILE}"
+STATIC_FILE="$(riph_root_path "${RIPH_CONFIG_DIR}/trusted-static.list")"
+GRACE_FILE="$(riph_root_path "${RIPH_CONFIG_DIR}/previous-ip-grace.json")"
+NOW_EPOCH="$(date -u '+%s')"
+TMP="$(mktemp)"
+trap 'rm -f "${TMP}"' EXIT
+riph_write_effective_trusted_entries "${TMP}" "${STATIC_FILE}" "${GRACE_FILE}" "${NOW_EPOCH}"
+
+while IFS=$'\t' read -r cidr _comment; do
+    [[ -n "${cidr}" ]] || continue
+    if riph_ipv4_in_cidr "${IP}" "${cidr}"; then
+        exit 0
+    fi
+done <"${TMP}"
+exit 1

@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+COMMON_DEFAULT="/usr/local/libexec/riph-common.sh"
+if [[ -f "${SCRIPT_DIR}/../libexec/riph-common.sh" ]]; then
+    # shellcheck source=../libexec/riph-common.sh
+    source "${SCRIPT_DIR}/../libexec/riph-common.sh"
+else
+    # shellcheck source=/usr/local/libexec/riph-common.sh
+    source "${COMMON_DEFAULT}"
+fi
+
+APPLY="${SCRIPT_DIR}/riph-apply"
+GUARD="${SCRIPT_DIR}/riph-trusted-unban-guard"
+
+RIPH_ROOT="/"
+CONFIG_PATH="/etc/router-ip-push-hardening/config.env"
+REASON="periodic reconcile"
+NOW_EPOCH=""
+DRY_RUN=0
+MAX_CONVERGENCE_ATTEMPTS=3
+
+usage() {
+    cat <<'USAGE'
+Usage: riph-reconcile [options]
+
+Options:
+  --root DIR          Pass production/test root to apply and guard.
+  --config PATH       Config path inside root.
+  --reason TEXT       Human-readable apply reason.
+  --dry-run           Do not mutate Nginx or Fail2ban/UFW.
+  --now-epoch EPOCH   Deterministic test time.
+  -h, --help          Show this help.
+
+Normal reconcile is convergent: after each successful apply it re-reads Router IP
+Push and verifies that last successful state + active allowlist still contain the
+current Router IP. If the ISP/Router IP changes during the transaction, reconcile
+immediately retries up to three times instead of waiting for another path/timer event.
+
+A successful trusted/Nginx apply is never rolled back merely because the post-apply
+guard cleanup is temporarily unavailable. Guard failures are logged and retried by
+the next reconcile; run `riph-admin guard` for a strict manual check.
+USAGE
+}
+
+while (($#)); do
+    case "$1" in
+        --root)
+            (($# >= 2)) || riph_die "--root requires a value"
+            RIPH_ROOT="$(riph_validate_root "$2")"
+            shift 2
+            ;;
+        --config)
+            (($# >= 2)) || riph_die "--config requires a value"
+            CONFIG_PATH="$2"
+            shift 2
+            ;;
+        --reason)
+            (($# >= 2)) || riph_die "--reason requires a value"
+            REASON="$2"
+            shift 2
+            ;;
+        --dry-run)
+            DRY_RUN=1
+            shift
+            ;;
+        --now-epoch)
+            (($# >= 2)) || riph_die "--now-epoch requires a value"
+            [[ "$2" =~ ^[0-9]+$ ]] || riph_die "--now-epoch must be an integer"
+            NOW_EPOCH="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            riph_die "unknown argument: $1"
+            ;;
+    esac
+done
+
+[[ -x "${APPLY}" || -f "${APPLY}" ]] || riph_die "riph-apply not found: ${APPLY}"
+[[ -x "${GUARD}" || -f "${GUARD}" ]] || riph_die "guard not found: ${GUARD}"
+riph_require_cmd jq
+riph_require_cmd sleep
+
+CONFIG_FILE="$(riph_root_path "${CONFIG_PATH}")"
+riph_load_config "${CONFIG_FILE}"
+
+apply_args=(--root "${RIPH_ROOT}" --config "${CONFIG_PATH}" --reason "${REASON}")
+guard_args=(--root "${RIPH_ROOT}" --config "${CONFIG_PATH}")
+
+if [[ -n "${NOW_EPOCH}" ]]; then
+    apply_args+=(--now-epoch "${NOW_EPOCH}")
+    guard_args+=(--now-epoch "${NOW_EPOCH}")
+fi
+if (( DRY_RUN == 1 )); then
+    apply_args+=(--dry-run)
+    guard_args+=(--dry-run)
+fi
+
+LAST_STATE_FILE="$(riph_root_path "${RIPH_CONFIG_DIR}/last-apply-state.json")"
+ALLOWLIST_FILE="$(riph_root_path "${ALLOWLIST_OUTPUT}")"
+
+current_state_converged() {
+    local router_id current_ip applied_ip
+
+    [[ -f "${LAST_STATE_FILE}" ]] || return 1
+    [[ -f "${ALLOWLIST_FILE}" ]] || return 1
+    jq -e '.version == 1 and (.routers | type == "object")' "${LAST_STATE_FILE}" >/dev/null 2>&1 || return 1
+
+    for router_id in "${RIPH_ROUTER_IDS[@]}"; do
+        if current_ip="$(riph_current_router_ip "${router_id}")"; then
+            applied_ip="$(jq -r --arg id "${router_id}" '.routers[$id].current_ip // empty' "${LAST_STATE_FILE}")"
+            [[ "${applied_ip}" == "${current_ip}" ]] || return 1
+            grep -Eq "^[[:space:]]*${current_ip//./\\.}/32[[:space:]]+1;" "${ALLOWLIST_FILE}" || return 1
+        elif [[ "${REQUIRE_ROUTER_IP:-1}" == 1 ]]; then
+            return 1
+        fi
+    done
+    return 0
+}
+
+if (( DRY_RUN == 1 )); then
+    # A dry-run deliberately does not update last-apply-state, so convergence
+    # against active files is not meaningful. Generate candidates once and run
+    # the guard in dry-run mode.
+    bash "${APPLY}" "${apply_args[@]}"
+else
+    converged=0
+    for ((attempt = 1; attempt <= MAX_CONVERGENCE_ATTEMPTS; attempt++)); do
+        # Trust/routing is the primary safety state. If an apply transaction fails,
+        # fail hard; riph-apply has already restored its previous Nginx state.
+        bash "${APPLY}" "${apply_args[@]}"
+
+        if current_state_converged; then
+            converged=1
+            break
+        fi
+
+        riph_log "Router IP changed or active allowlist moved during reconcile attempt ${attempt}; retrying"
+        if (( attempt < MAX_CONVERGENCE_ATTEMPTS )); then
+            sleep 1
+        fi
+    done
+    (( converged == 1 )) || riph_die "Router IP did not converge into active allowlist after ${MAX_CONVERGENCE_ATTEMPTS} attempts"
+fi
+
+# Cleanup is secondary and retryable. Rolling back a freshly accepted Router IP
+# because Fail2ban/UFW cleanup is temporarily unavailable would be less safe than
+# keeping the new trusted state and retrying the guard on the next reconcile.
+if ! bash "${GUARD}" "${guard_args[@]}"; then
+    printf '[riph] WARNING: trusted state applied, but guard cleanup failed; will retry on next reconcile\n' >&2
+fi

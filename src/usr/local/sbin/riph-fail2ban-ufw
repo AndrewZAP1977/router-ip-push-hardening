@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+MODE="${1:-}"
+JAIL="${2:-}"
+IP="${3:-}"
+UFW_BIN="${RIPH_UFW_BIN:-ufw}"
+LOCK_FILE="${RIPH_UFW_LOCK:-/run/lock/riph-ufw.lock}"
+
+[[ "${MODE}" == ban || "${MODE}" == unban ]] || { echo 'invalid mode' >&2; exit 2; }
+[[ "${JAIL}" =~ ^[A-Za-z0-9._-]{1,80}$ ]] || { echo 'invalid jail name' >&2; exit 2; }
+[[ "${IP}" =~ ^[0-9A-Fa-f:.]{2,45}$ ]] || { echo 'invalid address syntax' >&2; exit 2; }
+
+if ! command -v "${UFW_BIN}" >/dev/null 2>&1 && [[ ! -x "${UFW_BIN}" ]]; then
+    echo "ufw executable not found: ${UFW_BIN}" >&2
+    exit 1
+fi
+command -v flock >/dev/null 2>&1 || { echo 'flock not found' >&2; exit 1; }
+
+mkdir -p "$(dirname "${LOCK_FILE}")"
+exec 9>"${LOCK_FILE}"
+flock -w 15 9 || { echo 'timed out waiting for RIPH UFW lock' >&2; exit 1; }
+
+MARKER="riph-f2b-${JAIL}"
+
+find_owned_rule_numbers() {
+    local line
+    LC_ALL=C "${UFW_BIN}" status numbered 2>/dev/null \
+        | while IFS= read -r line; do
+            # Ownership requires all of these simultaneously:
+            #   * source is an exact whitespace-delimited token;
+            #   * exact project marker;
+            #   * destination is exactly TCP/443 (allow optional UFW '(v6)' tag);
+            #   * rule action is DENY IN.
+            # This prevents a manually-created same-marker rule on another port
+            # from being mistaken for the Fail2ban rule.
+            [[ " ${line} " == *" ${IP} "* ]] || continue
+            [[ "${line}" == *"# ${MARKER}"* ]] || continue
+            [[ "${line}" =~ [[:space:]]443/tcp([[:space:]]|[[:space:]]+\(v6\)[[:space:]]) ]] || continue
+            [[ "${line}" =~ [[:space:]]DENY[[:space:]]+IN[[:space:]] ]] || continue
+            if [[ "${line}" =~ ^[[:space:]]*\[[[:space:]]*([0-9]+)\] ]]; then
+                printf '%s\n' "${BASH_REMATCH[1]}"
+            fi
+        done
+}
+
+RULE_NUMBERS=()
+if ! owned_output="$(find_owned_rule_numbers | sort -nr -u)"; then
+    echo 'failed to inspect UFW numbered rules; refusing to mutate firewall state' >&2
+    exit 1
+fi
+if [[ -n "${owned_output}" ]]; then
+    mapfile -t RULE_NUMBERS <<<"${owned_output}"
+fi
+
+if [[ "${MODE}" == ban ]]; then
+    if ((${#RULE_NUMBERS[@]} > 0)); then
+        exit 0
+    fi
+    LC_ALL=C "${UFW_BIN}" prepend deny proto tcp from "${IP}" to any port 443 comment "${MARKER}"
+    exit 0
+fi
+
+# Delete descending numbers so UFW renumbering cannot invalidate the remaining
+# entries. Only exact project marker + source + TCP/443 DENY IN matches are removed.
+for number in "${RULE_NUMBERS[@]}"; do
+    LC_ALL=C "${UFW_BIN}" --force delete "${number}"
+done

@@ -1,0 +1,359 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+COMMON_DEFAULT="/usr/local/libexec/riph-common.sh"
+TRUSTED_DEFAULT="/usr/local/libexec/riph-trusted.sh"
+NET_DEFAULT="/usr/local/libexec/riph-net.sh"
+MANUAL_APPLY_DEFAULT="/usr/local/sbin/riph-apply-manual-deny"
+
+if [[ -f "${SCRIPT_DIR}/../libexec/riph-common.sh" ]]; then
+    # Repository/test layout.
+    # shellcheck source=../libexec/riph-common.sh
+    source "${SCRIPT_DIR}/../libexec/riph-common.sh"
+    # shellcheck source=../libexec/riph-trusted.sh
+    source "${SCRIPT_DIR}/../libexec/riph-trusted.sh"
+    # shellcheck source=../libexec/riph-net.sh
+    source "${SCRIPT_DIR}/../libexec/riph-net.sh"
+    MANUAL_APPLY="${SCRIPT_DIR}/riph-apply-manual-deny"
+else
+    # Installed layout.
+    # shellcheck source=/usr/local/libexec/riph-common.sh
+    source "${COMMON_DEFAULT}"
+    # shellcheck source=/usr/local/libexec/riph-trusted.sh
+    source "${TRUSTED_DEFAULT}"
+    # shellcheck source=/usr/local/libexec/riph-net.sh
+    source "${NET_DEFAULT}"
+    MANUAL_APPLY="${MANUAL_APPLY_DEFAULT}"
+fi
+
+RIPH_ROOT="/"
+CONFIG_PATH="/etc/router-ip-push-hardening/config.env"
+RIPH_NOW_EPOCH_OVERRIDE=""
+DRY_RUN=0
+LEGACY_SHIELD_REMOVE_ALL=0
+
+usage() {
+    cat <<'USAGE'
+Usage: riph-trusted-unban-guard [options]
+
+Options:
+  --root DIR          Test root prefix (/, /tmp/* or /var/tmp/*).
+  --config PATH       Config path inside root.
+  --dry-run           Report trusted bans/UFW changes without mutating them.
+  --now-epoch EPOCH   Override current UTC epoch for deterministic tests.
+  --legacy-shield-remove-all
+                       Remove only exact RIPH-owned legacy trusted ALLOW shields
+                       and exit. Used by the controlled legacy retirement path.
+  -h, --help           Show this help.
+
+Testing:
+  RIPH_FAIL2BAN_CLIENT_BIN may point to a stub executable.
+  RIPH_UFW_BIN may point to a stub executable for legacy shield tests.
+USAGE
+}
+
+while (($#)); do
+    case "$1" in
+        --root)
+            (($# >= 2)) || riph_die "--root requires a value"
+            RIPH_ROOT="$(riph_validate_root "$2")"
+            shift 2
+            ;;
+        --config)
+            (($# >= 2)) || riph_die "--config requires a value"
+            CONFIG_PATH="$2"
+            shift 2
+            ;;
+        --dry-run)
+            DRY_RUN=1
+            shift
+            ;;
+        --now-epoch)
+            (($# >= 2)) || riph_die "--now-epoch requires a value"
+            [[ "$2" =~ ^[0-9]+$ ]] || riph_die "--now-epoch must be an integer"
+            RIPH_NOW_EPOCH_OVERRIDE="$2"
+            shift 2
+            ;;
+        --legacy-shield-remove-all)
+            LEGACY_SHIELD_REMOVE_ALL=1
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            riph_die "unknown argument: $1"
+            ;;
+    esac
+done
+
+riph_require_cmd jq
+riph_require_cmd awk
+
+CONFIG_FILE="$(riph_root_path "${CONFIG_PATH}")"
+riph_load_config "${CONFIG_FILE}"
+riph_prepare_dirs
+
+STATIC_FILE="$(riph_root_path "${RIPH_CONFIG_DIR}/trusted-static.list")"
+GRACE_FILE="$(riph_root_path "${RIPH_CONFIG_DIR}/previous-ip-grace.json")"
+NOW_EPOCH="$(riph_now_epoch)"
+RUNTIME_DIR="$(riph_root_path "${RIPH_STATE_DIR}/runtime")"
+LOG_DIR="$(riph_root_path "${RIPH_STATE_DIR}/logs")"
+LEGACY_IGNORE_OVERRIDE="$(riph_root_path /etc/fail2ban/jail.d/zz-riph-legacy-trusted-ignore.local)"
+LEGACY_SHIELD_MARKER="riph-legacy-trusted-shield"
+UFW_BIN="${RIPH_UFW_BIN:-ufw}"
+UFW_LOCK="${RIPH_UFW_LOCK:-$(riph_root_path /run/lock/riph-ufw.lock)}"
+mkdir -p "${RUNTIME_DIR}" "${LOG_DIR}"
+
+require_ufw_for_shield() {
+    riph_require_cmd flock
+    riph_require_cmd sort
+    if [[ "${UFW_BIN}" == */* ]]; then
+        [[ -x "${UFW_BIN}" ]] || riph_die "UFW executable not found: ${UFW_BIN}"
+    else
+        riph_require_cmd "${UFW_BIN}"
+    fi
+}
+
+# Output: numbered-rule<TAB>IPv4. Ownership requires exact marker + TCP/443 +
+# ALLOW IN. A manually created same-marker rule with another shape is ignored.
+legacy_shield_rules() {
+    local line number source
+    LC_ALL=C "${UFW_BIN}" status numbered 2>/dev/null \
+        | while IFS= read -r line; do
+            [[ "${line}" == *"# ${LEGACY_SHIELD_MARKER}"* ]] || continue
+            [[ "${line}" =~ ^[[:space:]]*\[[[:space:]]*([0-9]+)\][[:space:]]+443/tcp([[:space:]]+\(v6\))?[[:space:]]+ALLOW[[:space:]]+IN[[:space:]]+([^[:space:]]+) ]] || continue
+            number="${BASH_REMATCH[1]}"
+            source="${BASH_REMATCH[3]}"
+            riph_is_ipv4 "${source}" || continue
+            printf '%s\t%s\n' "${number}" "${source}"
+        done
+}
+
+legacy_shield_current_ips() {
+    local router_id current_ip
+    for router_id in "${RIPH_ROUTER_IDS[@]}"; do
+        if current_ip="$(riph_current_router_ip "${router_id}")"; then
+            printf '%s\n' "${current_ip}"
+        elif [[ "${REQUIRE_ROUTER_IP:-1}" == 1 ]]; then
+            riph_die "current Router IP missing while syncing legacy trusted shield: ${router_id}"
+        fi
+    done | sort -u
+}
+
+legacy_shield_mutate() {
+    local mode="$1" row number source current_ip
+    local current_output owned_output after_output
+    local -a current_ips=() owned=() delete_numbers=()
+    local -A desired=() kept=() present=()
+
+    require_ufw_for_shield
+    mkdir -p "$(dirname "${UFW_LOCK}")"
+    exec 8>"${UFW_LOCK}"
+    flock -w 15 8 || riph_die "timed out waiting for RIPH UFW lock"
+
+    if [[ "${mode}" == sync ]]; then
+        if ! current_output="$(legacy_shield_current_ips)"; then
+            riph_die "failed to read current Router IPs for legacy trusted shield"
+        fi
+        if [[ -n "${current_output}" ]]; then
+            mapfile -t current_ips <<<"${current_output}"
+        fi
+        for current_ip in "${current_ips[@]}"; do
+            desired["${current_ip}"]=1
+        done
+    fi
+
+    if ! owned_output="$(legacy_shield_rules)"; then
+        riph_die "failed to inspect UFW numbered rules for legacy trusted shield"
+    fi
+    if [[ -n "${owned_output}" ]]; then
+        mapfile -t owned <<<"${owned_output}"
+    fi
+
+    for row in "${owned[@]}"; do
+        [[ -n "${row}" ]] || continue
+        number="${row%%$'\t'*}"
+        source="${row#*$'\t'}"
+
+        if [[ "${mode}" == remove-all || -z "${desired[${source}]:-}" || -n "${kept[${source}]:-}" ]]; then
+            delete_numbers+=("${number}")
+        else
+            kept["${source}"]=1
+        fi
+    done
+
+    if ((${#delete_numbers[@]} > 0)); then
+        mapfile -t delete_numbers < <(printf '%s\n' "${delete_numbers[@]}" | sort -nr -u)
+        for number in "${delete_numbers[@]}"; do
+            if (( DRY_RUN == 1 )); then
+                riph_log "dry-run: would delete project legacy shield UFW rule #${number}"
+            else
+                LC_ALL=C "${UFW_BIN}" --force delete "${number}"
+            fi
+        done
+    fi
+
+    if [[ "${mode}" == remove-all ]]; then
+        flock -u 8
+        exec 8>&-
+        riph_log "legacy trusted shield remove-all complete"
+        return 0
+    fi
+
+    # Re-query after deletes because UFW renumbers. Then prepend only missing
+    # current-IP shields. Prepend is deliberate: the old unmarked legacy DENY may
+    # already exist and must remain untouched until its own 6h expiry.
+    if (( DRY_RUN == 0 )); then
+        if ! after_output="$(legacy_shield_rules)"; then
+            riph_die "failed to re-read UFW numbered rules after legacy shield cleanup"
+        fi
+        if [[ -n "${after_output}" ]]; then
+            while IFS=$'\t' read -r _number source; do
+                [[ -n "${source}" ]] || continue
+                present["${source}"]=1
+            done <<<"${after_output}"
+        fi
+    else
+        for source in "${!kept[@]}"; do
+            present["${source}"]=1
+        done
+    fi
+
+    for current_ip in "${current_ips[@]}"; do
+        [[ -n "${present[${current_ip}]:-}" ]] && continue
+        if (( DRY_RUN == 1 )); then
+            riph_log "dry-run: would prepend TCP/443 ALLOW shield for current Router IP ${current_ip}"
+        else
+            LC_ALL=C "${UFW_BIN}" prepend allow proto tcp from "${current_ip}" to any port 443 comment "${LEGACY_SHIELD_MARKER}"
+        fi
+    done
+
+    # Do not carry the shared UFW lock into Fail2ban unban calls below. A project
+    # Fail2ban action may invoke riph-fail2ban-ufw, which takes this same lock.
+    flock -u 8
+    exec 8>&-
+
+    riph_log "legacy trusted shield synchronized for ${#current_ips[@]} current Router IP(s)"
+}
+
+if (( LEGACY_SHIELD_REMOVE_ALL == 1 )); then
+    legacy_shield_mutate remove-all
+    exit 0
+fi
+
+TRUSTED_ENTRIES="${RUNTIME_DIR}/trusted-guard.$$.tsv"
+trap 'rm -f "${TRUSTED_ENTRIES}"' EXIT
+riph_write_effective_trusted_entries \
+    "${TRUSTED_ENTRIES}" "${STATIC_FILE}" "${GRACE_FILE}" "${NOW_EPOCH}"
+
+ip_is_trusted() {
+    local ip="$1"
+    local cidr _comment
+    while IFS=$'\t' read -r cidr _comment; do
+        [[ -n "${cidr}" ]] || continue
+        if riph_ipv4_in_cidr "${ip}" "${cidr}"; then
+            return 0
+        fi
+    done <"${TRUSTED_ENTRIES}"
+    return 1
+}
+
+check_manual_conflicts() {
+    local list_name="$1"
+    local file="$2"
+    local raw line deny_cidr trusted_cidr _comment
+    local line_no=0
+    [[ -f "${file}" ]] || return 0
+
+    while IFS= read -r raw || [[ -n "${raw}" ]]; do
+        ((line_no += 1))
+        line="${raw#"${raw%%[![:space:]]*}"}"
+        [[ -z "${line}" || "${line:0:1}" == "#" ]] && continue
+        deny_cidr="${line%%[[:space:]]*}"
+        riph_is_ipv4_cidr "${deny_cidr}" \
+            || riph_die "${file}:${line_no}: invalid IPv4/CIDR: ${deny_cidr}"
+        deny_cidr="$(riph_normalize_ipv4_cidr "${deny_cidr}")"
+
+        while IFS=$'\t' read -r trusted_cidr _comment; do
+            [[ -n "${trusted_cidr}" ]] || continue
+            if riph_ipv4_cidr_overlap "${deny_cidr}" "${trusted_cidr}"; then
+                riph_log "WARNING: ${list_name} ${deny_cidr} overlaps trusted ${trusted_cidr}"
+                MANUAL_CONFLICTS=$((MANUAL_CONFLICTS + 1))
+            fi
+        done <"${TRUSTED_ENTRIES}"
+    done <"${file}"
+}
+
+MANUAL_CONFLICTS=0
+check_manual_conflicts \
+    "manual-deny-443" \
+    "$(riph_root_path "${RIPH_CONFIG_DIR}/manual-deny-443.list")"
+check_manual_conflicts \
+    "manual-deny-all" \
+    "$(riph_root_path "${RIPH_CONFIG_DIR}/manual-deny-all.list")"
+
+# New manual deny entries are strict. The guard is the recovery path when the
+# effective trusted set changes later: it suppresses/removes only project-owned
+# overlapping UFW rules while leaving the source lists intact for review.
+manual_args=(--root "${RIPH_ROOT}" --config "${CONFIG_PATH}" --protect-trusted --now-epoch "${NOW_EPOCH}")
+if (( DRY_RUN == 1 )); then
+    manual_args+=(--dry-run)
+fi
+bash "${MANUAL_APPLY}" "${manual_args[@]}"
+
+# While the old unmarked legacy jail coexists with RIPH, its late .local override
+# prevents new trusted bans. A newly assigned ISP address can nevertheless already
+# have an older legacy DENY. Shield the *current* Router IP at the top of UFW with
+# an exact RIPH marker rather than deleting the ambiguous old DENY. Every reconcile
+# resynchronizes this shield after Router IP convergence.
+if [[ -f "${LEGACY_IGNORE_OVERRIDE}" ]]; then
+    grep -Fq 'ignorecommand = /usr/local/sbin/riph-fail2ban-ignore <ip>' "${LEGACY_IGNORE_OVERRIDE}" \
+        || riph_die "legacy trusted-ignore override has unexpected content"
+    legacy_shield_mutate sync
+fi
+
+FAIL2BAN_BIN="${RIPH_FAIL2BAN_CLIENT_BIN:-fail2ban-client}"
+JAILS="${RIPH_FAIL2BAN_JAILS:-riph-nginx-stream-sni-reject riph-nginx-stream-private-sni-abuse}"
+read -r -a JAIL_ARRAY <<<"${JAILS}"
+UNBANNED=0
+
+if ! command -v "${FAIL2BAN_BIN}" >/dev/null 2>&1 && [[ ! -x "${FAIL2BAN_BIN}" ]]; then
+    riph_log "Fail2ban client not available; unban scan skipped"
+else
+    for jail in "${JAIL_ARRAY[@]}"; do
+        [[ "${jail}" =~ ^[A-Za-z0-9._-]+$ ]] || riph_die "invalid Fail2ban jail name: ${jail}"
+        if ! status_output="$(LC_ALL=C "${FAIL2BAN_BIN}" status "${jail}" 2>/dev/null)"; then
+            riph_log "Fail2ban jail not active: ${jail}"
+            continue
+        fi
+
+        banned_line="$(awk -F 'Banned IP list:[[:space:]]*' 'NF > 1 {print $2}' <<<"${status_output}")"
+        read -r -a BANNED_IPS <<<"${banned_line}"
+        for banned_ip in "${BANNED_IPS[@]}"; do
+            riph_is_ipv4 "${banned_ip}" || continue
+            if ip_is_trusted "${banned_ip}"; then
+                if (( DRY_RUN == 1 )); then
+                    riph_log "dry-run: would unban trusted ${banned_ip} from ${jail}"
+                else
+                    "${FAIL2BAN_BIN}" set "${jail}" unbanip "${banned_ip}" >/dev/null
+                    riph_log "unbanned trusted ${banned_ip} from ${jail}"
+                fi
+                UNBANNED=$((UNBANNED + 1))
+            fi
+        done
+    done
+fi
+
+printf '%s\ttrusted_unbanned=%d\tmanual_conflicts=%d\n' \
+    "$(riph_utc_iso_from_epoch "${NOW_EPOCH}")" "${UNBANNED}" "${MANUAL_CONFLICTS}" \
+    >>"${LOG_DIR}/trusted-unban-guard.log"
+
+if (( MANUAL_CONFLICTS > 0 )); then
+    riph_log "guard protected trusted set from ${MANUAL_CONFLICTS} manual-deny conflict(s)"
+fi
+
+riph_log "guard complete: trusted_unbanned=${UNBANNED} manual_conflicts=${MANUAL_CONFLICTS}"

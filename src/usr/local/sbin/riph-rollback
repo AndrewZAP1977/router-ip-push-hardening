@@ -1,0 +1,261 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+COMMON_DEFAULT="/usr/local/libexec/riph-common.sh"
+if [[ -f "${SCRIPT_DIR}/../libexec/riph-common.sh" ]]; then
+    # shellcheck source=../libexec/riph-common.sh
+    source "${SCRIPT_DIR}/../libexec/riph-common.sh"
+else
+    # shellcheck source=/usr/local/libexec/riph-common.sh
+    source "${COMMON_DEFAULT}"
+fi
+
+RIPH_ROOT="/"
+CONFIG_PATH="/etc/router-ip-push-hardening/config.env"
+BACKUP_ID=""
+LIST_ONLY=0
+DRY_RUN=0
+
+usage() {
+    cat <<'USAGE'
+Usage: riph-rollback [options]
+
+Options:
+  --root DIR          Test root prefix (/, /tmp/* or /var/tmp/*).
+  --config PATH       Config path inside root.
+  --backup ID         Restore a specific backup ID.
+  --latest            Restore the newest normal apply backup.
+  --list              List available normal apply backups and exit.
+  --dry-run           Show what would be restored without changing files.
+  -h, --help          Show this help.
+
+Rollback creates a safety snapshot of the pre-rollback state. If nginx -t or
+reload fails after restoration, the safety snapshot is restored automatically.
+
+A real rollback is refused while the temporary Router-IP/Nginx hotfix still owns
+the production allowlist. Listing and dry-run remain read-only and are allowed.
+USAGE
+}
+
+while (($#)); do
+    case "$1" in
+        --root)
+            (($# >= 2)) || riph_die "--root requires a value"
+            RIPH_ROOT="$(riph_validate_root "$2")"
+            shift 2
+            ;;
+        --config)
+            (($# >= 2)) || riph_die "--config requires a value"
+            CONFIG_PATH="$2"
+            shift 2
+            ;;
+        --backup)
+            (($# >= 2)) || riph_die "--backup requires a value"
+            BACKUP_ID="$2"
+            shift 2
+            ;;
+        --latest)
+            BACKUP_ID="latest"
+            shift
+            ;;
+        --list)
+            LIST_ONLY=1
+            shift
+            ;;
+        --dry-run)
+            DRY_RUN=1
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            riph_die "unknown argument: $1"
+            ;;
+    esac
+done
+
+riph_require_cmd jq
+riph_require_cmd flock
+riph_require_cmd install
+riph_require_cmd date
+
+CONFIG_FILE="$(riph_root_path "${CONFIG_PATH}")"
+riph_load_config "${CONFIG_FILE}"
+riph_prepare_dirs
+
+STATE_DIR="$(riph_root_path "${RIPH_STATE_DIR}")"
+CONFIG_DIR="$(riph_root_path "${RIPH_CONFIG_DIR}")"
+ALLOWLIST_FILE="$(riph_root_path "${ALLOWLIST_OUTPUT}")"
+STREAM_FILE="$(riph_root_path "${STREAM_OUTPUT:-/etc/nginx/stream-enabled/stream.conf}")"
+BRIDGE_FILE="$(riph_root_path "${BRIDGE_OUTPUT:-/etc/nginx/stream-enabled/06-router-ip-push-fake-site-bridges.conf}")"
+GRACE_FILE="${CONFIG_DIR}/previous-ip-grace.json"
+LAST_STATE_FILE="${CONFIG_DIR}/last-apply-state.json"
+LOCK_FILE="${STATE_DIR}/locks/apply.lock"
+BACKUP_ROOT="${STATE_DIR}/backups"
+NGINX_BIN="${RIPH_NGINX_BIN:-nginx}"
+SYSTEMCTL_BIN="${RIPH_SYSTEMCTL_BIN:-systemctl}"
+
+is_normal_backup_id() {
+    [[ "$1" =~ ^[0-9]{8}-[0-9]{6}-[0-9]+$ ]]
+}
+
+list_backups() {
+    local dir id created reason
+    [[ -d "${BACKUP_ROOT}" ]] || return 0
+    while IFS= read -r dir; do
+        id="${dir##*/}"
+        is_normal_backup_id "${id}" || continue
+        created=""
+        reason=""
+        if [[ -f "${dir}/manifest.json" ]]; then
+            created="$(jq -r '.created_at // empty' "${dir}/manifest.json" 2>/dev/null || true)"
+            reason="$(jq -r '.reason // empty' "${dir}/manifest.json" 2>/dev/null || true)"
+        fi
+        printf '%s\t%s\t%s\n' "${id}" "${created}" "${reason}"
+    done < <(find "${BACKUP_ROOT}" -mindepth 1 -maxdepth 1 -type d -print | sort -r)
+}
+
+if (( LIST_ONLY == 1 )); then
+    list_backups
+    exit 0
+fi
+
+[[ -n "${BACKUP_ID}" ]] || riph_die "choose --backup ID, --latest or --list"
+if [[ "${BACKUP_ID}" == "latest" ]]; then
+    BACKUP_ID="$(list_backups | awk 'NR == 1 {print $1}')"
+    [[ -n "${BACKUP_ID}" ]] || riph_die "no normal apply backups found"
+fi
+is_normal_backup_id "${BACKUP_ID}" || riph_die "invalid backup id: ${BACKUP_ID}"
+SOURCE_BACKUP="${BACKUP_ROOT}/${BACKUP_ID}"
+[[ -d "${SOURCE_BACKUP}" ]] || riph_die "backup not found: ${BACKUP_ID}"
+[[ -f "${SOURCE_BACKUP}/manifest.json" ]] || riph_die "backup manifest missing: ${BACKUP_ID}"
+jq -e '.version == 1' "${SOURCE_BACKUP}/manifest.json" >/dev/null \
+    || riph_die "invalid backup manifest: ${BACKUP_ID}"
+
+for name in allowlist.conf stream.conf bridges.conf previous-ip-grace.json last-apply-state.json; do
+    if [[ ! -e "${SOURCE_BACKUP}/${name}" && ! -f "${SOURCE_BACKUP}/${name}.absent" ]]; then
+        riph_die "backup ${BACKUP_ID} is incomplete: missing ${name} state"
+    fi
+done
+
+if (( DRY_RUN == 1 )); then
+    printf 'backup=%s\n' "${BACKUP_ID}"
+    for name in allowlist.conf stream.conf bridges.conf previous-ip-grace.json last-apply-state.json; do
+        if [[ -f "${SOURCE_BACKUP}/${name}.absent" ]]; then
+            printf 'remove\t%s\n' "${name}"
+        else
+            printf 'restore\t%s\n' "${name}"
+        fi
+    done
+    exit 0
+fi
+
+temporary_hotfix_owns_allowlist() {
+    local unit
+    for unit in \
+        router-ip-push-nginx-hotfix.path \
+        router-ip-push-nginx-hotfix.timer \
+        router-ip-push-nginx-hotfix.service; do
+        if "${SYSTEMCTL_BIN}" is-active --quiet "${unit}" >/dev/null 2>&1; then
+            return 0
+        fi
+        if [[ "${unit}" != *.service ]] \
+            && "${SYSTEMCTL_BIN}" is-enabled --quiet "${unit}" >/dev/null 2>&1; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+if { [[ "${RIPH_ROOT}" == "/" ]] || [[ "${RIPH_TEST_HOTFIX_OWNERSHIP_CHECK:-0}" == 1 ]]; } \
+    && temporary_hotfix_owns_allowlist; then
+    riph_die "temporary Router IP Push Nginx hotfix still owns the allowlist; runtime RIPH rollback is refused before ownership handover"
+fi
+
+exec 9>"${LOCK_FILE}"
+if ! flock -w 15 9; then
+    riph_die "timed out waiting for another riph-apply/reconcile/rollback process"
+fi
+
+NOW_EPOCH="$(date -u '+%s')"
+SAFETY_ID="rollback-safety-$(date -u -d "@${NOW_EPOCH}" '+%Y%m%d-%H%M%S')-$$"
+SAFETY_DIR="${BACKUP_ROOT}/${SAFETY_ID}"
+mkdir -p "${SAFETY_DIR}"
+
+snapshot_one() {
+    local source="$1" name="$2"
+    if [[ -e "${source}" ]]; then
+        cp -a "${source}" "${SAFETY_DIR}/${name}"
+    else
+        : >"${SAFETY_DIR}/${name}.absent"
+    fi
+}
+
+snapshot_one "${ALLOWLIST_FILE}" allowlist.conf
+snapshot_one "${STREAM_FILE}" stream.conf
+snapshot_one "${BRIDGE_FILE}" bridges.conf
+snapshot_one "${GRACE_FILE}" previous-ip-grace.json
+snapshot_one "${LAST_STATE_FILE}" last-apply-state.json
+jq -n \
+    --arg created_at "$(riph_utc_iso_from_epoch "${NOW_EPOCH}")" \
+    --arg source_backup "${BACKUP_ID}" \
+    '{version:1, kind:"rollback-safety", created_at:$created_at, source_backup:$source_backup}' \
+    >"${SAFETY_DIR}/manifest.json"
+
+restore_from_dir() {
+    local dir="$1" target="$2" name="$3" mode="$4"
+    local temp
+    if [[ -f "${dir}/${name}.absent" ]]; then
+        rm -f "${target}"
+        return 0
+    fi
+    [[ -f "${dir}/${name}" ]] || return 1
+    mkdir -p "$(dirname "${target}")"
+    temp="${target}.riph-rollback.$$"
+    install -m "${mode}" "${dir}/${name}" "${temp}"
+    mv -f "${temp}" "${target}"
+}
+
+restore_set() {
+    local dir="$1"
+    restore_from_dir "${dir}" "${ALLOWLIST_FILE}" allowlist.conf 0644
+    restore_from_dir "${dir}" "${STREAM_FILE}" stream.conf 0644
+    restore_from_dir "${dir}" "${BRIDGE_FILE}" bridges.conf 0644
+    restore_from_dir "${dir}" "${GRACE_FILE}" previous-ip-grace.json 0600
+    restore_from_dir "${dir}" "${LAST_STATE_FILE}" last-apply-state.json 0600
+}
+
+restore_safety() {
+    riph_log "restoring pre-rollback safety snapshot ${SAFETY_ID}"
+    restore_set "${SAFETY_DIR}" || riph_log "WARNING: safety snapshot restore was incomplete"
+}
+
+if ! restore_set "${SOURCE_BACKUP}"; then
+    restore_safety
+    riph_die "selected backup could not be restored completely"
+fi
+
+if ! "${NGINX_BIN}" -t; then
+    riph_log "restored backup fails nginx -t"
+    restore_safety
+    "${NGINX_BIN}" -t >/dev/null 2>&1 || riph_log "WARNING: safety snapshot also fails nginx -t"
+    riph_die "rollback rejected; pre-rollback state restored"
+fi
+
+if ! "${SYSTEMCTL_BIN}" reload nginx; then
+    riph_log "Nginx reload failed after rollback"
+    restore_safety
+    if "${NGINX_BIN}" -t; then
+        "${SYSTEMCTL_BIN}" reload nginx || riph_log "WARNING: failed to reload pre-rollback Nginx state"
+    else
+        riph_log "WARNING: pre-rollback state fails nginx -t"
+    fi
+    riph_die "rollback reload failed; pre-rollback state restored"
+fi
+
+riph_log "rollback complete: ${BACKUP_ID}"
+riph_log "pre-rollback safety snapshot: ${SAFETY_DIR}"

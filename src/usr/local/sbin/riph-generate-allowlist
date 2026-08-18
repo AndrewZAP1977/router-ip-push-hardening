@@ -1,0 +1,209 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+COMMON_DEFAULT="/usr/local/libexec/riph-common.sh"
+if [[ -f "${SCRIPT_DIR}/../libexec/riph-common.sh" ]]; then
+    # Repository/test layout.
+    # shellcheck source=../libexec/riph-common.sh
+    source "${SCRIPT_DIR}/../libexec/riph-common.sh"
+else
+    # Installed layout.
+    # shellcheck source=/usr/local/libexec/riph-common.sh
+    source "${COMMON_DEFAULT}"
+fi
+
+RIPH_ROOT="/"
+CONFIG_PATH="/etc/router-ip-push-hardening/config.env"
+STATIC_PATH=""
+GRACE_PATH=""
+OUTPUT_PATH=""
+PRINT_STDOUT=0
+RIPH_NOW_EPOCH_OVERRIDE=""
+
+usage() {
+    cat <<'EOF'
+Usage: riph-generate-allowlist [options]
+
+Options:
+  --root DIR          Test root prefix (/, /tmp/* or /var/tmp/*).
+  --config PATH       Config path inside root.
+  --static PATH       Override trusted-static.list path inside root.
+  --grace PATH        Override previous-ip-grace.json path inside root.
+  --output PATH       Write generated allowlist to this path inside root.
+  --stdout            Print generated allowlist to stdout.
+  --now-epoch EPOCH   Override current UTC epoch for deterministic tests.
+  -h, --help          Show this help.
+EOF
+}
+
+while (($#)); do
+    case "$1" in
+        --root)
+            (($# >= 2)) || riph_die "--root requires a value"
+            RIPH_ROOT="$(riph_validate_root "$2")"
+            shift 2
+            ;;
+        --config)
+            (($# >= 2)) || riph_die "--config requires a value"
+            CONFIG_PATH="$2"
+            shift 2
+            ;;
+        --static)
+            (($# >= 2)) || riph_die "--static requires a value"
+            STATIC_PATH="$2"
+            shift 2
+            ;;
+        --grace)
+            (($# >= 2)) || riph_die "--grace requires a value"
+            GRACE_PATH="$2"
+            shift 2
+            ;;
+        --output)
+            (($# >= 2)) || riph_die "--output requires a value"
+            OUTPUT_PATH="$2"
+            shift 2
+            ;;
+        --stdout)
+            PRINT_STDOUT=1
+            shift
+            ;;
+        --now-epoch)
+            (($# >= 2)) || riph_die "--now-epoch requires a value"
+            [[ "$2" =~ ^[0-9]+$ ]] || riph_die "--now-epoch must be an integer"
+            RIPH_NOW_EPOCH_OVERRIDE="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            riph_die "unknown argument: $1"
+            ;;
+    esac
+done
+
+riph_require_cmd jq
+riph_require_cmd awk
+riph_require_cmd sort
+
+CONFIG_FILE="$(riph_root_path "${CONFIG_PATH}")"
+riph_load_config "${CONFIG_FILE}"
+
+STATIC_PATH="${STATIC_PATH:-${RIPH_CONFIG_DIR}/trusted-static.list}"
+GRACE_PATH="${GRACE_PATH:-${RIPH_CONFIG_DIR}/previous-ip-grace.json}"
+
+STATIC_FILE="$(riph_root_path "${STATIC_PATH}")"
+GRACE_FILE="$(riph_root_path "${GRACE_PATH}")"
+NOW_EPOCH="$(riph_now_epoch)"
+
+tmp_entries="$(mktemp)"
+tmp_render="$(mktemp)"
+cleanup() {
+    rm -f "${tmp_entries}" "${tmp_render}"
+}
+trap cleanup EXIT
+
+add_entry() {
+    local cidr="$1"
+    local comment="$2"
+    riph_is_ipv4_cidr "${cidr}" || riph_die "invalid trusted IPv4/CIDR: ${cidr}"
+    cidr="$(riph_normalize_ipv4_cidr "${cidr}")"
+    printf '%s\t%s\n' "${cidr}" "${comment}" >>"${tmp_entries}"
+}
+
+if [[ -f "${STATIC_FILE}" ]]; then
+    line_no=0
+    while IFS= read -r raw || [[ -n "${raw}" ]]; do
+        ((line_no += 1))
+        line="${raw#"${raw%%[![:space:]]*}"}"
+        [[ -z "${line}" || "${line:0:1}" == "#" ]] && continue
+
+        value="${line%%[[:space:]]*}"
+        if [[ "${line}" == *"#"* ]]; then
+            comment="${line#*#}"
+            comment="${comment#"${comment%%[![:space:]]*}"}"
+        else
+            comment="static"
+        fi
+        riph_is_ipv4_cidr "${value}" \
+            || riph_die "${STATIC_FILE}:${line_no}: invalid IPv4/CIDR: ${value}"
+        add_entry "${value}" "${comment:-static}"
+    done <"${STATIC_FILE}"
+fi
+
+for router_id in "${RIPH_ROUTER_IDS[@]}"; do
+    if current_ip="$(riph_current_router_ip "${router_id}")"; then
+        add_entry "${current_ip}/32" "router-ip-push:${router_id} current"
+    elif [[ "${REQUIRE_ROUTER_IP:-1}" == "1" ]]; then
+        riph_die "no current Router IP Push IPv4 for ${router_id}"
+    else
+        riph_log "warning: no current Router IP Push IPv4 for ${router_id}"
+    fi
+done
+
+if [[ -f "${GRACE_FILE}" ]]; then
+    jq -e '.version == 1 and (.routers | type == "object")' "${GRACE_FILE}" >/dev/null \
+        || riph_die "invalid grace state: ${GRACE_FILE}"
+
+    while IFS=$'\t' read -r router_id grace_ip expires_epoch expires_iso; do
+        [[ -n "${router_id}" ]] || continue
+        riph_validate_router_id "${router_id}"
+
+        configured=0
+        for configured_id in "${RIPH_ROUTER_IDS[@]}"; do
+            if [[ "${configured_id}" == "${router_id}" ]]; then
+                configured=1
+                break
+            fi
+        done
+        (( configured == 1 )) || continue
+
+        riph_is_ipv4 "${grace_ip}" || riph_die "invalid grace IPv4 for ${router_id}: ${grace_ip}"
+        [[ "${expires_epoch}" =~ ^[0-9]+$ ]] \
+            || riph_die "invalid grace expiry for ${router_id}: ${expires_epoch}"
+        if (( expires_epoch > NOW_EPOCH )); then
+            add_entry "${grace_ip}/32" \
+                "router-ip-push:${router_id} previous grace until ${expires_iso}"
+        fi
+    done < <(
+        jq -r '
+            .routers
+            | to_entries[]
+            | [
+                .key,
+                (.value.ip // ""),
+                ((.value.expires_at_epoch // 0) | tostring),
+                (.value.expires_at // "")
+              ]
+            | @tsv
+        ' "${GRACE_FILE}"
+    )
+fi
+
+# Deduplicate by CIDR. The first occurrence/comment wins.
+awk -F '\t' '!seen[$1]++' "${tmp_entries}" >"${tmp_entries}.dedup"
+mv "${tmp_entries}.dedup" "${tmp_entries}"
+
+{
+    printf '# Managed by router-ip-push-hardening. DO NOT EDIT.\n'
+    printf '# Regenerate with: riph-apply\n'
+    printf 'geo $router_ip_push_source_allowed {\n'
+    printf '        default 0;\n'
+    while IFS=$'\t' read -r cidr comment; do
+        printf '        %-18s 1; # %s\n' "${cidr}" "${comment}"
+    done <"${tmp_entries}"
+    printf '}\n'
+} >"${tmp_render}"
+
+if [[ -n "${OUTPUT_PATH}" ]]; then
+    output_file="$(riph_root_path "${OUTPUT_PATH}")"
+    mkdir -p "$(dirname "${output_file}")"
+    install -m 0644 "${tmp_render}" "${output_file}"
+fi
+
+if [[ "${PRINT_STDOUT}" == "1" || -z "${OUTPUT_PATH}" ]]; then
+    cat "${tmp_render}"
+fi
