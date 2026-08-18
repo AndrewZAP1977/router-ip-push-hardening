@@ -33,14 +33,16 @@ Options:
 
 Commands:
   status              Show temporary-hotfix and RIPH watch/timer states.
-  takeover            Atomically transfer allowlist ownership from the temporary
-                      Router IP Push Nginx hotfix to RIPH reconcile.
+  takeover            Transfer allowlist ownership from the temporary Router IP
+                      Push Nginx hotfix to RIPH without a two-writer window.
 
-The takeover does not delete the temporary hotfix files. It disables its path and
-timer only after holding the same lock used by the hotfix, performs a strict RIPH
-reconcile, enables the RIPH path/timer, performs a second reconcile to close any
-Router-IP change race during the handover, and verifies the current Router IP is
-in the generated allowlist. On failure it re-enables the temporary hotfix.
+The takeover keeps the temporary hotfix files for rollback/forensics. It disables
+its automatic triggers only while holding the same lock used by that hotfix, runs a
+strict RIPH reconcile, activates the RIPH path watch, converges the active allowlist
+to the current Router IP, then activates the 1-minute fallback timer.
+
+Any failure after mutation begins disables RIPH automatic triggers first and restores
+the temporary hotfix path/timer to their exact pre-handover enabled/active state.
 USAGE
 }
 
@@ -75,6 +77,8 @@ done
 CONFIG_FILE="$(riph_root_path "${CONFIG_PATH}")"
 riph_load_config "${CONFIG_FILE}"
 riph_require_cmd flock
+riph_require_cmd grep
+riph_require_cmd sleep
 
 SYSTEMCTL_BIN="${RIPH_SYSTEMCTL_BIN:-systemctl}"
 if [[ "${SYSTEMCTL_BIN}" != */* ]]; then
@@ -119,69 +123,130 @@ status_cmd() {
     exit 0
 }
 
-# The temporary production hotfix uses this exact lock. Holding it closes the
-# ownership gap: no hotfix service can rewrite the allowlist while ownership is
-# being transferred to RIPH.
 HOTFIX_LOCK="${RIPH_HOTFIX_LOCK:-$(riph_root_path /run/lock/router-ip-push-nginx-hotfix.lock)}"
 mkdir -p "$(dirname "${HOTFIX_LOCK}")"
 exec 8>"${HOTFIX_LOCK}"
 flock -w 15 8 || riph_die "timed out waiting for temporary hotfix lock"
 
 hotfix_path_was_enabled="$(unit_state is-enabled "${HOTFIX_PATH_UNIT}")"
+hotfix_path_was_active="$(unit_state is-active "${HOTFIX_PATH_UNIT}")"
 hotfix_timer_was_enabled="$(unit_state is-enabled "${HOTFIX_TIMER_UNIT}")"
+hotfix_timer_was_active="$(unit_state is-active "${HOTFIX_TIMER_UNIT}")"
+riph_path_was_enabled="$(unit_state is-enabled "${RIPH_PATH_UNIT}")"
+riph_path_was_active="$(unit_state is-active "${RIPH_PATH_UNIT}")"
+riph_timer_was_enabled="$(unit_state is-enabled "${RIPH_TIMER_UNIT}")"
+riph_timer_was_active="$(unit_state is-active "${RIPH_TIMER_UNIT}")"
 
-reenable_hotfix() {
+if [[ "${hotfix_path_was_enabled}" != enabled && "${hotfix_path_was_active}" != active \
+   && "${hotfix_timer_was_enabled}" != enabled && "${hotfix_timer_was_active}" != active ]]; then
+    riph_die "temporary hotfix does not currently own the allowlist"
+fi
+
+if [[ "${riph_path_was_enabled}" == enabled || "${riph_path_was_active}" == active \
+   || "${riph_timer_was_enabled}" == enabled || "${riph_timer_was_active}" == active ]]; then
+    riph_die "RIPH path/timer are already enabled or active; refuse ambiguous two-writer takeover"
+fi
+
+restore_unit_state() {
+    local unit="$1" was_enabled="$2" was_active="$3"
+
+    if [[ "${was_enabled}" == enabled ]]; then
+        "${SYSTEMCTL_BIN}" enable "${unit}" >/dev/null 2>&1 || true
+    else
+        "${SYSTEMCTL_BIN}" disable "${unit}" >/dev/null 2>&1 || true
+    fi
+
+    if [[ "${was_active}" == active ]]; then
+        "${SYSTEMCTL_BIN}" start "${unit}" >/dev/null 2>&1 || true
+    else
+        "${SYSTEMCTL_BIN}" stop "${unit}" >/dev/null 2>&1 || true
+    fi
+}
+
+TAKEOVER_STARTED=0
+HANDOVER_COMMITTED=0
+restore_ownership_on_exit() {
     local rc=$?
-    trap - ERR
-    riph_log "handover failed; restoring temporary hotfix ownership"
-    if [[ "${hotfix_path_was_enabled}" == enabled ]]; then
-        "${SYSTEMCTL_BIN}" enable --now "${HOTFIX_PATH_UNIT}" >/dev/null 2>&1 || true
+    trap - EXIT
+
+    if (( TAKEOVER_STARTED == 1 && HANDOVER_COMMITTED == 0 )); then
+        riph_log "handover failed; restoring pre-handover ownership"
+
+        # Never restore the temporary writer before first removing any RIPH
+        # automatic writer that may have been enabled before the failure.
+        "${SYSTEMCTL_BIN}" disable --now "${RIPH_PATH_UNIT}" "${RIPH_TIMER_UNIT}" >/dev/null 2>&1 || true
+        restore_unit_state "${RIPH_PATH_UNIT}" "${riph_path_was_enabled}" "${riph_path_was_active}"
+        restore_unit_state "${RIPH_TIMER_UNIT}" "${riph_timer_was_enabled}" "${riph_timer_was_active}"
+        restore_unit_state "${HOTFIX_PATH_UNIT}" "${hotfix_path_was_enabled}" "${hotfix_path_was_active}"
+        restore_unit_state "${HOTFIX_TIMER_UNIT}" "${hotfix_timer_was_enabled}" "${hotfix_timer_was_active}"
     fi
-    if [[ "${hotfix_timer_was_enabled}" == enabled ]]; then
-        "${SYSTEMCTL_BIN}" enable --now "${HOTFIX_TIMER_UNIT}" >/dev/null 2>&1 || true
-    fi
+
     exit "${rc}"
 }
-trap reenable_hotfix ERR
+trap restore_ownership_on_exit EXIT
 
-# Stop new temporary-hotfix triggers first. A running invocation cannot be in
-# its mutation section because this process already owns HOTFIX_LOCK.
+TAKEOVER_STARTED=1
+
+# Holding HOTFIX_LOCK guarantees the temporary service cannot be mutating the
+# allowlist while its triggers are removed.
 "${SYSTEMCTL_BIN}" disable --now "${HOTFIX_PATH_UNIT}" "${HOTFIX_TIMER_UNIT}" >/dev/null
 "${SYSTEMCTL_BIN}" stop "${HOTFIX_SERVICE_UNIT}" >/dev/null 2>&1 || true
 
-# First strict reconcile transfers the current trusted/routing state while no
-# automatic writer is active. If it fails, riph-apply restores its previous
-# Nginx state and the ERR trap re-enables the temporary hotfix.
+# Initial transactional transfer while neither automatic writer is active.
 bash "${RECONCILE}" --root "${RIPH_ROOT}" --config "${CONFIG_PATH}" \
     --reason "temporary hotfix ownership handover"
 
 "${SYSTEMCTL_BIN}" daemon-reload
-"${SYSTEMCTL_BIN}" enable --now "${RIPH_PATH_UNIT}" "${RIPH_TIMER_UNIT}" >/dev/null
 
+# Activate only the path first. Enabling the timer on a long-running host can
+# legitimately make an already-past OnBootSec deadline fire immediately; keep
+# that extra concurrency out of the ownership transition itself.
+"${SYSTEMCTL_BIN}" enable --now "${RIPH_PATH_UNIT}" >/dev/null
 [[ "$(unit_state is-active "${RIPH_PATH_UNIT}")" == active ]] \
     || riph_die "${RIPH_PATH_UNIT} is not active after handover"
+
+ALLOWLIST_FILE="$(riph_root_path "${ALLOWLIST_OUTPUT}")"
+
+current_allowlist_matches() {
+    local router_id current_ip
+    [[ -f "${ALLOWLIST_FILE}" ]] || return 1
+
+    for router_id in "${RIPH_ROUTER_IDS[@]}"; do
+        if current_ip="$(riph_current_router_ip "${router_id}")"; then
+            grep -Eq "^[[:space:]]*${current_ip//./\\.}/32[[:space:]]+1;" "${ALLOWLIST_FILE}" \
+                || return 1
+        elif [[ "${REQUIRE_ROUTER_IP:-1}" == 1 ]]; then
+            return 1
+        fi
+    done
+    return 0
+}
+
+# Router IP Push does not share HOTFIX_LOCK, so its current IP can change while
+# ownership is moving. Reconcile after path activation and retry a bounded number
+# of times if a path-triggered reconcile overlaps or the current IP advances again.
+converged=0
+for attempt in 1 2 3; do
+    if bash "${RECONCILE}" --root "${RIPH_ROOT}" --config "${CONFIG_PATH}" \
+        --reason "post-handover Router IP verification attempt ${attempt}"; then
+        if current_allowlist_matches; then
+            converged=1
+            break
+        fi
+    fi
+    riph_log "Router-IP handover convergence attempt ${attempt} did not settle; retrying"
+    sleep 1
+done
+(( converged == 1 )) || riph_die "current Router IP did not converge into active allowlist during handover"
+
+# The path now owns immediate changes. Add the independent 1-minute fallback only
+# after the transfer has converged.
+"${SYSTEMCTL_BIN}" enable --now "${RIPH_TIMER_UNIT}" >/dev/null
 [[ "$(unit_state is-active "${RIPH_TIMER_UNIT}")" == active ]] \
     || riph_die "${RIPH_TIMER_UNIT} is not active after handover"
 
-# Router IP Push intentionally has no dependency on the hotfix lock. The ISP IP
-# can therefore change between the first reconcile and path activation. Reconcile
-# once more after the path/timer are active so that transition cannot be missed.
-bash "${RECONCILE}" --root "${RIPH_ROOT}" --config "${CONFIG_PATH}" \
-    --reason "post-handover Router IP verification"
-
-ALLOWLIST_FILE="$(riph_root_path "${ALLOWLIST_OUTPUT}")"
-[[ -f "${ALLOWLIST_FILE}" ]] || riph_die "generated allowlist missing after handover: ${ALLOWLIST_FILE}"
-
-for router_id in "${RIPH_ROUTER_IDS[@]}"; do
-    if current_ip="$(riph_current_router_ip "${router_id}")"; then
-        grep -Eq "^[[:space:]]*${current_ip//./\\.}/32[[:space:]]+1;" "${ALLOWLIST_FILE}" \
-            || riph_die "current ${router_id} IP ${current_ip} is not trusted after handover"
-    elif [[ "${REQUIRE_ROUTER_IP:-1}" == 1 ]]; then
-        riph_die "current Router IP missing after handover: ${router_id}"
-    fi
-done
-
-trap - ERR
+HANDOVER_COMMITTED=1
+trap - EXIT
 riph_log "temporary hotfix ownership transferred to RIPH"
 riph_log "temporary hotfix unit files/script were preserved but path/timer remain disabled"
 status_cmd
