@@ -3,17 +3,57 @@
 This plan is deliberately gate-based. Do not advance to the next phase until the
 previous phase has been reviewed and explicitly accepted.
 
-The first server interaction is **read-only**. The production installer gate stays
-enabled until Phase 2 is complete.
+The first server interaction is **read-only**. Production mutation remains gated
+until candidate validation is complete.
+
+## Real incident incorporated into the test plan
+
+On 2026-08-17 the AX3200 public IPv4 changed from `78.111.155.187` to
+`78.111.154.96`. Router IP Push correctly updated:
+
+- `/var/lib/router-ip-push/ips/AX3200.ipv4`;
+- `/var/lib/router-ip-push/state/AX3200.json`.
+
+The old staging Nginx allowlist did not have a consumer watching that update, so
+the new source was treated as untrusted and `treda.layerupzap.ru` was routed to
+bridge `9543` / fake site instead of Xray `8443` until the allowlist was corrected
+and Nginx reloaded.
+
+This exact A -> B transition is now a mandatory regression case. A temporary
+production safeguard currently owns the staging allowlist on Hexabyte:
+
+- `router-ip-push-nginx-hotfix.path`;
+- `router-ip-push-nginx-hotfix.timer` (1-minute fallback);
+- `router-ip-push-nginx-hotfix.service`;
+- `/usr/local/sbin/router-ip-push-nginx-hotfix`.
+
+The temporary hotfix must remain active until RIPH takes ownership atomically. It
+must not run in parallel with RIPH as a second long-lived allowlist writer.
 
 ## Phase 0 — local/repository readiness
 
-Required before touching Hexabyte:
+Required before changing Hexabyte production state:
 
 - GitHub Actions remains manual-only (`workflow_dispatch`);
 - local/test-root regression suite passes;
 - no production `/` install has been performed from this repository;
 - branch remains draft and unmerged;
+- exact Router-IP incident regression passes:
+  - A=`78.111.155.187` is initially current/trusted;
+  - Router IP Push atomically replaces the current file with B=`78.111.154.96`;
+  - first reconcile makes B trusted immediately;
+  - A remains trusted only as 4-hour previous-IP grace;
+  - after grace expiry A is removed while B remains trusted;
+- systemd unit regression confirms:
+  - `PathChanged=/var/lib/router-ip-push/ips`;
+  - path triggers `riph-reconcile.service`;
+  - fallback reconcile timer is 1 minute;
+- hotfix handover regression confirms:
+  - successful takeover disables temporary hotfix path/timer;
+  - RIPH path/timer become active;
+  - takeover performs a second reconcile after RIPH path activation;
+  - an IP change occurring between the two reconciles is still consumed;
+  - failed takeover restores the temporary hotfix;
 - current Hexabyte-specific seed values are reviewed:
   - public SNI `nukla.layerupzap.ru` -> `127.0.0.1:7443`;
   - private SNI `treda.layerupzap.ru` -> Xray `8443`, fake `9443`, bridge `9543`;
@@ -24,7 +64,7 @@ Required before touching Hexabyte:
 
 ## Phase 1 — read-only Hexabyte preflight
 
-Run `tools/preflight-report.sh` as root from a checked-out copy of this branch.
+Run `tools/preflight-report.sh` as root.
 
 The script must not:
 
@@ -39,26 +79,28 @@ The script must not:
 
 Review the report for:
 
-1. Ubuntu/Debian version and command availability;
+1. Debian version and command availability;
 2. current `nginx -t` result;
 3. current Nginx stream include layout;
 4. exact current contents of:
+   - `00-sni-watch.conf`;
    - `05-router-ip-push-source-allow.conf`;
-   - `06-router-ip-push-fake-site-bridges.conf` if present;
+   - `06-router-ip-push-fake-site-bridges.conf`;
    - `stream.conf`;
 5. current listeners on 443/7443/8443/8444/9443/9444/9543/9544;
 6. Router IP Push current IP and `last_seen`;
-7. current Fail2ban installation/service/jails;
-8. current UFW rules and whether UFW is active;
-9. any existing RIPH files/units from manual experiments;
-10. existing stream audit log format/tail.
+7. temporary hotfix script, backup directory and unit states;
+8. current Fail2ban installation/service/jails;
+9. current UFW rules and whether UFW is active;
+10. any existing RIPH files/units;
+11. legacy and RIPH stream audit log state/tails.
 
 **STOP GATE 1:** do not install anything until the report is compared with the
-known manually tested Hexabyte state.
+known working Hexabyte state.
 
 ## Phase 2 — candidate generation without production mutation
 
-Build a temporary test root from the approved Hexabyte values and generate:
+Build temporary candidates and generate:
 
 - effective trusted allowlist;
 - private `stream.conf`;
@@ -76,13 +118,18 @@ trongo + untrusted          -> 9544 -> 9444
 unknown / empty / IP-SNI    -> reject 127.0.0.1:9
 ```
 
-Confirm the generated audit log exists only on the external `:443` server, not on
-internal bridge listeners.
+During migration the external `:443` server may explicitly write both:
 
-Validate Fail2ban regex against synthetic controlled log lines before live jails are
-enabled. Validate `riph-fail2ban-ufw` with synthetic UFW status containing both a
-manual deny and a Fail2ban deny for the same IP; unban must select only the exact
-`riph-f2b-<jail>` marked rule.
+- legacy `/var/log/nginx/stream-sni.log` using `sni_watch` so the existing legacy
+  reject jail remains fed;
+- new `/var/log/nginx/riph-stream-sni.log` using `riph_stream_sni`.
+
+Internal bridge listeners must not enter the new RIPH audit log.
+
+Validate Fail2ban regex against synthetic controlled log lines before live RIPH
+jails are enabled. Validate `riph-fail2ban-ufw` with synthetic UFW status containing
+both a manual deny and a project Fail2ban deny for the same IP; unban must select
+only the exact `riph-f2b-<jail>` marked rule.
 
 **STOP GATE 2:** candidate diff must contain no unexpected listener, upstream,
 trusted source, package/service, SSH or unrelated configuration change.
@@ -93,12 +140,13 @@ Immediately before the first controlled install:
 
 - confirm SSH access still works from the current session;
 - keep the current SSH session open;
+- confirm the temporary Router-IP/Nginx hotfix path and timer are active;
 - record current `nginx -t` as successful;
 - save the exact Nginx stream files;
-- save current Fail2ban project-related files/status;
+- save current Fail2ban related files/status;
 - save `ufw status numbered`;
 - save Router IP Push state;
-- record enabled/active state of relevant systemd units.
+- record enabled/active state of temporary hotfix and RIPH units.
 
 The installer creates its own pre-install snapshot as an additional layer, including
 all three Nginx runtime files that may later be changed by `riph-apply`.
@@ -107,48 +155,68 @@ No SSH policy is changed.
 
 **STOP GATE 3:** rollback material must be readable before any apply.
 
-## Phase 4 — controlled file install, no timers yet
+## Phase 4 — controlled file install while hotfix remains owner
 
 Use the explicit controlled-test production gate only after Phases 1–3 pass.
 
-First install files without enabling timers. Review:
+Install project files **without applying RIPH and without changing ownership yet**.
+The temporary hotfix continues protecting Router IP changes during this phase.
+
+Review:
 
 - `/etc/router-ip-push-hardening/config.env`;
 - static trusted list;
 - current Router IP Push address;
-- generated candidates via dry-run/admin status.
+- both RIPH Fail2ban jails remain disabled;
+- `riph-hotfix-handover status` reports temporary ownership;
+- generated candidates via dry-run/status.
 
-Do not use `--replace-config` unless replacement of existing RIPH config was
-explicitly intended and reviewed.
+Do not use `--replace-config` unless replacement was explicitly intended and
+reviewed.
 
-## Phase 5 — transactional Nginx apply
+## Phase 5 — atomic allowlist ownership handover + transactional Nginx apply
 
-Run the normal transactional apply.
+Because the temporary hotfix and RIPH both write the same allowlist, **do not run a
+raw production `riph-apply` while the hotfix path/timer are active**.
 
-Required checks:
+The controlled production transition uses `riph-hotfix-handover takeover` (the
+installer invokes it when production `--apply --enable-timers` sees the temporary
+hotfix).
 
-1. backup created;
-2. `nginx -t` succeeds;
-3. only expected allowlist/stream/bridge files change;
-4. Nginx reload succeeds;
-5. current SSH session remains healthy;
-6. `riph-admin status` shows expected current/effective trusted sources.
+Required handover sequence:
 
-If validation or reload fails, stop and inspect automatic rollback. Do not continue
-to Fail2ban.
+1. acquire `/run/lock/router-ip-push-nginx-hotfix.lock`;
+2. record temporary hotfix unit state;
+3. disable/stop the temporary hotfix path/timer/service triggers;
+4. run strict transactional `riph-reconcile`;
+5. `nginx -t` and Nginx reload must succeed through `riph-apply`;
+6. enable `riph-router-ip.path` and `riph-reconcile.timer`;
+7. verify both RIPH units are active;
+8. run a **second** reconcile after RIPH path/timer activation;
+9. read Router IP Push again and verify every configured current Router IP is
+   present in the generated allowlist;
+10. leave temporary hotfix files on disk but disabled.
+
+The second reconcile is mandatory because Router IP Push does not use the hotfix
+lock: the ISP address can change in the middle of the ownership transition.
+
+If any handover step fails, the temporary hotfix path/timer must be re-enabled.
+
+**STOP GATE 4:** RIPH owns the allowlist, current AX3200 IP is trusted, Nginx is
+healthy, RIPH path/timer are active, and temporary hotfix path/timer are disabled.
 
 ## Phase 6 — routing functional checks
 
 Verify the non-destructive cases first:
 
 - `nukla` reaches the public site;
-- AX3200/current trusted source reaches `treda` Xray;
-- AX3200/current trusted source reaches `trongo` Xray;
+- AX3200/current trusted source reaches `treda` Xray (`8443`);
+- AX3200/current trusted source reaches `trongo` Xray (`8444`);
 - normal user traffic remains functional.
 
-For an untrusted-source camouflage test, use a source that is deliberately and
-safely outside the effective trusted set. Do not temporarily remove the current
-home/Router IP from trusted state merely to force a test.
+For an untrusted-source camouflage test, use a source deliberately outside the
+effective trusted set. Do not remove the current home/Router IP from trusted state
+merely to force a test.
 
 Expected untrusted results:
 
@@ -156,36 +224,39 @@ Expected untrusted results:
 - `trongo` -> fake trongo site through bridge 9544;
 - unknown SNI -> reject.
 
-Confirm `/var/log/nginx/stream-sni.log` records external `:443` sessions only and
-shows final routes `www`, `xray_N`, `fake_N`, or `reject`.
+Confirm `/var/log/nginx/riph-stream-sni.log` records only external `:443` sessions
+and shows final routes `www`, `xray_N`, `fake_N`, or `reject`.
 
-**STOP GATE 4:** private trusted routing and camouflage must match the previously
-manual-tested behavior before Fail2ban is activated.
+## Phase 7 — Fail2ban validation, activation and legacy handover
 
-## Phase 7 — Fail2ban validation and activation
+The packaged RIPH jails remain disabled until this phase.
 
-Before restart/reload:
+Before activation:
 
-- ensure `fail2ban-client -t` succeeds;
-- run `fail2ban-regex` against controlled sample log;
-- verify both actions are TCP/443 only;
-- verify `riph-fail2ban-ignore` returns success for:
+- `fail2ban-client -t` succeeds;
+- `fail2ban-regex` succeeds against controlled sample log;
+- both RIPH actions are TCP/443 only;
+- `riph-fail2ban-ignore` returns success for:
   - current AX3200 IP;
   - VPS_GR;
   - Spectra;
   - Hexabyte;
-- verify it returns nonzero for a known untrusted test IP;
-- verify `riph-fail2ban-ufw` only selects/removes exact project-marked rules.
+- it returns nonzero for a known untrusted test IP;
+- `riph-fail2ban-ufw` only selects/removes exact project-marked rules.
 
-After activation:
+Then:
 
-- both project jails are active;
-- no trusted IP is banned;
-- `riph-admin guard` reports a clean trusted state.
+1. activate the two `riph-*` jails;
+2. confirm both are active and no trusted IP is banned;
+3. run the trusted guard;
+4. quiesce legacy SNI logging only after the new jails are proven healthy;
+5. allow existing legacy bans to expire naturally under the old 6-hour policy;
+6. retire the legacy jail only when its ban list is empty.
 
-Do not deliberately trigger a live ban from the current home IP.
+Do not manually migrate/remove legacy unmarked UFW bans merely to make the handover
+faster. Do not deliberately trigger a live ban from the current home IP.
 
-## Phase 8 — manual deny validation
+## Phase 8 — manual deny validation / later legacy manual-deny adoption
 
 Use a harmless documentation/test IP outside all trusted ranges to validate:
 
@@ -194,29 +265,31 @@ Use a harmless documentation/test IP outside all trusted ranges to validate:
 - remove 443-only deny;
 - trusted-overlap addition is rejected before UFW mutation.
 
-All-port deny remains a manual exceptional path; it is not part of the normal live
-validation sequence.
+Existing legacy manual UFW deny rules are preserved until an explicit adoption
+step. Do not duplicate or delete them implicitly during first installation.
 
-## Phase 9 — Router IP watch / grace / guard
+All-port deny remains a manual exceptional path.
 
-Only after routing and Fail2ban are healthy:
+## Phase 9 — Router IP watch / grace / guard end-to-end observation
 
-- enable `riph-router-ip.path`;
-- enable `riph-reconcile.timer`;
-- confirm both are active;
-- confirm there is no separate periodic guard timer;
-- confirm the trusted guard runs inside reconcile.
+RIPH path/timer are already active after Phase 5. Verify:
 
-A real ISP IP change is the final end-to-end validation when it naturally occurs:
+- `riph-router-ip.path` is active/waiting;
+- `riph-reconcile.timer` is active with 1-minute fallback;
+- there is no separate periodic guard timer;
+- trusted guard runs inside reconcile.
 
-1. Router IP Push writes the new `.ipv4` address;
-2. path unit triggers reconcile;
-3. new IP becomes current trusted;
+A natural future ISP IP change is the end-to-end validation:
+
+1. Router IP Push atomically replaces the current `.ipv4` address;
+2. directory `PathChanged` triggers reconcile;
+3. new IP becomes current trusted immediately;
 4. old IP enters 4-hour grace;
 5. trusted guard removes any project 443 ban affecting the new IP;
-6. after grace expires, periodic reconcile removes the old IP.
+6. if the path event is missed, the 1-minute timer is the fallback;
+7. after grace expires, reconcile removes the old IP.
 
-Do not force an ISP reconnect solely for this test unless explicitly agreed.
+Do not force an ISP reconnect solely for the test unless explicitly agreed.
 
 ## Phase 10 — harvest checkpoint / observation
 
@@ -242,7 +315,7 @@ Expected categories:
 ## Phase 11 — rollback drill
 
 A rollback drill is performed only after a known-good post-install state is saved.
-Use a controlled non-connectivity-breaking routing/config change or an isolated
+Use a controlled non-connectivity-breaking routing/config change or isolated
 validation where possible.
 
 Verify:
@@ -260,13 +333,16 @@ Do not use SSH/UFW access-policy changes as rollback-drill material.
 Private v1 is ready to merge only after:
 
 - all read-only/pre-production gates pass;
+- the exact 2026-08-17 Router-IP incident regression passes;
+- hotfix -> RIPH ownership handover and its mid-handover IP-race regression pass;
 - controlled Hexabyte routing matches the manually proven scheme;
 - Fail2ban jails match only controlled final routes;
 - trusted IPs cannot remain project-banned;
 - automatic bans remain TCP/443-only;
 - Fail2ban unban cannot remove project manual-deny ownership;
 - Router IP Push remains reachable over SSH;
-- timers/watch behave as designed;
+- path plus 1-minute fallback timer behave as designed;
+- temporary hotfix path/timer are disabled after RIPH takes ownership;
 - harvest shows clean routing categories;
 - rollback has been validated;
 - one final GitHub Actions run may be performed only with explicit approval.
