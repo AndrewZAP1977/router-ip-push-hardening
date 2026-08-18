@@ -5,11 +5,19 @@ Private hardening supplement for an existing `3x-ui-installer` Nginx/Xray deploy
 The repository is intentionally separate from the public installer. It contains
 private source-IP/SNI policy and must remain private.
 
+## Нормальная инструкция на русском
+
+Если тебе нужно **поставить РИФ, понять принцип работы или пользоваться меню**, а не читать архитектурную документацию, начинай отсюда:
+
+**[Практическая инструкция РИФ на русском → docs/USER_GUIDE_RU.md](docs/USER_GUIDE_RU.md)**
+
+Там есть краткое объяснение работы, установка/обновление, добавление дополнительных Router IP Push роутеров и описание **всех 22 пунктов интерактивного меню с примерами**. Большие разделы сворачиваются.
+
 ## Status
 
 Controlled Hexabyte production validation completed on 2026-08-18.
 
-Production ownership is now RIPH:
+Production ownership is RIPH:
 
 - `riph-router-ip.path` is enabled/active;
 - `riph-reconcile.timer` is enabled/active with 1-minute fallback;
@@ -22,6 +30,11 @@ Production ownership is now RIPH:
 - the fail-closed manual-deny helper verifies physical UFW ownership on every
   applied-state row.
 
+Dynamic home/router addresses are intentionally **not** permanent static trust.
+RIPH automatically discovers additional routers that have a valid Router IP Push
+registration under `/etc/router-ip-push/routers.d/` and have sent at least one
+current IPv4 update. A stray `.ipv4` file without a valid registration is not enough.
+
 GitHub Actions is intentionally manual-only (`workflow_dispatch`) and was not run
 during the production validation.
 
@@ -30,6 +43,8 @@ during the production validation.
 v1 includes:
 
 - Router IP Push current IPv4 as a trusted source;
+- automatic discovery of validly registered Router IP Push routers after their first update;
+- optional explicit Router IP IDs for compatibility/special cases;
 - static trusted IPv4/CIDR entries;
 - configurable previous-IP grace (4 hours by default);
 - generated Nginx `geo $router_ip_push_source_allowed`;
@@ -118,9 +133,13 @@ Completed on 2026-08-18:
 12. repeated automatic `riph-reconcile.service` runs accepted the physical
     ownership state with `manual_conflicts=0`.
 
-Permanent static trusted sources validated in production include localhost,
-VPS_GR `5.61.39.137/32`, Spectra `45.87.41.121/32`, Hexabyte
-`194.104.94.182/32`, and SmartBox-mother `176.110.189.199/32`.
+At validation time SmartBox-mother was temporarily represented by a known provider
+source IP. That address is dynamic and has been removed from permanent static trust.
+Future SmartBox-mother trust comes from its normal Router IP Push registration and
+first update, after which RIPH discovers it automatically.
+
+Permanent static trusted examples are localhost, VPS_GR `5.61.39.137/32`, Spectra
+`45.87.41.121/32` and Hexabyte `194.104.94.182/32`.
 
 See `docs/HEXABYTE_LEGACY_MIGRATION.md` for the migration record.
 
@@ -143,6 +162,7 @@ The tests use temporary `/tmp/riph-*` roots and stub Nginx/systemctl/UFW command
 Important regressions include:
 
 - `tests/test-ip-change-incident.sh` — exact 2026-08-17 address transition;
+- `tests/test-router-auto-discovery.sh` — registered-router trust discovery and rejection of stray/unregistered state;
 - `tests/test-systemd-watch.sh` — directory path watch + 1-minute fallback;
 - `tests/test-hotfix-handover.sh` — ownership transfer, rollback, and IP change in
   the middle of handover;
@@ -189,12 +209,14 @@ The Nginx allowlist is generated and must not be edited manually. Effective trus
 sources are derived from:
 
 1. `/etc/router-ip-push-hardening/trusted-static.list`;
-2. `/var/lib/router-ip-push/ips/<ROUTER_ID>.ipv4`;
-3. non-expired entries in `/etc/router-ip-push-hardening/previous-ip-grace.json`.
+2. explicit Router IP IDs (if configured) plus valid registrations from
+   `/etc/router-ip-push/routers.d/<router_id>.json` that have a current Router IP Push IPv4;
+3. `/var/lib/router-ip-push/ips/<router_id>.ipv4` / Router IP Push state for those effective IDs;
+4. non-expired entries in `/etc/router-ip-push-hardening/previous-ip-grace.json`.
 
 Manual-deny ownership is derived from the configured source lists plus the
 project-owned applied-state file, but state is trusted only when the corresponding
 RIPH-marked UFW rule is physically visible.
 
-See `docs/ARCHITECTURE.md`, `docs/HEXABYTE_TEST_PLAN.md` and
+See `docs/USER_GUIDE_RU.md`, `docs/ARCHITECTURE.md`, `docs/HEXABYTE_TEST_PLAN.md` and
 `docs/HEXABYTE_LEGACY_MIGRATION.md`.

@@ -2,9 +2,9 @@
 # Format:
 #   IPv4[/prefix] [# comment]
 #
-# Dynamic AX3200 addresses are NOT listed here. They come from Router IP Push.
+# Dynamic router addresses must NOT be listed here. They come from Router IP Push
+# for router IDs explicitly configured in ROUTER_IDS.
 127.0.0.1/32          # localhost
 5.61.39.137/32        # VPS_GR
 45.87.41.121/32       # Spectra
 194.104.94.182/32     # Hexabyte
-176.110.189.199/32    # SmartBox-mother static

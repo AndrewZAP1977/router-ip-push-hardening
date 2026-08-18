@@ -26,11 +26,12 @@ grep -Fq 'Current production safety gate' "${REPORT}" \
 grep -Fq 'temporary safeguard owns a synchronized staging allowlist' "${REPORT}" \
     || fail 'candidate report lost Router IP/hotfix synchronization check'
 
-grep -Fq "${SMARTBOX_MOTHER}" "${STATIC}" \
-    || fail 'SmartBox-mother is not preserved in the permanent static trusted set'
-grep -Fq 'SMARTBOX_MOTHER_IP=176.110.189.199' "${REPORT}" \
-    || fail 'candidate report does not preserve/check SmartBox-mother trusted access'
-grep -Fq 'candidate allowlist lost SmartBox-mother static trusted source' "${REPORT}" \
-    || fail 'candidate report lacks SmartBox-mother candidate fail-closed check'
+! grep -Fq "${SMARTBOX_MOTHER}" "${STATIC}" \
+    || fail 'dynamic SmartBox-mother address is still seeded as permanent static trust'
+! grep -Fq 'SMARTBOX_MOTHER_IP=' "${REPORT}" \
+    || fail 'historical candidate report still hardcodes SmartBox-mother dynamic IPv4'
 
-echo 'PASS: candidate report preserves production Nginx prefix, safety gate and SmartBox-mother trusted source'
+grep -Fq '# router-ip-push:AX3200 current' "${REPORT}" \
+    || fail 'candidate report lost Router IP Push dynamic trust line'
+
+echo 'PASS: candidate report preserves Nginx safety gate and keeps dynamic router IPs out of static trust'
