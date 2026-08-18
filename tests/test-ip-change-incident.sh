@@ -38,10 +38,22 @@ cat >"${T}/usr/local/bin/systemctl-stub" <<EOF_STUB
 echo "systemctl \$*" >>"${CALL_LOG}"
 exit 0
 EOF_STUB
-chmod +x "${T}/usr/local/bin/nginx-stub" "${T}/usr/local/bin/systemctl-stub"
+cat >"${T}/usr/local/bin/ufw-stub" <<'EOF_STUB'
+#!/usr/bin/env bash
+# This incident regression has empty manual-deny lists. The production helper
+# now validates UFW availability fail-closed, so provide a harmless test-root UFW.
+if [[ "${1:-}" == status && "${2:-}" == numbered ]]; then
+    printf '%s\n' 'Status: active'
+fi
+exit 0
+EOF_STUB
+chmod +x "${T}/usr/local/bin/nginx-stub" \
+         "${T}/usr/local/bin/systemctl-stub" \
+         "${T}/usr/local/bin/ufw-stub"
 
 export RIPH_NGINX_BIN="${T}/usr/local/bin/nginx-stub"
 export RIPH_SYSTEMCTL_BIN="${T}/usr/local/bin/systemctl-stub"
+export RIPH_UFW_BIN="${T}/usr/local/bin/ufw-stub"
 export RIPH_FAIL2BAN_CLIENT_BIN="${T}/usr/local/bin/fail2ban-not-installed"
 
 OLD_IP='78.111.155.187'
