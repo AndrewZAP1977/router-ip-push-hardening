@@ -281,14 +281,28 @@ read_existing_jail_enabled() {
             exit
         }
     ' "${target}")"
-    [[ "${value}" == true || "${value}" == false ]] \
-        || riph_die "existing RIPH jail has missing/invalid enabled flag: ${target}"
+    [[ "${value}" == true || "${value}" == false ]] || return 2
     printf '%s\n' "${value}"
 }
 
 capture_existing_jail_states() {
-    RIPH_JAIL_REJECT_ENABLED_BEFORE="$(read_existing_jail_enabled "${RIPH_JAIL_REJECT_LOGICAL}" 2>/dev/null || true)"
-    RIPH_JAIL_PRIVATE_ENABLED_BEFORE="$(read_existing_jail_enabled "${RIPH_JAIL_PRIVATE_LOGICAL}" 2>/dev/null || true)"
+    local target value
+
+    target="$(riph_root_path "${RIPH_JAIL_REJECT_LOGICAL}")"
+    if [[ -f "${target}" ]]; then
+        if ! value="$(read_existing_jail_enabled "${RIPH_JAIL_REJECT_LOGICAL}")"; then
+            riph_die "could not preserve existing RIPH jail enabled state: ${target}"
+        fi
+        RIPH_JAIL_REJECT_ENABLED_BEFORE="${value}"
+    fi
+
+    target="$(riph_root_path "${RIPH_JAIL_PRIVATE_LOGICAL}")"
+    if [[ -f "${target}" ]]; then
+        if ! value="$(read_existing_jail_enabled "${RIPH_JAIL_PRIVATE_LOGICAL}")"; then
+            riph_die "could not preserve existing RIPH jail enabled state: ${target}"
+        fi
+        RIPH_JAIL_PRIVATE_ENABLED_BEFORE="${value}"
+    fi
 }
 
 preserve_jail_enabled_state() {
