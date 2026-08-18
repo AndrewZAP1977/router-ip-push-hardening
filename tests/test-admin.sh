@@ -23,6 +23,10 @@ printf '%s\n' '{"version":1,"router_id":"AX3200","source_ip":"78.111.155.187","l
 : >"${T}/etc/router-ip-push-hardening/manual-deny-all.list"
 
 CALL_LOG="${T}/calls.log"
+UFW_STATE="${T}/ufw-state.tsv"
+: >"${CALL_LOG}"
+: >"${UFW_STATE}"
+
 cat >"${T}/usr/local/bin/nginx-stub" <<EOF_STUB
 #!/usr/bin/env bash
 echo "nginx \$*" >>"${CALL_LOG}"
@@ -33,15 +37,82 @@ cat >"${T}/usr/local/bin/systemctl-stub" <<EOF_STUB
 echo "systemctl \$*" >>"${CALL_LOG}"
 exit 0
 EOF_STUB
-cat >"${T}/usr/local/bin/ufw-stub" <<EOF_STUB
+cat >"${T}/usr/local/bin/ufw-stub" <<'EOF_STUB'
 #!/usr/bin/env bash
-echo "ufw \$*" >>"${CALL_LOG}"
+set -Eeuo pipefail
+
+LOG="${RIPH_TEST_CALL_LOG:?}"
+STATE="${RIPH_TEST_UFW_STATE:?}"
+echo "ufw $*" >>"${LOG}"
+
+if [[ "${1:-}" == status && "${2:-}" == numbered ]]; then
+    n=0
+    while IFS=$'\t' read -r scope cidr marker; do
+        [[ -n "${scope:-}" ]] || continue
+        ((n += 1))
+        source="${cidr}"
+        [[ "${source}" == */32 ]] && source="${source%/32}"
+        if [[ "${scope}" == 443 ]]; then
+            printf '[%2d] 443/tcp                    DENY IN     %-28s # %s\n' "${n}" "${source}" "${marker}"
+        else
+            printf '[%2d] Anywhere                   DENY IN     %-28s # %s\n' "${n}" "${source}" "${marker}"
+        fi
+    done <"${STATE}"
+    exit 0
+fi
+
+parse_rule() {
+    local -a args=("$@")
+    local i
+    SCOPE=all
+    CIDR=''
+    MARKER=''
+    for ((i=0; i<${#args[@]}; i++)); do
+        case "${args[$i]}" in
+            from)
+                CIDR="${args[$((i+1))]}"
+                ;;
+            port)
+                [[ "${args[$((i+1))]}" == 443 ]] && SCOPE=443
+                ;;
+            comment)
+                MARKER="${args[$((i+1))]}"
+                ;;
+        esac
+    done
+    [[ -n "${CIDR}" && -n "${MARKER}" ]]
+}
+
+if [[ "${1:-}" == prepend ]]; then
+    parse_rule "$@"
+    if awk -F '\t' -v s="${SCOPE}" -v c="${CIDR}" '$1==s && $2==c {found=1} END{exit !found}' "${STATE}"; then
+        echo 'Skipping adding existing rule'
+        exit 0
+    fi
+    printf '%s\t%s\t%s\n' "${SCOPE}" "${CIDR}" "${MARKER}" >>"${STATE}"
+    echo 'Rule inserted'
+    exit 0
+fi
+
+if [[ "${1:-}" == --force && "${2:-}" == delete ]]; then
+    shift 2
+    parse_rule "$@"
+    tmp="${STATE}.tmp.$$"
+    awk -F '\t' -v s="${SCOPE}" -v c="${CIDR}" -v m="${MARKER}" \
+        '!( $1==s && $2==c && $3==m )' "${STATE}" >"${tmp}"
+    mv -f "${tmp}" "${STATE}"
+    echo 'Rule deleted'
+    exit 0
+fi
+
 exit 0
 EOF_STUB
 chmod +x "${T}/usr/local/bin/"*-stub
 export RIPH_NGINX_BIN="${T}/usr/local/bin/nginx-stub"
 export RIPH_SYSTEMCTL_BIN="${T}/usr/local/bin/systemctl-stub"
 export RIPH_UFW_BIN="${T}/usr/local/bin/ufw-stub"
+export RIPH_TEST_CALL_LOG="${CALL_LOG}"
+export RIPH_TEST_UFW_STATE="${UFW_STATE}"
 
 "${ADMIN}" --root "${T}" apply >/dev/null
 STATUS_OUT="${T}/status.txt"
@@ -60,8 +131,10 @@ echo 'TEST A2: manual deny add/remove through managed sync'
 "${ADMIN}" --root "${T}" deny443-add 198.51.100.0/24 scanner >/dev/null
 grep -F '198.51.100.0/24 # scanner' "${T}/etc/router-ip-push-hardening/manual-deny-443.list" >/dev/null || fail 'deny443 add missing'
 grep -F 'ufw prepend deny proto tcp from 198.51.100.0/24 to any port 443 comment riph-manual-443' "${CALL_LOG}" >/dev/null || fail 'deny443 add not applied'
+grep -F $'443\t198.51.100.0/24\triph-manual-443' "${UFW_STATE}" >/dev/null || fail 'deny443 ownership marker missing'
 "${ADMIN}" --root "${T}" deny443-remove 198.51.100.0/24 >/dev/null
 grep -F 'ufw --force delete deny proto tcp from 198.51.100.0/24 to any port 443 comment riph-manual-443' "${CALL_LOG}" >/dev/null || fail 'deny443 remove not applied'
+! grep -F $'443\t198.51.100.0/24\triph-manual-443' "${UFW_STATE}" >/dev/null || fail 'deny443 ownership marker remained after remove'
 
 echo 'TEST A3: trusted overlap is rejected and list restored'
 cp "${T}/etc/router-ip-push-hardening/manual-deny-443.list" "${T}/deny.before"
