@@ -23,8 +23,22 @@ else
     printf '%s\n' "$*" >>"${RIPH_TEST_F2B_LOG:?}"
 fi
 EOF
-chmod +x "${T}/usr/local/bin/f2b-stub"
+
+# riph-apply-manual-deny is invoked by the guard even when the desired manual
+# deny state is empty. The helper intentionally requires an inspectable UFW
+# executable before trusting ownership state, so test-root guard coverage must
+# provide one rather than depending on the host having UFW installed.
+cat >"${T}/usr/local/bin/ufw-stub" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == status && "${2:-}" == numbered ]]; then
+    exit 0
+fi
+exit 0
+EOF
+
+chmod +x "${T}/usr/local/bin/f2b-stub" "${T}/usr/local/bin/ufw-stub"
 export RIPH_FAIL2BAN_CLIENT_BIN="${T}/usr/local/bin/f2b-stub"
+export RIPH_UFW_BIN="${T}/usr/local/bin/ufw-stub"
 export RIPH_TEST_F2B_LOG="${LOG}"
 
 "${GUARD}" --root "${T}" --now-epoch 1000
