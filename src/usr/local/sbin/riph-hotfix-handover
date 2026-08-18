@@ -38,8 +38,9 @@ Commands:
 
 The takeover keeps the temporary hotfix files for rollback/forensics. It disables
 its automatic triggers only while holding the same lock used by that hotfix, runs a
-strict RIPH reconcile, activates the RIPH path watch, converges the active allowlist
-to the current Router IP, then activates the 1-minute fallback timer.
+strict convergent RIPH reconcile, activates the RIPH path watch, runs a second
+convergent reconcile to close the ownership-transition race, verifies current Router
+IP presence in the active allowlist, then activates the 1-minute fallback timer.
 
 Any failure after mutation begins disables RIPH automatic triggers first and restores
 the temporary hotfix path/timer to their exact pre-handover enabled/active state.
@@ -78,7 +79,6 @@ CONFIG_FILE="$(riph_root_path "${CONFIG_PATH}")"
 riph_load_config "${CONFIG_FILE}"
 riph_require_cmd flock
 riph_require_cmd grep
-riph_require_cmd sleep
 
 SYSTEMCTL_BIN="${RIPH_SYSTEMCTL_BIN:-systemctl}"
 if [[ "${SYSTEMCTL_BIN}" != */* ]]; then
@@ -192,55 +192,38 @@ TAKEOVER_STARTED=1
 "${SYSTEMCTL_BIN}" disable --now "${HOTFIX_PATH_UNIT}" "${HOTFIX_TIMER_UNIT}" >/dev/null
 "${SYSTEMCTL_BIN}" stop "${HOTFIX_SERVICE_UNIT}" >/dev/null 2>&1 || true
 
-# Initial transactional transfer while neither automatic writer is active.
+# Initial transaction while neither automatic writer is active. riph-reconcile
+# itself rechecks live Router IP after each apply and immediately retries if the
+# address changes during this transaction.
 bash "${RECONCILE}" --root "${RIPH_ROOT}" --config "${CONFIG_PATH}" \
     --reason "temporary hotfix ownership handover"
 
 "${SYSTEMCTL_BIN}" daemon-reload
 
-# Activate only the path first. Enabling the timer on a long-running host can
-# legitimately make an already-past OnBootSec deadline fire immediately; keep
-# that extra concurrency out of the ownership transition itself.
+# Activate only the path first. The independent periodic timer is intentionally
+# added after the transition is verified, keeping takeover concurrency minimal.
 "${SYSTEMCTL_BIN}" enable --now "${RIPH_PATH_UNIT}" >/dev/null
 [[ "$(unit_state is-active "${RIPH_PATH_UNIT}")" == active ]] \
     || riph_die "${RIPH_PATH_UNIT} is not active after handover"
 
+# Router IP Push does not share HOTFIX_LOCK, so the ISP address can change between
+# the first reconcile and path activation. A second strict convergent reconcile
+# closes that transition race; a real apply/nginx failure aborts immediately.
+bash "${RECONCILE}" --root "${RIPH_ROOT}" --config "${CONFIG_PATH}" \
+    --reason "post-handover Router IP verification"
+
 ALLOWLIST_FILE="$(riph_root_path "${ALLOWLIST_OUTPUT}")"
+[[ -f "${ALLOWLIST_FILE}" ]] || riph_die "generated allowlist missing after handover: ${ALLOWLIST_FILE}"
 
-current_allowlist_matches() {
-    local router_id current_ip
-    [[ -f "${ALLOWLIST_FILE}" ]] || return 1
-
-    for router_id in "${RIPH_ROUTER_IDS[@]}"; do
-        if current_ip="$(riph_current_router_ip "${router_id}")"; then
-            grep -Eq "^[[:space:]]*${current_ip//./\\.}/32[[:space:]]+1;" "${ALLOWLIST_FILE}" \
-                || return 1
-        elif [[ "${REQUIRE_ROUTER_IP:-1}" == 1 ]]; then
-            return 1
-        fi
-    done
-    return 0
-}
-
-# Router IP Push does not share HOTFIX_LOCK, so its current IP can change while
-# ownership is moving. Reconcile after path activation and retry a bounded number
-# of times if a path-triggered reconcile overlaps or the current IP advances again.
-converged=0
-for attempt in 1 2 3; do
-    if bash "${RECONCILE}" --root "${RIPH_ROOT}" --config "${CONFIG_PATH}" \
-        --reason "post-handover Router IP verification attempt ${attempt}"; then
-        if current_allowlist_matches; then
-            converged=1
-            break
-        fi
+for router_id in "${RIPH_ROUTER_IDS[@]}"; do
+    if current_ip="$(riph_current_router_ip "${router_id}")"; then
+        grep -Eq "^[[:space:]]*${current_ip//./\\.}/32[[:space:]]+1;" "${ALLOWLIST_FILE}" \
+            || riph_die "current ${router_id} IP ${current_ip} is not trusted after handover"
+    elif [[ "${REQUIRE_ROUTER_IP:-1}" == 1 ]]; then
+        riph_die "current Router IP missing after handover: ${router_id}"
     fi
-    riph_log "Router-IP handover convergence attempt ${attempt} did not settle; retrying"
-    sleep 1
 done
-(( converged == 1 )) || riph_die "current Router IP did not converge into active allowlist during handover"
 
-# The path now owns immediate changes. Add the independent 1-minute fallback only
-# after the transfer has converged.
 "${SYSTEMCTL_BIN}" enable --now "${RIPH_TIMER_UNIT}" >/dev/null
 [[ "$(unit_state is-active "${RIPH_TIMER_UNIT}")" == active ]] \
     || riph_die "${RIPH_TIMER_UNIT} is not active after handover"
