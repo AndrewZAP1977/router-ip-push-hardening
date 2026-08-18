@@ -56,6 +56,7 @@ grep -Fqx 'OnActiveSec=1min' "${T1}/etc/systemd/system/riph-reconcile.timer" || 
 grep -Fqx 'OnUnitActiveSec=1min' "${T1}/etc/systemd/system/riph-reconcile.timer" || fail 'installed reconcile fallback recurrence is not one minute'
 ! grep -Fq 'OnBootSec=' "${T1}/etc/systemd/system/riph-reconcile.timer" || fail 'installed reconcile timer still uses boot-relative first trigger'
 [[ ! -e "${T1}/etc/systemd/system/riph-guard.timer" ]] || fail 'redundant guard timer was installed'
+grep -Fq '176.110.189.199/32' "${T1}/etc/router-ip-push-hardening/trusted-static.list" || fail 'installer seed lost SmartBox-mother static trusted source'
 [[ -f "${T1}/etc/nginx/stream-enabled/stream.conf" ]] || fail 'stream config not applied'
 grep -F 'access_log /var/log/nginx/riph-stream-sni.log riph_stream_sni;' "${T1}/etc/nginx/stream-enabled/stream.conf" >/dev/null || fail 'dedicated audit log missing'
 grep -F 'treda.layerupzap.ru|1' "${T1}/etc/nginx/stream-enabled/stream.conf" >/dev/null || fail 'private routing missing'
