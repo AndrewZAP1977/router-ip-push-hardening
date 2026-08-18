@@ -71,7 +71,7 @@ fi
 cmp -s "${T}/deny.before" "${T}/etc/router-ip-push-hardening/manual-deny-443.list" || fail 'failed deny edit was not rolled back'
 
 echo 'TEST A4: harvest through admin'
-cat >"${T}/var/log/nginx/stream-sni.log" <<'EOF_LOG'
+cat >"${T}/var/log/nginx/riph-stream-sni.log" <<'EOF_LOG'
 2026-08-17T14:00:00+00:00 src=203.0.113.10 route=reject sni=- upstream=127.0.0.1:9 status=502 session=0.001
 2026-08-17T14:00:01+00:00 src=78.111.155.187 route=xray_1 sni=treda.layerupzap.ru upstream=127.0.0.1:8443 status=200 session=1.000
 EOF_LOG
