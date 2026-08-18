@@ -11,6 +11,8 @@ MODE=""
 DO_APPLY=0
 ENABLE_TIMERS=0
 REPLACE_CONFIG=0
+TEMP_HOTFIX_ACTIVE=0
+HANDOVER_OWNS_TIMERS=0
 
 usage() {
     cat <<'USAGE'
@@ -22,12 +24,17 @@ Modes (choose one):
 
 Install options:
   --apply             Apply transactional Nginx/trusted routing only. Does not activate Fail2ban.
-  --enable-timers     Enable Router-IP watch and 5-minute reconcile after successful apply.
+  --enable-timers     Enable Router-IP watch and 1-minute reconcile after successful apply.
   --replace-config    Replace config/list files with repository examples (backed up).
 
 Global options:
   --root DIR          Test root prefix. Production root is '/'.
   -h, --help          Show this help.
+
+Temporary Hexabyte hotfix ownership:
+  If router-ip-push-nginx-hotfix.path/timer are active, a production --apply
+  is allowed only together with --enable-timers. The installer then uses
+  riph-hotfix-handover so there is never more than one active allowlist owner.
 
 Development safety gate:
   Real '/' installation is intentionally blocked until the controlled VPS test.
@@ -94,6 +101,7 @@ for required in \
     src/usr/local/sbin/riph-fail2ban-ufw \
     src/usr/local/sbin/riph-fail2ban-activate \
     src/usr/local/sbin/riph-legacy-handover \
+    src/usr/local/sbin/riph-hotfix-handover \
     src/usr/local/sbin/riph-trusted-unban-guard \
     src/usr/local/sbin/riph-reconcile \
     src/usr/local/sbin/riph-rollback \
@@ -136,6 +144,14 @@ preflight() {
         fail2ban-client -t
         LC_ALL=C ufw status | grep -Fqx 'Status: active' \
             || riph_die "UFW must already be active; installer will not enable/reset it"
+
+        if systemctl is-active --quiet router-ip-push-nginx-hotfix.path \
+            || systemctl is-active --quiet router-ip-push-nginx-hotfix.timer \
+            || systemctl is-enabled --quiet router-ip-push-nginx-hotfix.path \
+            || systemctl is-enabled --quiet router-ip-push-nginx-hotfix.timer; then
+            TEMP_HOTFIX_ACTIVE=1
+            riph_log "temporary Router IP Push Nginx hotfix detected; allowlist ownership handover is required"
+        fi
     fi
 
     for router_id in "${RIPH_ROUTER_IDS[@]}"; do
@@ -157,6 +173,10 @@ fi
 
 if [[ "${RIPH_ROOT}" == "/" && "${RIPH_ALLOW_INCOMPLETE_PRODUCTION:-0}" != "1" ]]; then
     riph_die "production install is blocked until the controlled VPS test; use test-root for development"
+fi
+
+if [[ "${RIPH_ROOT}" == "/" ]] && (( TEMP_HOTFIX_ACTIVE == 1 && DO_APPLY == 1 && ENABLE_TIMERS == 0 )); then
+    riph_die "temporary hotfix currently owns the allowlist; use --apply --enable-timers for atomic RIPH ownership handover"
 fi
 
 STATE_DIR="$(riph_root_path "${RIPH_STATE_DIR}")"
@@ -188,6 +208,7 @@ mapfile -t FILE_SPECS <<'EOF_SPECS'
 /usr/local/sbin/riph-fail2ban-ufw|src/usr/local/sbin/riph-fail2ban-ufw|0755|replace
 /usr/local/sbin/riph-fail2ban-activate|src/usr/local/sbin/riph-fail2ban-activate|0755|replace
 /usr/local/sbin/riph-legacy-handover|src/usr/local/sbin/riph-legacy-handover|0755|replace
+/usr/local/sbin/riph-hotfix-handover|src/usr/local/sbin/riph-hotfix-handover|0755|replace
 /usr/local/sbin/riph-trusted-unban-guard|src/usr/local/sbin/riph-trusted-unban-guard|0755|replace
 /usr/local/sbin/riph-reconcile|src/usr/local/sbin/riph-reconcile|0755|replace
 /usr/local/sbin/riph-rollback|src/usr/local/sbin/riph-rollback|0755|replace
@@ -300,17 +321,25 @@ done
 if (( DO_APPLY == 1 )); then
     installed_apply="$(riph_root_path /usr/local/sbin/riph-apply)"
     installed_guard="$(riph_root_path /usr/local/sbin/riph-trusted-unban-guard)"
-    bash "${installed_apply}" --root "${RIPH_ROOT}" --reason "initial hardening install"
+    installed_handover="$(riph_root_path /usr/local/sbin/riph-hotfix-handover)"
+
     if [[ "${RIPH_ROOT}" == "/" ]]; then
         touch "${STREAM_AUDIT_LOG:-/var/log/nginx/riph-stream-sni.log}"
         # Validate project Fail2ban files while they remain disabled. Activation is
         # a separate controlled Phase 7 action after routing is proven healthy.
         fail2ban-client -t
     fi
-    bash "${installed_guard}" --root "${RIPH_ROOT}"
+
+    if [[ "${RIPH_ROOT}" == "/" ]] && (( TEMP_HOTFIX_ACTIVE == 1 )); then
+        bash "${installed_handover}" --root "${RIPH_ROOT}" --config /etc/router-ip-push-hardening/config.env takeover
+        HANDOVER_OWNS_TIMERS=1
+    else
+        bash "${installed_apply}" --root "${RIPH_ROOT}" --reason "initial hardening install"
+        bash "${installed_guard}" --root "${RIPH_ROOT}"
+    fi
 fi
 
-if (( ENABLE_TIMERS == 1 )); then
+if (( ENABLE_TIMERS == 1 && HANDOVER_OWNS_TIMERS == 0 )); then
     [[ "${RIPH_ROOT}" == "/" ]] || riph_die "--enable-timers is only valid for real production root"
     systemctl daemon-reload
     systemctl enable --now riph-router-ip.path riph-reconcile.timer
