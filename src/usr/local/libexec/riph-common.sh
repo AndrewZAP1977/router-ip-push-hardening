@@ -122,7 +122,7 @@ riph_now_epoch() {
 
 riph_router_id_is_effective() {
     local wanted="$1" existing
-    for existing in "${RIPH_ROUTER_IDS[@]:-}"; do
+    for existing in "${RIPH_ROUTER_IDS[@]}"; do
         [[ "${existing}" == "${wanted}" ]] && return 0
     done
     return 1
@@ -140,6 +140,7 @@ riph_discover_registered_router_ids() {
 
     registry_dir="$(riph_root_path "${ROUTER_REGISTRY_DIR}")"
     [[ -d "${registry_dir}" ]] || return 0
+    riph_require_cmd jq
 
     shopt -s nullglob
     registrations=("${registry_dir}"/*.json)
