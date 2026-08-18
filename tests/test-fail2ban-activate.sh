@@ -12,7 +12,7 @@ fail() {
 }
 
 make_case() {
-    local t="$1"
+    local t="$1" legacy_ban="${2:-66.132.224.81}"
     mkdir -p \
         "${t}/etc/router-ip-push-hardening" \
         "${t}/etc/fail2ban/jail.d" \
@@ -29,14 +29,14 @@ make_case() {
     cp "${ROOT}/src/etc/fail2ban/jail.d/riph-nginx-stream-sni-reject.local" "${t}/etc/fail2ban/jail.d/"
     cp "${ROOT}/src/etc/fail2ban/jail.d/riph-nginx-stream-private-sni-abuse.local" "${t}/etc/fail2ban/jail.d/"
 
-    cat >"${t}/usr/local/bin/f2b-stub" <<'EOF_STUB'
+    cat >"${t}/usr/local/bin/f2b-stub" <<EOF_STUB
 #!/usr/bin/env bash
 set -Eeuo pipefail
-case "${1:-}" in
+case "\${1:-}" in
     status) exit 0 ;;
     get)
-        if [[ "${2:-}" == nginx-stream-sni-reject && "${3:-}" == banip ]]; then
-            printf '%s\n' '66.132.224.81'
+        if [[ "\${2:-}" == nginx-stream-sni-reject && "\${3:-}" == banip ]]; then
+            printf '%s\n' '${legacy_ban}'
         fi
         ;;
     set) exit 0 ;;
@@ -62,12 +62,15 @@ grep -Fx 'enabled = true' "${CASE_OK}/etc/fail2ban/jail.d/riph-nginx-stream-sni-
     || fail 'reject jail was not enabled'
 grep -Fx 'enabled = true' "${CASE_OK}/etc/fail2ban/jail.d/riph-nginx-stream-private-sni-abuse.local" >/dev/null \
     || fail 'private-abuse jail was not enabled'
+LEGACY_OVERRIDE="${CASE_OK}/etc/fail2ban/jail.d/zz-riph-legacy-trusted-ignore.local"
+[[ -f "${LEGACY_OVERRIDE}" ]] || fail 'legacy dynamic trusted ignore override was not created'
+grep -Fx 'ignorecommand = /usr/local/sbin/riph-fail2ban-ignore <ip>' "${LEGACY_OVERRIDE}" >/dev/null \
+    || fail 'legacy dynamic trusted ignore override is wrong'
 backup_count="$(find "${CASE_OK}/var/lib/router-ip-push-hardening/backups" -maxdepth 1 -type d -name 'fail2ban-activate-*' | wc -l)"
 [[ "${backup_count}" -eq 1 ]] || fail 'activation backup missing'
 
-# A failure after both jail files were already changed must still restore the
-# original disabled files. EXIT-trap coverage is important because explicit
-# riph_die/exit paths are not guaranteed to run an ERR trap.
+# A failure after both jail files and the legacy protection override were already
+# changed must restore the original disabled/absent state.
 CASE_FAIL="${BASE}/fail"
 make_case "${CASE_FAIL}"
 cp "${CASE_FAIL}/etc/fail2ban/jail.d/riph-nginx-stream-sni-reject.local" "${CASE_FAIL}/reject.before"
@@ -88,5 +91,30 @@ cmp -s "${CASE_FAIL}/reject.before" "${CASE_FAIL}/etc/fail2ban/jail.d/riph-nginx
     || fail 'reject jail was not restored after activation failure'
 cmp -s "${CASE_FAIL}/private.before" "${CASE_FAIL}/etc/fail2ban/jail.d/riph-nginx-stream-private-sni-abuse.local" \
     || fail 'private-abuse jail was not restored after activation failure'
+[[ ! -e "${CASE_FAIL}/etc/fail2ban/jail.d/zz-riph-legacy-trusted-ignore.local" ]] \
+    || fail 'legacy ignore override was not removed after activation rollback'
+
+# If the current dynamic Router IP is already present in the legacy ban list, the
+# helper must refuse before creating an override/jail mutation. Calling the old
+# jail's generic actionunban here could delete an ambiguously-owned UFW rule.
+CASE_BANNED="${BASE}/current-banned"
+make_case "${CASE_BANNED}" '78.111.154.96'
+cat >"${CASE_BANNED}/usr/local/bin/guard-ok" <<'EOF_GUARD_OK2'
+#!/usr/bin/env bash
+exit 0
+EOF_GUARD_OK2
+chmod +x "${CASE_BANNED}/usr/local/bin/guard-ok"
+export RIPH_FAIL2BAN_CLIENT_BIN="${CASE_BANNED}/usr/local/bin/f2b-stub"
+export RIPH_GUARD_BIN="${CASE_BANNED}/usr/local/bin/guard-ok"
+
+if "${ACTIVATE}" --root "${CASE_BANNED}" >"${CASE_BANNED}/out.txt" 2>&1; then
+    fail 'activation unexpectedly accepted a current Router IP already banned by legacy jail'
+fi
+grep -Fq 'automatic unban refused' "${CASE_BANNED}/out.txt" \
+    || fail 'ambiguous legacy current-IP ban refusal message missing'
+grep -Fx 'enabled = false' "${CASE_BANNED}/etc/fail2ban/jail.d/riph-nginx-stream-sni-reject.local" >/dev/null \
+    || fail 'ambiguous legacy-ban refusal mutated RIPH jail'
+[[ ! -e "${CASE_BANNED}/etc/fail2ban/jail.d/zz-riph-legacy-trusted-ignore.local" ]] \
+    || fail 'ambiguous legacy-ban refusal created override before stopping'
 
 echo 'PASS: Fail2ban activation tests'
