@@ -67,6 +67,9 @@ AUDIT_LOG="$(riph_root_path "${STREAM_AUDIT_LOG:-/var/log/nginx/riph-stream-sni.
 BACKUP_ROOT="$(riph_root_path "${RIPH_STATE_DIR}/backups")"
 BACKUP_ID="fail2ban-activate-$(date -u '+%Y%m%d-%H%M%S')-$$"
 BACKUP_DIR="${BACKUP_ROOT}/${BACKUP_ID}"
+RIPH_JAIL_REJECT="riph-nginx-stream-sni-reject"
+RIPH_JAIL_PRIVATE="riph-nginx-stream-private-sni-abuse"
+LEGACY_JAIL="nginx-stream-sni-reject"
 
 for file in "${JAIL_REJECT}" "${JAIL_PRIVATE}"; do
     [[ -f "${file}" ]] || riph_die "RIPH jail file missing: ${file}"
@@ -79,16 +82,27 @@ done
 F2B_BIN="${RIPH_FAIL2BAN_CLIENT_BIN:-fail2ban-client}"
 GUARD_BIN="${RIPH_GUARD_BIN:-${SCRIPT_DIR}/riph-trusted-unban-guard}"
 if [[ "${RIPH_ROOT}" == "/" ]]; then
-    riph_require_cmd "${F2B_BIN}"
-else
-    [[ -x "${F2B_BIN}" || "${F2B_BIN}" == */* ]] || true
+    if [[ "${F2B_BIN}" == */* ]]; then
+        [[ -x "${F2B_BIN}" ]] || riph_die "Fail2ban client not executable: ${F2B_BIN}"
+    else
+        riph_require_cmd "${F2B_BIN}"
+    fi
 fi
 
+jail_active() {
+    "${F2B_BIN}" status "$1" >/dev/null 2>&1
+}
+
 legacy_bans() {
-    if "${F2B_BIN}" status nginx-stream-sni-reject >/dev/null 2>&1; then
-        "${F2B_BIN}" get nginx-stream-sni-reject banip 2>/dev/null || true
+    if jail_active "${LEGACY_JAIL}"; then
+        "${F2B_BIN}" get "${LEGACY_JAIL}" banip 2>/dev/null || true
     fi
 }
+
+LEGACY_ACTIVE_BEFORE=0
+if jail_active "${LEGACY_JAIL}"; then
+    LEGACY_ACTIVE_BEFORE=1
+fi
 
 if [[ "${RIPH_ROOT}" == "/" ]]; then
     "${F2B_BIN}" -t
@@ -96,9 +110,13 @@ fi
 LEGACY_BEFORE="$(legacy_bans | tr '\n' ' ' | xargs 2>/dev/null || true)"
 
 if (( DRY_RUN == 1 )); then
-    riph_log "dry-run: would enable riph-nginx-stream-sni-reject"
-    riph_log "dry-run: would enable riph-nginx-stream-private-sni-abuse"
-    riph_log "legacy jail would remain untouched; current bans: ${LEGACY_BEFORE:-none}"
+    riph_log "dry-run: would enable ${RIPH_JAIL_REJECT}"
+    riph_log "dry-run: would enable ${RIPH_JAIL_PRIVATE}"
+    if (( LEGACY_ACTIVE_BEFORE == 1 )); then
+        riph_log "legacy jail would remain active; current bans: ${LEGACY_BEFORE:-none}"
+    else
+        riph_log "legacy jail is currently inactive; RIPH activation will not create/modify it"
+    fi
     exit 0
 fi
 
@@ -124,31 +142,48 @@ restore_jails() {
     cp -a "${BACKUP_DIR}/$(basename "${JAIL_PRIVATE}")" "${JAIL_PRIVATE}" || true
 }
 
-on_error() {
+ACTIVATION_STARTED=0
+ACTIVATION_COMMITTED=0
+restore_on_exit() {
     local rc=$?
-    trap - ERR
-    riph_log "activation failed; restoring disabled RIPH jail files"
-    restore_jails
-    if [[ "${RIPH_ROOT}" == "/" ]]; then
-        "${F2B_BIN}" -t >/dev/null 2>&1 || true
-        "${F2B_BIN}" reload >/dev/null 2>&1 || true
+    trap - EXIT
+
+    if (( ACTIVATION_STARTED == 1 && ACTIVATION_COMMITTED == 0 )); then
+        riph_log "activation failed; restoring pre-activation RIPH jail files"
+        restore_jails
+        if [[ "${RIPH_ROOT}" == "/" ]]; then
+            if "${F2B_BIN}" -t >/dev/null 2>&1; then
+                "${F2B_BIN}" reload >/dev/null 2>&1 || true
+            fi
+        fi
     fi
     exit "${rc}"
 }
-trap on_error ERR
+trap restore_on_exit EXIT
+ACTIVATION_STARTED=1
 
 set_enabled_true "${JAIL_REJECT}"
 set_enabled_true "${JAIL_PRIVATE}"
 
 if [[ "${RIPH_ROOT}" == "/" ]]; then
     "${F2B_BIN}" -t
+    # Upstream Fail2Ban reload updates configuration without server/jail restart,
+    # so the existing legacy jail is not intentionally stopped/unbanned here.
     "${F2B_BIN}" reload
-    "${F2B_BIN}" status riph-nginx-stream-sni-reject >/dev/null
-    "${F2B_BIN}" status riph-nginx-stream-private-sni-abuse >/dev/null
+    jail_active "${RIPH_JAIL_REJECT}" || riph_die "RIPH jail not active after reload: ${RIPH_JAIL_REJECT}"
+    jail_active "${RIPH_JAIL_PRIVATE}" || riph_die "RIPH jail not active after reload: ${RIPH_JAIL_PRIVATE}"
+
+    if (( LEGACY_ACTIVE_BEFORE == 1 )); then
+        jail_active "${LEGACY_JAIL}" || riph_die "legacy jail disappeared during RIPH activation"
+    fi
 
     LEGACY_AFTER="$(legacy_bans | tr '\n' ' ' | xargs 2>/dev/null || true)"
     if [[ "${LEGACY_AFTER}" != "${LEGACY_BEFORE}" ]]; then
-        riph_die "legacy ban list changed during RIPH activation: before='${LEGACY_BEFORE:-none}' after='${LEGACY_AFTER:-none}'"
+        # The legacy jail is still running. Its list can legitimately change while
+        # this command executes because a 6h ban expires or a new reject is seen.
+        # Record the transition, but do not treat that natural runtime activity as
+        # proof that the RIPH reload damaged legacy state.
+        riph_log "legacy ban list changed while activation ran: before='${LEGACY_BEFORE:-none}' after='${LEGACY_AFTER:-none}'"
     fi
 fi
 
@@ -156,6 +191,7 @@ if [[ -f "${GUARD_BIN}" || -x "${GUARD_BIN}" ]]; then
     bash "${GUARD_BIN}" --root "${RIPH_ROOT}" --config "${CONFIG_PATH}"
 fi
 
-trap - ERR
-riph_log "RIPH Fail2ban jails activated; legacy jail remains active"
+ACTIVATION_COMMITTED=1
+trap - EXIT
+riph_log "RIPH Fail2ban jails activated; legacy jail state left under legacy ownership"
 riph_log "activation backup: ${BACKUP_DIR}"
