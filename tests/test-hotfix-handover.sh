@@ -190,9 +190,9 @@ if bash "${HANDOVER}" --root "${CASE_FAIL_EARLY}" takeover >/dev/null 2>&1; then
 fi
 assert_hotfix_owner "${CASE_FAIL_EARLY}"
 
-# More important: failure after RIPH path has already been enabled must first
-# remove that writer and then restore the temporary writer. This prevents the
-# rollback itself from creating two simultaneous allowlist owners.
+# Failure after RIPH path activation must immediately restore the temporary owner.
+# The bounded A->B->C retry now belongs inside riph-reconcile itself, so handover
+# performs exactly one initial reconcile and one post-path reconcile.
 CASE_FAIL_LATE="${T}/fail-late"
 make_case "${CASE_FAIL_LATE}"
 cat >"${CASE_FAIL_LATE}/bin/reconcile-stub" <<'EOF_RECONCILE_FAIL_LATE'
@@ -233,10 +233,10 @@ export RIPH_HOTFIX_LOCK="${CASE_FAIL_LATE}/hotfix.lock"
 export RIPH_TEST_IP_FILE="${CASE_FAIL_LATE}/var/lib/router-ip-push/ips/AX3200.ipv4"
 
 if bash "${HANDOVER}" --root "${CASE_FAIL_LATE}" takeover >/dev/null 2>&1; then
-    fail 'handover unexpectedly succeeded when post-path reconciliation never converged'
+    fail 'handover unexpectedly succeeded when the post-path reconcile failed'
 fi
 assert_hotfix_owner "${CASE_FAIL_LATE}"
-[[ "$(cat "${CASE_FAIL_LATE}/reconcile.count")" == 4 ]] \
-    || fail 'late failure should perform initial reconcile plus three bounded convergence attempts'
+[[ "$(cat "${CASE_FAIL_LATE}/reconcile.count")" == 2 ]] \
+    || fail 'late failure should perform exactly initial + post-path reconciles'
 
 echo 'PASS: temporary hotfix ownership handover tests'
