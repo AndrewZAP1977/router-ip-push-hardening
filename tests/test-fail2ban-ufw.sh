@@ -12,6 +12,9 @@ cat >"${T}/ufw-stub" <<'EOF_STUB'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 if [[ "${1:-}" == status && "${2:-}" == numbered ]]; then
+    if [[ -n "${RIPH_TEST_UFW_STATUS_EXIT:-}" ]]; then
+        exit "${RIPH_TEST_UFW_STATUS_EXIT}"
+    fi
     cat "${RIPH_TEST_UFW_STATE:?}"
     exit 0
 fi
@@ -55,5 +58,16 @@ EOF_STATE2
 "${HELPER}" ban nginx-stream-sni-reject 203.0.113.44
 expected='prepend deny proto tcp from 203.0.113.44 to any port 443 comment riph-f2b-nginx-stream-sni-reject'
 grep -Fx -- "${expected}" "${CALLS}" >/dev/null || { echo 'FAIL: correct owned TCP/443 deny was not created when only wrong-shape same-marker rules existed' >&2; exit 1; }
+
+# A failed numbered-rule scan must never be treated as an empty firewall. No UFW
+# mutation is permitted when ownership cannot be established safely.
+: >"${CALLS}"
+export RIPH_TEST_UFW_STATUS_EXIT=7
+if "${HELPER}" ban nginx-stream-sni-reject 203.0.113.99 >/dev/null 2>&1; then
+    echo 'FAIL: ban succeeded even though UFW ownership scan failed' >&2
+    exit 1
+fi
+[[ ! -s "${CALLS}" ]] || { echo 'FAIL: firewall mutation occurred after failed UFW scan' >&2; exit 1; }
+unset RIPH_TEST_UFW_STATUS_EXIT
 
 echo 'PASS: Fail2ban UFW ownership tests'
