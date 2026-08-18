@@ -45,7 +45,14 @@ find_owned_rule_numbers() {
         done
 }
 
-mapfile -t RULE_NUMBERS < <(find_owned_rule_numbers | sort -nr -u)
+RULE_NUMBERS=()
+if ! owned_output="$(find_owned_rule_numbers | sort -nr -u)"; then
+    echo 'failed to inspect UFW numbered rules; refusing to mutate firewall state' >&2
+    exit 1
+fi
+if [[ -n "${owned_output}" ]]; then
+    mapfile -t RULE_NUMBERS <<<"${owned_output}"
+fi
 
 if [[ "${MODE}" == ban ]]; then
     if ((${#RULE_NUMBERS[@]} > 0)); then
