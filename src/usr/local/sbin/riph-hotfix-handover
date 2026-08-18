@@ -37,9 +37,10 @@ Commands:
                       Router IP Push Nginx hotfix to RIPH reconcile.
 
 The takeover does not delete the temporary hotfix files. It disables its path and
- timer only after holding the same lock used by the hotfix, performs a strict RIPH
-reconcile, enables the RIPH path/timer, and verifies the current Router IP is in
-the generated allowlist. On failure it re-enables the temporary hotfix.
+timer only after holding the same lock used by the hotfix, performs a strict RIPH
+reconcile, enables the RIPH path/timer, performs a second reconcile to close any
+Router-IP change race during the handover, and verifies the current Router IP is
+in the generated allowlist. On failure it re-enables the temporary hotfix.
 USAGE
 }
 
@@ -148,9 +149,9 @@ trap reenable_hotfix ERR
 "${SYSTEMCTL_BIN}" disable --now "${HOTFIX_PATH_UNIT}" "${HOTFIX_TIMER_UNIT}" >/dev/null
 "${SYSTEMCTL_BIN}" stop "${HOTFIX_SERVICE_UNIT}" >/dev/null 2>&1 || true
 
-# RIPH performs its transactional Nginx apply before its automatic triggers are
-# enabled. If this fails, riph-apply restores its previous Nginx state and the
-# ERR trap re-enables the temporary hotfix.
+# First strict reconcile transfers the current trusted/routing state while no
+# automatic writer is active. If it fails, riph-apply restores its previous
+# Nginx state and the ERR trap re-enables the temporary hotfix.
 bash "${RECONCILE}" --root "${RIPH_ROOT}" --config "${CONFIG_PATH}" \
     --reason "temporary hotfix ownership handover"
 
@@ -161,6 +162,12 @@ bash "${RECONCILE}" --root "${RIPH_ROOT}" --config "${CONFIG_PATH}" \
     || riph_die "${RIPH_PATH_UNIT} is not active after handover"
 [[ "$(unit_state is-active "${RIPH_TIMER_UNIT}")" == active ]] \
     || riph_die "${RIPH_TIMER_UNIT} is not active after handover"
+
+# Router IP Push intentionally has no dependency on the hotfix lock. The ISP IP
+# can therefore change between the first reconcile and path activation. Reconcile
+# once more after the path/timer are active so that transition cannot be missed.
+bash "${RECONCILE}" --root "${RIPH_ROOT}" --config "${CONFIG_PATH}" \
+    --reason "post-handover Router IP verification"
 
 ALLOWLIST_FILE="$(riph_root_path "${ALLOWLIST_OUTPUT}")"
 [[ -f "${ALLOWLIST_FILE}" ]] || riph_die "generated allowlist missing after handover: ${ALLOWLIST_FILE}"
