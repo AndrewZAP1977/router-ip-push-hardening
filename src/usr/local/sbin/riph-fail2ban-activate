@@ -35,7 +35,9 @@ pass a local fail2ban-regex compatibility check.
 
 While the legacy jail remains active, activation also installs a late jail.d/*.local
 override that gives the legacy jail the same dynamic trusted-source ignorecommand.
-Existing legacy bans are never force-unbanned by this helper.
+Existing legacy bans are never force-unbanned by this helper. If a newly assigned
+current Router IP already has an older legacy ban, that ambiguous DENY is left
+untouched and the trusted guard places a project-owned TCP/443 ALLOW shield above it.
 USAGE
 }
 
@@ -188,6 +190,7 @@ production_readiness() {
     require_executable_or_command "${SYSTEMCTL_BIN}"
     require_executable_or_command "${NGINX_BIN}"
     require_executable_or_command "${IGNORE_BIN}"
+    require_executable_or_command "${GUARD_BIN}"
     riph_require_cmd sort
 
     temporary_hotfix_owns_allowlist \
@@ -219,16 +222,20 @@ if jail_active "${LEGACY_JAIL}"; then
     LEGACY_ACTIVE_BEFORE=1
 fi
 LEGACY_BEFORE="$(legacy_bans | tr '\n' ' ' | xargs 2>/dev/null || true)"
+LEGACY_CURRENT_COLLISION=0
 
 # Never use the legacy generic actionunban to repair a trusted-source collision:
 # its UFW deletion is unmarked/ambiguous. If a current Router IP is already in the
-# legacy ban list, stop before mutation and inspect that rule separately.
+# legacy ban list, preserve that ticket/rule and let the trusted guard add a
+# project-owned TCP/443 ALLOW shield above it after the legacy ignore override is
+# loaded. The old DENY then expires naturally under its original jail lifecycle.
 if (( LEGACY_ACTIVE_BEFORE == 1 )) && [[ -n "${LEGACY_BEFORE}" ]]; then
     for router_id in "${RIPH_ROUTER_IDS[@]}"; do
         if current_ip="$(riph_current_router_ip "${router_id}" 2>/dev/null)"; then
             for banned_ip in ${LEGACY_BEFORE}; do
                 if [[ "${banned_ip}" == "${current_ip}" ]]; then
-                    riph_die "current ${router_id} IP ${current_ip} is already banned by legacy ${LEGACY_JAIL}; automatic unban refused"
+                    LEGACY_CURRENT_COLLISION=1
+                    riph_log "WARNING: current ${router_id} IP ${current_ip} is already banned by legacy ${LEGACY_JAIL}; legacy ban will remain untouched and RIPH trusted shield will protect TCP/443"
                 fi
             done
         fi
@@ -241,6 +248,9 @@ if (( DRY_RUN == 1 )); then
     if (( LEGACY_ACTIVE_BEFORE == 1 )); then
         riph_log "dry-run: would add dynamic trusted ignorecommand override to ${LEGACY_JAIL}"
         riph_log "legacy jail would remain active; current bans: ${LEGACY_BEFORE:-none}"
+        if (( LEGACY_CURRENT_COLLISION == 1 )); then
+            riph_log "dry-run: current Router IP legacy ban would remain untouched; guard would add project-owned TCP/443 ALLOW shield"
+        fi
     else
         riph_log "legacy jail is currently inactive; no legacy ignore override would be added"
     fi
