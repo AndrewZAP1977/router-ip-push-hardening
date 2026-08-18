@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# Historical pre-production candidate validator retained for regression/forensics.
+# Dynamic router addresses must come from Router IP Push, not static trust entries.
+
 section() { printf '\n===== %s =====\n' "$1"; }
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 warn() { printf 'WARNING: %s\n' "$*" >&2; }
@@ -16,7 +19,6 @@ CURRENT_STREAM=/etc/nginx/stream-enabled/stream.conf
 CURRENT_BRIDGE=/etc/nginx/stream-enabled/06-router-ip-push-fake-site-bridges.conf
 LEGACY_WATCH=/etc/nginx/stream-enabled/00-sni-watch.conf
 LEGACY_LOG=/var/log/nginx/stream-sni.log
-SMARTBOX_MOTHER_IP=176.110.189.199
 
 [[ -f "${ROUTER_IP_FILE}" ]] || fail "missing ${ROUTER_IP_FILE}"
 [[ -f "${CURRENT_ALLOW}" ]] || fail "missing ${CURRENT_ALLOW}"
@@ -52,10 +54,7 @@ router_line_count="$(grep -Ec '# router-ip-push:AX3200([^[:alnum:]_-]|$)' "${CUR
     || fail "current staging allowlist must contain exactly one AX3200 dynamic line; found ${router_line_count}"
 grep -Eq "^[[:space:]]*${ROUTER_IP//./\\.}/32[[:space:]]+1;[[:space:]]+# router-ip-push:AX3200" "${CURRENT_ALLOW}" \
     || fail "temporary safeguard/current staging allowlist is not synchronized to Router IP Push ${ROUTER_IP}"
-grep -Eq "^[[:space:]]*${SMARTBOX_MOTHER_IP//./\\.}/32[[:space:]]+1;[[:space:]]+# SmartBox-mother static" "${CURRENT_ALLOW}" \
-    || fail "current staging allowlist lost SmartBox-mother static trusted source ${SMARTBOX_MOTHER_IP}"
 printf 'PASS: temporary safeguard owns a synchronized staging allowlist\n'
-printf 'PASS: SmartBox-mother static source %s is still trusted in production\n' "${SMARTBOX_MOTHER_IP}"
 
 if [[ -f "${LEGACY_LOG}" ]]; then
     if tail -n 250 "${LEGACY_LOG}" \
@@ -86,7 +85,6 @@ STREAM="${TMP}/stream-enabled/stream.conf"
     printf '        %-18s 1; # VPS_GR\n' '5.61.39.137/32'
     printf '        %-18s 1; # Spectra\n' '45.87.41.121/32'
     printf '        %-18s 1; # Hexabyte\n' '194.104.94.182/32'
-    printf '        %-18s 1; # SmartBox-mother static\n' "${SMARTBOX_MOTHER_IP}/32"
     printf '        %-18s 1; # router-ip-push:AX3200 current\n' "${ROUTER_IP}/32"
     printf '}\n'
 } >"${ALLOW}"
@@ -198,8 +196,7 @@ for check in \
     grep -Fq "${check}" "${STREAM}" || fail "candidate routing check failed: ${check}"
 done
 grep -Fq "${ROUTER_IP}/32" "${ALLOW}" || fail 'candidate allowlist lost current Router IP'
-grep -Fq "${SMARTBOX_MOTHER_IP}/32" "${ALLOW}" || fail 'candidate allowlist lost SmartBox-mother static trusted source'
-printf 'PASS: expected Hexabyte routing, current Router IP and SmartBox-mother static source are present\n'
+printf 'PASS: expected Hexabyte routing and current Router IP are present\n'
 
 section 'Diff: trusted allowlist'
 diff -u "${CURRENT_ALLOW}" "${ALLOW}" || true
