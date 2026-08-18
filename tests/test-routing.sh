@@ -33,4 +33,23 @@ grep -F 'proxy_pass 127.0.0.1:9443;' "${BRIDGE}" >/dev/null
 grep -F 'listen 127.0.0.1:9544 proxy_protocol;' "${BRIDGE}" >/dev/null
 grep -F 'proxy_pass 127.0.0.1:9444;' "${BRIDGE}" >/dev/null
 
+# Quiesce mode must stop only the legacy external audit feed. The dedicated RIPH
+# route-aware log remains exactly once on the external :443 server, and bridge
+# sessions must still not enter it.
+sed -i 's/^LEGACY_STREAM_AUDIT_COMPAT=1$/LEGACY_STREAM_AUDIT_COMPAT=0/' \
+    "${T}/etc/router-ip-push-hardening/config.env"
+"${GEN}" \
+    --root "${T}" \
+    --stream-output /etc/nginx/stream-enabled/stream-quiesced.conf \
+    --bridge-output /etc/nginx/stream-enabled/bridges-quiesced.conf
+
+QUIESCED_STREAM="${T}/etc/nginx/stream-enabled/stream-quiesced.conf"
+QUIESCED_BRIDGE="${T}/etc/nginx/stream-enabled/bridges-quiesced.conf"
+[[ "$(grep -Fc 'access_log /var/log/nginx/riph-stream-sni.log riph_stream_sni;' "${QUIESCED_STREAM}")" == 1 ]] \
+    || { echo 'FAIL: quiesced routing lost or duplicated RIPH audit log' >&2; exit 1; }
+! grep -F 'access_log /var/log/nginx/stream-sni.log sni_watch' "${QUIESCED_STREAM}" >/dev/null \
+    || { echo 'FAIL: quiesced routing still feeds legacy external audit log' >&2; exit 1; }
+! grep -F 'access_log /var/log/nginx/riph-stream-sni.log' "${QUIESCED_BRIDGE}" >/dev/null \
+    || { echo 'FAIL: quiesced bridge traffic entered RIPH audit log' >&2; exit 1; }
+
 echo 'PASS: routing tests'
