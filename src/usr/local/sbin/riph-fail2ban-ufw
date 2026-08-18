@@ -28,10 +28,17 @@ find_owned_rule_numbers() {
     local line
     LC_ALL=C "${UFW_BIN}" status numbered 2>/dev/null \
         | while IFS= read -r line; do
-            # Source address is rendered as a whitespace-delimited token by
-            # `ufw status numbered`; do not use substring matching here.
+            # Ownership requires all of these simultaneously:
+            #   * source is an exact whitespace-delimited token;
+            #   * exact project marker;
+            #   * destination is exactly TCP/443 (allow optional UFW '(v6)' tag);
+            #   * rule action is DENY IN.
+            # This prevents a manually-created same-marker rule on another port
+            # from being mistaken for the Fail2ban rule.
             [[ " ${line} " == *" ${IP} "* ]] || continue
             [[ "${line}" == *"# ${MARKER}"* ]] || continue
+            [[ "${line}" =~ [[:space:]]443/tcp([[:space:]]|[[:space:]]+\(v6\)[[:space:]]) ]] || continue
+            [[ "${line}" =~ [[:space:]]DENY[[:space:]]+IN[[:space:]] ]] || continue
             if [[ "${line}" =~ ^[[:space:]]*\[[[:space:]]*([0-9]+)\] ]]; then
                 printf '%s\n' "${BASH_REMATCH[1]}"
             fi
@@ -49,7 +56,7 @@ if [[ "${MODE}" == ban ]]; then
 fi
 
 # Delete descending numbers so UFW renumbering cannot invalidate the remaining
-# entries. Only exact project marker + candidate IP matches are removed.
+# entries. Only exact project marker + source + TCP/443 DENY IN matches are removed.
 for number in "${RULE_NUMBERS[@]}"; do
     LC_ALL=C "${UFW_BIN}" --force delete "${number}"
 done
