@@ -5,11 +5,19 @@ Private hardening supplement for an existing `3x-ui-installer` Nginx/Xray deploy
 The repository is intentionally separate from the public installer. It contains
 private source-IP/SNI policy and must remain private.
 
+## Нормальная инструкция на русском
+
+Если тебе нужно **поставить РИФ, понять принцип работы или пользоваться меню**, а не читать архитектурную документацию, начинай отсюда:
+
+**[Практическая инструкция РИФ на русском → docs/USER_GUIDE_RU.md](docs/USER_GUIDE_RU.md)**
+
+Там есть краткое объяснение работы, установка/обновление, диагностика и описание **всех 22 пунктов интерактивного меню с примерами**. Большие разделы сворачиваются.
+
 ## Status
 
 Controlled Hexabyte production validation completed on 2026-08-18.
 
-Production ownership is now RIPH:
+Production ownership is RIPH:
 
 - `riph-router-ip.path` is enabled/active;
 - `riph-reconcile.timer` is enabled/active with 1-minute fallback;
@@ -21,6 +29,10 @@ Production ownership is now RIPH:
 - `riph-adopt-bridge` temporary adoption rules are absent;
 - the fail-closed manual-deny helper verifies physical UFW ownership on every
   applied-state row.
+
+Dynamic home/router addresses are intentionally **not** permanent static trust.
+They are consumed from Router IP Push only for router IDs explicitly listed in
+`ROUTER_IDS`.
 
 GitHub Actions is intentionally manual-only (`workflow_dispatch`) and was not run
 during the production validation.
@@ -118,9 +130,13 @@ Completed on 2026-08-18:
 12. repeated automatic `riph-reconcile.service` runs accepted the physical
     ownership state with `manual_conflicts=0`.
 
-Permanent static trusted sources validated in production include localhost,
-VPS_GR `5.61.39.137/32`, Spectra `45.87.41.121/32`, Hexabyte
-`194.104.94.182/32`, and SmartBox-mother `176.110.189.199/32`.
+At validation time SmartBox-mother was temporarily represented by a known source IP.
+That address is dynamic and is no longer part of the permanent static-trust example;
+future SmartBox-mother trust should come from Router IP Push after its router ID is
+explicitly configured in RIPH.
+
+Permanent static trusted examples are localhost, VPS_GR `5.61.39.137/32`, Spectra
+`45.87.41.121/32` and Hexabyte `194.104.94.182/32`.
 
 See `docs/HEXABYTE_LEGACY_MIGRATION.md` for the migration record.
 
@@ -189,12 +205,12 @@ The Nginx allowlist is generated and must not be edited manually. Effective trus
 sources are derived from:
 
 1. `/etc/router-ip-push-hardening/trusted-static.list`;
-2. `/var/lib/router-ip-push/ips/<ROUTER_ID>.ipv4`;
+2. `/var/lib/router-ip-push/ips/<ROUTER_ID>.ipv4` for IDs configured in `ROUTER_IDS`;
 3. non-expired entries in `/etc/router-ip-push-hardening/previous-ip-grace.json`.
 
 Manual-deny ownership is derived from the configured source lists plus the
 project-owned applied-state file, but state is trusted only when the corresponding
 RIPH-marked UFW rule is physically visible.
 
-See `docs/ARCHITECTURE.md`, `docs/HEXABYTE_TEST_PLAN.md` and
+See `docs/USER_GUIDE_RU.md`, `docs/ARCHITECTURE.md`, `docs/HEXABYTE_TEST_PLAN.md` and
 `docs/HEXABYTE_LEGACY_MIGRATION.md`.
