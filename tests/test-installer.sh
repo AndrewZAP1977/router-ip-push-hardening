@@ -17,6 +17,15 @@ EOF_STUB
 #!/usr/bin/env bash
 exit "${RIPH_TEST_SYSTEMCTL_EXIT:-0}"
 EOF_STUB
+    cat >"${t}/usr/local/bin/ufw-stub" <<'EOF_STUB'
+#!/usr/bin/env bash
+# Installer test-root has empty manual-deny lists. The production helper now
+# fails closed unless a UFW executable is available, so provide a harmless stub.
+if [[ "${1:-}" == status && "${2:-}" == numbered ]]; then
+    printf '%s\n' 'Status: active'
+fi
+exit 0
+EOF_STUB
     chmod +x "${t}/usr/local/bin/"*-stub
 }
 
@@ -40,6 +49,7 @@ grep -Fq 'disable --now "${RIPH_PATH_UNIT}" "${RIPH_TIMER_UNIT}"' "${INSTALLER}"
 echo 'TEST I1: test-root install + apply'
 export RIPH_NGINX_BIN="${T1}/usr/local/bin/nginx-stub"
 export RIPH_SYSTEMCTL_BIN="${T1}/usr/local/bin/systemctl-stub"
+export RIPH_UFW_BIN="${T1}/usr/local/bin/ufw-stub"
 "${INSTALLER}" --root "${T1}" --check >/dev/null
 "${INSTALLER}" --root "${T1}" --install --apply >/dev/null
 [[ -x "${T1}/usr/local/sbin/riph-admin" ]] || fail 'admin not installed'
@@ -70,6 +80,7 @@ printf '%s\n' 'PREEXISTING_ADMIN_SENTINEL' >"${T2}/usr/local/sbin/riph-admin"
 chmod 0700 "${T2}/usr/local/sbin/riph-admin"
 export RIPH_NGINX_BIN="${T2}/usr/local/bin/nginx-stub"
 export RIPH_SYSTEMCTL_BIN="${T2}/usr/local/bin/systemctl-stub"
+export RIPH_UFW_BIN="${T2}/usr/local/bin/ufw-stub"
 export RIPH_TEST_NGINX_EXIT=1
 if "${INSTALLER}" --root "${T2}" --install --apply; then
     fail 'installer unexpectedly succeeded with failing nginx'
