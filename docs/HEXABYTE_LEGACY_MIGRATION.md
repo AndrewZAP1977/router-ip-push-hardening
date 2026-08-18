@@ -1,79 +1,71 @@
 # Hexabyte legacy migration
 
-This document records the pre-existing Hexabyte mechanisms discovered by the
-read-only preflight on 2026-08-17 and defines a no-gap migration into RIPH v1.
+This document records the pre-existing Hexabyte security mechanisms discovered by
+read-only preflight on 2026-08-17 and the completed no-gap migration into RIPH v1.
 
-## Legacy state that must be preserved initially
+## Completion status
+
+Migration completed on 2026-08-18.
+
+Final production state:
+
+- dedicated RIPH audit log active on external `:443`;
+- RIPH reject/private-SNI Fail2ban jails active;
+- legacy stream logger retired from active Nginx configuration;
+- legacy reject jail retired from active Fail2ban configuration;
+- temporary legacy trusted-ignore override retired;
+- temporary current-Router-IP UFW shield retired;
+- exactly five RIPH-owned manual TCP/443 denies remain;
+- no temporary manual-deny adoption bridge remains;
+- `riph-router-ip.path` and `riph-reconcile.timer` are enabled/active;
+- automatic reconcile accepts the fail-closed physical ownership state.
+
+Retired legacy files were archived by the migration helpers for forensic rollback.
+Legacy filter/action files were retained where appropriate.
+
+## Legacy state discovered before migration
 
 ### Nginx stream audit
 
-`/etc/nginx/stream-enabled/00-sni-watch.conf` defines:
-
-```nginx
-log_format sni_watch 'time="$time_local" ip="$remote_addr" port="$remote_port" sni="$ssl_preread_server_name" upstream="$upstream_addr" status=$status sent=$bytes_sent recv=$bytes_received time_sec=$session_time';
-access_log /var/log/nginx/stream-sni.log sni_watch buffer=32k flush=5s;
-```
-
-Because the logger is configured at stream level, it currently records both the
-external `:443` server and local PROXY-protocol bridge servers.
+`/etc/nginx/stream-enabled/00-sni-watch.conf` defined the old `sni_watch` log format
+and wrote `/var/log/nginx/stream-sni.log` at stream level. Because it was configured
+at stream level, it included both external `:443` and local bridge activity.
 
 ### Legacy Fail2ban reject jail
 
-Existing jail name:
+Observed legacy jail:
 
 ```text
 nginx-stream-sni-reject
-```
-
-Observed configuration:
-
-```text
-enabled  = true
 findtime = 10m
 maxretry = 5
 bantime  = 6h
-action   = ufw-443-insert[name=nginx-stream-sni-reject]
 logpath  = /var/log/nginx/stream-sni.log
 ```
 
-Observed filter:
+Its filter matched sessions that reached reject upstream `127.0.0.1:9`.
+Its UFW action created unmarked TCP/443 denies and used a broad unmarked delete on
+unban. Because those automatic rules had no RIPH ownership marker, RIPH never
+adopted them in place or accelerated their removal.
+
+### Existing manual UFW TCP/443 denies
+
+Five pre-existing manual rules were present:
 
 ```text
-failregex = ^.*ip="<HOST>" port="[0-9]+" sni="[^"]*" upstream="127\.0\.0\.1:9" status=.*$
-```
-
-So the legacy jail bans sessions that reached the dead reject upstream.
-
-Observed action:
-
-```text
-actionban   = ufw insert 1 deny from <ip> to any port 443 proto tcp
-actionunban = ufw delete deny from <ip> to any port 443 proto tcp
-```
-
-These legacy automatic UFW rules have no RIPH ownership marker. Because the
-legacy `actionunban` is a generic rule deletion, RIPH must not try to adopt those
-rules in place or accelerate their removal during handover.
-
-### Existing manual UFW 443 denies
-
-These are intentionally left untouched during initial RIPH installation:
-
-```text
-176.65.132.38
+176.65.132.38/32
 199.45.154.0/23
-167.71.72.165
-82.39.206.156
+167.71.72.165/32
+82.39.206.156/32
 45.148.10.0/24
 ```
 
-They are not treated as RIPH-owned until a later explicit adoption step.
+They were intentionally left untouched during the first RIPH install and only
+adopted after the rest of the security migration was stable.
 
-## Collision avoidance in RIPH v1
+## Collision avoidance used during migration
 
-RIPH does not overwrite the legacy jail/filter/log names.
-
-Dedicated RIPH objects:
+RIPH used separate names throughout coexistence:
 
 ```text
 log:     /var/log/nginx/riph-stream-sni.log
@@ -83,109 +75,153 @@ filters: riph-nginx-stream-sni-reject
          riph-nginx-stream-private-sni-abuse
 ```
 
-Both RIPH jails are installed disabled.
+The first install did not overwrite the old jail/filter/log names.
 
-## Phase A — parallel audit, legacy protection remains active
+## Phase A — parallel audit
 
-During controlled migration:
+The controlled migration initially used:
 
 ```text
 LEGACY_STREAM_AUDIT_COMPAT=1
 ```
 
-The external `:443` server explicitly writes two logs:
+The external `:443` server wrote both the legacy log and the new RIPH route-aware
+log while the old jail remained active. Live validation confirmed equivalent
+external sessions appeared in both logs before quiesce.
 
-1. legacy `sni_watch`, so the already-running legacy reject jail continues to
-   observe external sessions;
-2. dedicated RIPH route-aware log, used for RIPH validation and future RIPH jails.
+## Phase B — validate RIPH routing/logging
 
-The legacy stream-level logger remains present, so bridge sessions continue to be
-recorded exactly as before in the legacy log. Bridge sessions are never written to
-the RIPH route-aware log.
+Before Fail2ban activation, production validation confirmed:
 
-No legacy Fail2ban file is overwritten and no legacy jail is restarted merely by
-RIPH Nginx apply.
+- trusted AX3200 `treda` -> Xray `8443`;
+- trusted AX3200 `trongo` -> Xray `8444`;
+- trusted SmartBox-mother `treda` -> Xray `8443`;
+- untrusted/reject sessions were recorded with final RIPH routes;
+- internal bridge listeners did not become separate external RIPH log entries.
 
-## Phase B — validate RIPH routing and RIPH log
+## Phase C — activate RIPH jails
 
-Before any Fail2ban migration:
+Activation completed transactionally with `fail2ban-client -t` and reload rather
+than restart.
 
-- validate Nginx routing behavior;
-- confirm the legacy log still receives external `:443` traffic;
-- confirm `/var/log/nginx/riph-stream-sni.log` receives external `:443` only;
-- validate RIPH Fail2ban regex against the new route-aware log;
-- confirm RIPH jails remain disabled.
+Both RIPH jails became active while the legacy jail was still present. Synthetic
+UFW action tests validated:
 
-## Phase C — activate RIPH jails while legacy jail remains active
+- IPv4 reject ban/unban;
+- IPv4 private-SNI-abuse ban/unban;
+- IPv6 reject ban/unban;
+- exact RIPH ownership markers;
+- cleanup after explicit unban.
 
-The activation is explicit and guarded:
+During coexistence, dynamic trusted ignore plus a project-owned top-of-UFW current
+Router-IP shield protected a newly assigned trusted ISP source without deleting any
+ambiguous old legacy deny.
 
-1. validate `fail2ban-client -t`;
-2. validate both RIPH regex filters;
-3. validate current/static trusted ignore behavior;
-4. enable `riph-nginx-stream-sni-reject` and
-   `riph-nginx-stream-private-sni-abuse`;
-5. reload Fail2ban;
-6. confirm both RIPH jails are active;
-7. run trusted-unban guard;
-8. verify any new RIPH UFW bans use exact `riph-f2b-*` ownership markers.
+## Phase D — quiesce legacy input
 
-At this point both the legacy reject jail and the RIPH security pipeline may be
-active briefly. Do not migrate existing legacy ban rules into RIPH manually.
-
-## Phase D — quiesce legacy input, then wait for old bans to expire
-
-Once the RIPH jails are proven healthy:
-
-1. set `LEGACY_STREAM_AUDIT_COMPAT=0` through the controlled legacy handover;
-2. remove the stream-level `00-sni-watch.conf` from active logging only through a
-   backed-up `nginx -t`-gated operation;
-3. stop feeding **new** reject events to the legacy jail;
-4. leave the legacy jail running while its existing ban list ages naturally under
-   the original 6-hour `bantime`;
-5. do not issue generic legacy `unbanip`/UFW cleanup merely to speed retirement.
-
-This avoids having the broad legacy `actionunban` remove a rule whose ownership is
-ambiguous.
-
-## Phase E — retire legacy jail only when ban list is empty
-
-Retirement is permitted only when:
+After RIPH Fail2ban validation, legacy external logging was quiesced by setting:
 
 ```text
-fail2ban-client get nginx-stream-sni-reject banip
+LEGACY_STREAM_AUDIT_COMPAT=0
 ```
 
-returns no addresses.
+The old jail remained available while its existing ban list aged naturally under
+the original 6-hour policy. A post-quiesce live AX3200 request appeared only in the
+RIPH log, proving new external events no longer fed the legacy pipeline.
 
-Then:
+## Phase E — retire legacy jail/logger
 
-1. back up the legacy jail configuration;
-2. disable/remove the active legacy jail override from Fail2ban configuration;
-3. validate `fail2ban-client -t`;
-4. reload/restart Fail2ban as required by the tested helper;
-5. confirm the legacy jail is no longer active;
-6. confirm both RIPH jails remain active;
-7. confirm existing manual UFW denies remain unchanged.
+Retirement was allowed only after the legacy ban list was read successfully and was
+empty.
 
-The old filter/action/log files may be retained as historical evidence. They do
-not need to be deleted.
+The controlled retirement then removed the active:
+
+- `00-sni-watch.conf`;
+- legacy reject jail config;
+- legacy trusted-ignore override;
+- temporary RIPH current-IP UFW shield.
+
+Nginx and Fail2ban validation/reload succeeded. Retired active files were archived
+under the RIPH runtime backup area.
+
+Post-retirement production state had exactly these active jails:
+
+```text
+3x-ipl
+riph-nginx-stream-sni-reject
+riph-nginx-stream-private-sni-abuse
+```
+
+Final live smoke confirmed the legacy log remained unchanged while the RIPH log
+continued to grow.
 
 ## Phase F — manual UFW adoption
 
-The five legacy manual denies remain active and untouched until a separate
-migration step is tested. Adoption must avoid both protection gaps and permanent
-duplicate rules:
+### Ownership bug discovered before adoption
 
-1. validate the CIDR does not overlap effective trusted state;
-2. create the equivalent RIPH-owned marked rule;
-3. confirm the RIPH-owned rule is active;
-4. remove only the exact corresponding legacy rule;
-5. record the CIDR in the RIPH source list/applied state.
+The first attempt to add the five manual sources to RIPH exposed real UFW behavior:
+a semantically duplicate rule can be skipped while the command still returns
+success. The old manual unmarked DENY therefore remained, while the old helper
+incorrectly wrote `manual-deny-applied.tsv` as if a RIPH-marked rule had been
+created.
 
-Do not infer ownership merely because a CIDR already exists in UFW.
+`riph-apply-manual-deny` was hardened before migration continued:
+
+- applied state is treated as an ownership claim;
+- every state row must correspond to a physically visible exact RIPH-marked UFW
+  rule;
+- `Skipping adding existing rule` is treated as failure;
+- successful add/delete is followed by physical rule verification;
+- false ownership state fails closed before mutation.
+
+Regression coverage includes the exact duplicate/no-op and false-state cases.
+
+### Transactional adoption
+
+A one-time helper adopted the five old manual rules with this safety sequence:
+
+1. require `manual-deny-443.list` and stale applied state to match exactly;
+2. require exactly one old unmarked TCP/443 deny for each source;
+3. verify no source overlaps effective trusted state;
+4. verify there is no conflicting active RIPH Fail2ban rule;
+5. add and verify temporary destination-specific `riph-adopt-bridge` denies to
+   Hexabyte public `194.104.94.182:443`;
+6. remove only the exact old unmarked manual rules;
+7. add and verify exact `# riph-manual-443` rules;
+8. atomically repair `manual-deny-applied.tsv`;
+9. remove temporary bridge rules only after permanent ownership and state are
+   verified;
+10. rollback restores old legacy rules/state and keeps bridge protection if
+    restoration cannot be proven complete.
+
+The production dry-run passed for all five sources with no UFW/list/state change.
+The real adoption completed successfully and created an adoption backup under:
+
+```text
+/var/lib/router-ip-push-hardening/backups/manual-deny-adopt-20260818-162655-1320851
+```
+
+A later accidental second invocation correctly failed its preflight because the
+old unmarked rules no longer existed; it made no changes.
+
+Final manual-deny state:
+
+```text
+5 × # riph-manual-443
+0 × riph-adopt-bridge
+0 × old unmarked copies of those five rules
+```
+
+The production `riph-apply-manual-deny` was then replaced with the tested
+fail-closed version. Installed ownership dry-run returned success, guard returned
+success with `trusted_unbanned=0 manual_conflicts=0`, and subsequent automatic
+`riph-reconcile.service` runs repeatedly logged:
+
+```text
+manual deny state already matches desired lists and owned UFW rules
+```
 
 ## SSH and unrelated services
 
-No phase in this migration changes SSH policy, ZeroTier, Nextcloud, OnlyOffice,
+No phase in this migration changed SSH policy, ZeroTier, Nextcloud, OnlyOffice,
 ztncui, 3x-ui client data or Xray client definitions.
