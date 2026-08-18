@@ -9,10 +9,6 @@ private source-IP/SNI policy and must remain private.
 
 Controlled Hexabyte production validation completed on 2026-08-18.
 
-The branch remains draft/unmerged pending an explicit final review decision.
-GitHub Actions remains manual-only (`workflow_dispatch`) and was not run during the
-production validation.
-
 Production ownership is now RIPH:
 
 - `riph-router-ip.path` is enabled/active;
@@ -20,15 +16,18 @@ Production ownership is now RIPH:
 - the temporary Router-IP/Nginx hotfix path/timer are disabled/inactive;
 - the temporary hotfix files/script remain on disk only for rollback/forensics;
 - the legacy stream logger/jail have been retired from active configuration;
-- five pre-existing manual TCP/443 UFW denies are now exact RIPH-owned
+- five pre-existing manual TCP/443 UFW denies are exact RIPH-owned
   `# riph-manual-443` rules;
 - `riph-adopt-bridge` temporary adoption rules are absent;
 - the fail-closed manual-deny helper verifies physical UFW ownership on every
   applied-state row.
 
+GitHub Actions is intentionally manual-only (`workflow_dispatch`) and was not run
+during the production validation.
+
 ## v1 scope
 
-Implemented on `agent/core-apply-v1`:
+v1 includes:
 
 - Router IP Push current IPv4 as a trusted source;
 - static trusted IPv4/CIDR entries;
@@ -58,8 +57,13 @@ Implemented on `agent/core-apply-v1`:
 - interactive and command-mode `riph-admin`;
 - runtime rollback with a pre-rollback safety snapshot;
 - installer with preflight, project-file backup, Nginx runtime snapshot and automatic restore on installation failure;
+- safe reinstall behavior that preserves already-activated RIPH Fail2ban jail flags;
 - deterministic `/tmp` test-root support;
 - one-time transactional legacy manual-deny adoption helper with rollback coverage.
+
+The one-time `riph-manual-deny-adopt-legacy` helper is intentionally source-only and
+is not installed by `install.sh`; the Hexabyte legacy manual-deny migration is
+already complete.
 
 ## Safety boundary
 
@@ -122,9 +126,6 @@ See `docs/HEXABYTE_LEGACY_MIGRATION.md` for the migration record.
 
 ## Local validation
 
-GitHub Actions is manual-only (`workflow_dispatch`) so development commits do not
-consume Actions minutes automatically.
-
 Preferred local runner:
 
 ```bash
@@ -148,7 +149,8 @@ Important regressions include:
 - `tests/test-manual-deny.sh` — physical ownership, duplicate no-op and stale-state
   fail-closed behavior;
 - `tests/test-manual-deny-adopt-legacy.sh` — transactional legacy manual-deny
-  adoption and rollback.
+  adoption and rollback;
+- `tests/test-installer.sh` — first install, rollback and safe reinstall state preservation.
 
 ## Main commands after deployment
 
@@ -169,6 +171,17 @@ Interactive administration:
 ```bash
 riph-admin
 ```
+
+## Production install confirmation
+
+A real `/` install is still deliberately gated. Production mutation requires:
+
+```bash
+RIPH_ALLOW_PRODUCTION=1 ./install.sh --install ...
+```
+
+The historical `RIPH_ALLOW_INCOMPLETE_PRODUCTION=1` variable remains accepted as a
+compatibility alias for previously documented controlled procedures.
 
 ## Source of truth
 
