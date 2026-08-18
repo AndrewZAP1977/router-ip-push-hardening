@@ -41,6 +41,8 @@ Options:
 
 Testing:
   RIPH_NGINX_BIN and RIPH_SYSTEMCTL_BIN may point to stub executables.
+  RIPH_TEST_HOTFIX_OWNERSHIP_CHECK=1 enforces the production temporary-hotfix
+  ownership gate inside a temporary test root.
 EOF
 }
 
@@ -90,6 +92,38 @@ riph_require_cmd date
 
 CONFIG_FILE="$(riph_root_path "${CONFIG_PATH}")"
 riph_load_config "${CONFIG_FILE}"
+
+NGINX_BIN="${RIPH_NGINX_BIN:-nginx}"
+SYSTEMCTL_BIN="${RIPH_SYSTEMCTL_BIN:-systemctl}"
+
+# The live temporary Hexabyte safeguard and RIPH both write the same staging
+# allowlist. Normal production apply must never run while that temporary writer
+# still owns the file. riph-hotfix-handover disables/stops those units under the
+# shared hotfix lock before it invokes reconcile/apply, so the handover itself
+# naturally passes this gate. Dry-run is read-only and remains allowed.
+temporary_hotfix_owns_allowlist() {
+    local unit
+    for unit in \
+        router-ip-push-nginx-hotfix.path \
+        router-ip-push-nginx-hotfix.timer \
+        router-ip-push-nginx-hotfix.service; do
+        if "${SYSTEMCTL_BIN}" is-active --quiet "${unit}" >/dev/null 2>&1; then
+            return 0
+        fi
+        if [[ "${unit}" != *.service ]] \
+            && "${SYSTEMCTL_BIN}" is-enabled --quiet "${unit}" >/dev/null 2>&1; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+if (( DRY_RUN == 0 )) \
+    && { [[ "${RIPH_ROOT}" == "/" ]] || [[ "${RIPH_TEST_HOTFIX_OWNERSHIP_CHECK:-0}" == 1 ]]; } \
+    && temporary_hotfix_owns_allowlist; then
+    riph_die "temporary Router IP Push Nginx hotfix still owns the allowlist; use riph-hotfix-handover takeover"
+fi
+
 riph_prepare_dirs
 
 STATE_DIR="$(riph_root_path "${RIPH_STATE_DIR}")"
@@ -105,9 +139,11 @@ BACKUP_ROOT="${STATE_DIR}/backups"
 
 mkdir -p "${CONFIG_DIR}" "$(dirname "${ALLOWLIST_FILE}")" "$(dirname "${STREAM_FILE}")" "$(dirname "${BRIDGE_FILE}")"
 
+# Path and timer events can legitimately coincide. Wait briefly for the current
+# reconcile instead of turning a harmless overlap into a failed systemd job.
 exec 9>"${LOCK_FILE}"
-if ! flock -n 9; then
-    riph_die "another riph-apply/reconcile process is already running"
+if ! flock -w 15 9; then
+    riph_die "timed out waiting for another riph-apply/reconcile process"
 fi
 
 NOW_EPOCH="$(riph_now_epoch)"
@@ -396,9 +432,6 @@ atomic_install "${CANDIDATE_STREAM}" "${STREAM_FILE}" 0644
 atomic_install "${CANDIDATE_BRIDGE}" "${BRIDGE_FILE}" 0644
 atomic_install "${CANDIDATE_GRACE}" "${GRACE_FILE}" 0600
 atomic_install "${CANDIDATE_STATE}" "${LAST_STATE_FILE}" 0600
-
-NGINX_BIN="${RIPH_NGINX_BIN:-nginx}"
-SYSTEMCTL_BIN="${RIPH_SYSTEMCTL_BIN:-systemctl}"
 
 if ! "${NGINX_BIN}" -t; then
     riph_log "nginx validation failed; restoring previous files"
