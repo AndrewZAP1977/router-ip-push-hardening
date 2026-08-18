@@ -8,6 +8,11 @@ trap 'rm -rf "${T}"' EXIT
 
 mkdir -p "${T}/etc/router-ip-push-hardening"
 cp "${ROOT}/config/config.env.example" "${T}/etc/router-ip-push-hardening/config.env"
+
+# Production default is legacy compatibility OFF. Enable it explicitly for the
+# migration-compatibility half of this regression.
+sed -i 's/^LEGACY_STREAM_AUDIT_COMPAT=0$/LEGACY_STREAM_AUDIT_COMPAT=1/' \
+    "${T}/etc/router-ip-push-hardening/config.env"
 "${GEN}" --root "${T}"
 
 STREAM="${T}/etc/nginx/stream-enabled/stream.conf"
