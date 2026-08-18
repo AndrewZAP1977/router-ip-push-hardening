@@ -79,6 +79,10 @@ grep -Fqx 'OnUnitActiveSec=1min' "${T1}/etc/systemd/system/riph-reconcile.timer"
 [[ ! -e "${T1}/etc/systemd/system/riph-guard.timer" ]] || fail 'redundant guard timer was installed'
 ! grep -Fq '176.110.189.199/32' "${T1}/etc/router-ip-push-hardening/trusted-static.list" \
     || fail 'fresh install seeded a dynamic SmartBox-mother address as permanent static trust'
+grep -Fx 'ROUTER_AUTO_DISCOVER_REGISTERED=1' "${T1}/etc/router-ip-push-hardening/config.env" >/dev/null \
+    || fail 'fresh install did not enable registered Router IP Push auto-discovery'
+grep -Fx 'ROUTER_REGISTRY_DIR="/etc/router-ip-push/routers.d"' "${T1}/etc/router-ip-push-hardening/config.env" >/dev/null \
+    || fail 'fresh install did not seed Router IP Push registry path'
 grep -Fx 'LEGACY_STREAM_AUDIT_COMPAT=0' "${T1}/etc/router-ip-push-hardening/config.env" >/dev/null \
     || fail 'fresh install did not use retired legacy-audit default'
 [[ -f "${T1}/etc/nginx/stream-enabled/stream.conf" ]] || fail 'stream config not applied'
