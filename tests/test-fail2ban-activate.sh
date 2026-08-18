@@ -97,27 +97,30 @@ cmp -s "${CASE_FAIL}/private.before" "${CASE_FAIL}/etc/fail2ban/jail.d/riph-ngin
 [[ ! -e "${CASE_FAIL}/etc/fail2ban/jail.d/zz-riph-legacy-trusted-ignore.local" ]] \
     || fail 'legacy ignore override was not removed after activation rollback'
 
-# If the current dynamic Router IP is already present in the legacy ban list, the
-# helper must refuse before creating an override/jail mutation. Calling the old
-# jail's generic actionunban here could delete an ambiguously-owned UFW rule.
+# If the newly assigned current Router IP already has an older legacy ban, never
+# invoke the old generic actionunban. Activation must preserve that ban, install the
+# dynamic ignore override and continue to the trusted guard, whose UFW-shield logic
+# is covered separately by test-guard-legacy-shield.sh.
 CASE_BANNED="${BASE}/current-banned"
 make_case "${CASE_BANNED}" '78.111.154.96'
 cat >"${CASE_BANNED}/usr/local/bin/guard-ok" <<'EOF_GUARD_OK2'
 #!/usr/bin/env bash
+printf '%s\n' "$*" >>"${RIPH_TEST_GUARD_COLLISION_LOG:?}"
 exit 0
 EOF_GUARD_OK2
 chmod +x "${CASE_BANNED}/usr/local/bin/guard-ok"
 export RIPH_FAIL2BAN_CLIENT_BIN="${CASE_BANNED}/usr/local/bin/f2b-stub"
 export RIPH_GUARD_BIN="${CASE_BANNED}/usr/local/bin/guard-ok"
+export RIPH_TEST_GUARD_COLLISION_LOG="${CASE_BANNED}/guard.log"
 
-if "${ACTIVATE}" --root "${CASE_BANNED}" >"${CASE_BANNED}/out.txt" 2>&1; then
-    fail 'activation unexpectedly accepted a current Router IP already banned by legacy jail'
-fi
-grep -Fq 'automatic unban refused' "${CASE_BANNED}/out.txt" \
-    || fail 'ambiguous legacy current-IP ban refusal message missing'
-grep -Fx 'enabled = false' "${CASE_BANNED}/etc/fail2ban/jail.d/riph-nginx-stream-sni-reject.local" >/dev/null \
-    || fail 'ambiguous legacy-ban refusal mutated RIPH jail'
-[[ ! -e "${CASE_BANNED}/etc/fail2ban/jail.d/zz-riph-legacy-trusted-ignore.local" ]] \
-    || fail 'ambiguous legacy-ban refusal created override before stopping'
+"${ACTIVATE}" --root "${CASE_BANNED}" >"${CASE_BANNED}/out.txt" 2>&1
+grep -Fq 'legacy ban will remain untouched and RIPH trusted shield will protect TCP/443' "${CASE_BANNED}/out.txt" \
+    || fail 'legacy current-IP collision warning missing'
+grep -Fx 'enabled = true' "${CASE_BANNED}/etc/fail2ban/jail.d/riph-nginx-stream-sni-reject.local" >/dev/null \
+    || fail 'legacy collision prevented RIPH jail activation'
+[[ -f "${CASE_BANNED}/etc/fail2ban/jail.d/zz-riph-legacy-trusted-ignore.local" ]] \
+    || fail 'legacy collision did not install dynamic ignore override'
+[[ -s "${CASE_BANNED}/guard.log" ]] \
+    || fail 'legacy collision activation did not reach trusted guard'
 
 echo 'PASS: Fail2ban activation tests'
