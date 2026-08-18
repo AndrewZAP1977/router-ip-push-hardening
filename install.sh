@@ -21,6 +21,8 @@ HOTFIX_TIMER_UNIT="router-ip-push-nginx-hotfix.timer"
 HOTFIX_SERVICE_UNIT="router-ip-push-nginx-hotfix.service"
 RIPH_PATH_UNIT="riph-router-ip.path"
 RIPH_TIMER_UNIT="riph-reconcile.timer"
+RIPH_JAIL_REJECT_LOGICAL="/etc/fail2ban/jail.d/riph-nginx-stream-sni-reject.local"
+RIPH_JAIL_PRIVATE_LOGICAL="/etc/fail2ban/jail.d/riph-nginx-stream-private-sni-abuse.local"
 
 HOTFIX_PATH_WAS_ENABLED=""
 HOTFIX_PATH_WAS_ACTIVE=""
@@ -30,6 +32,8 @@ RIPH_PATH_WAS_ENABLED=""
 RIPH_PATH_WAS_ACTIVE=""
 RIPH_TIMER_WAS_ENABLED=""
 RIPH_TIMER_WAS_ACTIVE=""
+RIPH_JAIL_REJECT_ENABLED_BEFORE=""
+RIPH_JAIL_PRIVATE_ENABLED_BEFORE=""
 
 usage() {
     cat <<'USAGE'
@@ -53,9 +57,9 @@ Temporary Hexabyte hotfix ownership:
   is allowed only together with --enable-timers. The installer then uses
   riph-hotfix-handover so there is never more than one active allowlist owner.
 
-Development safety gate:
-  Real '/' installation is intentionally blocked until the controlled VPS test.
-  Set RIPH_ALLOW_INCOMPLETE_PRODUCTION=1 only for an explicitly controlled test.
+Production safety gate:
+  Real '/' installation requires explicit RIPH_ALLOW_PRODUCTION=1 confirmation.
+  Historical RIPH_ALLOW_INCOMPLETE_PRODUCTION=1 is also accepted for compatibility.
 USAGE
 }
 
@@ -165,6 +169,7 @@ capture_production_unit_states() {
 preflight() {
     local router_id ip_file ip
     riph_require_cmd jq
+    riph_require_cmd awk
     riph_require_cmd flock
     riph_require_cmd install
     riph_require_cmd sha256sum
@@ -204,8 +209,9 @@ if [[ "${MODE}" == "check" ]]; then
     exit 0
 fi
 
-if [[ "${RIPH_ROOT}" == "/" && "${RIPH_ALLOW_INCOMPLETE_PRODUCTION:-0}" != "1" ]]; then
-    riph_die "production install is blocked until the controlled VPS test; use test-root for development"
+PRODUCTION_CONFIRM="${RIPH_ALLOW_PRODUCTION:-${RIPH_ALLOW_INCOMPLETE_PRODUCTION:-0}}"
+if [[ "${RIPH_ROOT}" == "/" && "${PRODUCTION_CONFIRM}" != "1" ]]; then
+    riph_die "production install requires explicit RIPH_ALLOW_PRODUCTION=1 confirmation"
 fi
 
 if [[ "${RIPH_ROOT}" == "/" ]] && (( TEMP_HOTFIX_ACTIVE == 1 && DO_APPLY == 1 && ENABLE_TIMERS == 0 )); then
@@ -262,6 +268,55 @@ mapfile -t FILE_SPECS <<'EOF_SPECS'
 /etc/router-ip-push-hardening/manual-deny-443.list|config/manual-deny-443.list.example|0600|seed
 /etc/router-ip-push-hardening/manual-deny-all.list|config/manual-deny-all.list.example|0600|seed
 EOF_SPECS
+
+read_existing_jail_enabled() {
+    local logical="$1" target value
+    target="$(riph_root_path "${logical}")"
+    [[ -f "${target}" ]] || return 1
+    value="$(awk -F= '
+        /^[[:space:]]*enabled[[:space:]]*=/ {
+            v=$2
+            gsub(/[[:space:]]/, "", v)
+            print v
+            exit
+        }
+    ' "${target}")"
+    [[ "${value}" == true || "${value}" == false ]] \
+        || riph_die "existing RIPH jail has missing/invalid enabled flag: ${target}"
+    printf '%s\n' "${value}"
+}
+
+capture_existing_jail_states() {
+    RIPH_JAIL_REJECT_ENABLED_BEFORE="$(read_existing_jail_enabled "${RIPH_JAIL_REJECT_LOGICAL}" 2>/dev/null || true)"
+    RIPH_JAIL_PRIVATE_ENABLED_BEFORE="$(read_existing_jail_enabled "${RIPH_JAIL_PRIVATE_LOGICAL}" 2>/dev/null || true)"
+}
+
+preserve_jail_enabled_state() {
+    local logical="$1" target="$2" value="" tmp
+    case "${logical}" in
+        "${RIPH_JAIL_REJECT_LOGICAL}") value="${RIPH_JAIL_REJECT_ENABLED_BEFORE}" ;;
+        "${RIPH_JAIL_PRIVATE_LOGICAL}") value="${RIPH_JAIL_PRIVATE_ENABLED_BEFORE}" ;;
+        *) return 0 ;;
+    esac
+    [[ -n "${value}" ]] || return 0
+
+    tmp="${target}.riph-enabled.$$"
+    if ! awk -v value="${value}" '
+        BEGIN {done=0}
+        /^[[:space:]]*enabled[[:space:]]*=/ && done==0 {
+            print "enabled = " value
+            done=1
+            next
+        }
+        {print}
+        END {if (done==0) exit 2}
+    ' "${target}" >"${tmp}"; then
+        rm -f "${tmp}"
+        riph_die "installed RIPH jail has no enabled flag: ${target}"
+    fi
+    install -m 0644 "${tmp}" "${target}"
+    rm -f "${tmp}"
+}
 
 snapshot_target() {
     local logical="$1" target="$2" rel
@@ -372,6 +427,11 @@ restore_install_on_exit() {
 }
 trap restore_install_on_exit EXIT
 
+# RIPH activation mutates these two jail files from enabled=false to enabled=true.
+# On an update/reinstall, preserve that existing administrative state instead of
+# silently writing the repository's safe first-install default back to false.
+capture_existing_jail_states
+
 for spec in "${FILE_SPECS[@]}"; do
     IFS='|' read -r logical source_rel mode policy <<<"${spec}"
     target="$(riph_root_path "${logical}")"
@@ -401,19 +461,27 @@ for spec in "${FILE_SPECS[@]}"; do
     temp="${target}.riph-install.$$"
     install -m "${mode}" "${source_file}" "${temp}"
     mv -f "${temp}" "${target}"
+    preserve_jail_enabled_state "${logical}" "${target}"
 done
+
+if [[ "${RIPH_ROOT}" == "/" ]]; then
+    # Unit files may have been updated even when --enable-timers was not requested.
+    # daemon-reload changes no enabled/active state and keeps future service starts
+    # aligned with the just-installed files.
+    systemctl daemon-reload
+    if (( DO_APPLY == 1 )); then
+        touch "${STREAM_AUDIT_LOG:-/var/log/nginx/riph-stream-sni.log}"
+    fi
+    # Validate the newly installed Fail2ban files regardless of whether Nginx is
+    # applied now. Do not reload Fail2ban here: runtime jail changes remain an
+    # explicit operator action, while active/inactive flags are preserved on disk.
+    fail2ban-client -t
+fi
 
 if (( DO_APPLY == 1 )); then
     installed_apply="$(riph_root_path /usr/local/sbin/riph-apply)"
     installed_guard="$(riph_root_path /usr/local/sbin/riph-trusted-unban-guard)"
     installed_handover="$(riph_root_path /usr/local/sbin/riph-hotfix-handover)"
-
-    if [[ "${RIPH_ROOT}" == "/" ]]; then
-        touch "${STREAM_AUDIT_LOG:-/var/log/nginx/riph-stream-sni.log}"
-        # Validate project Fail2ban files while they remain disabled. Activation is
-        # a separate controlled Phase 7 action after routing is proven healthy.
-        fail2ban-client -t
-    fi
 
     if [[ "${RIPH_ROOT}" == "/" ]] && (( TEMP_HOTFIX_ACTIVE == 1 )); then
         bash "${installed_handover}" --root "${RIPH_ROOT}" --config /etc/router-ip-push-hardening/config.env takeover
@@ -426,7 +494,6 @@ fi
 
 if (( ENABLE_TIMERS == 1 && HANDOVER_OWNS_TIMERS == 0 )); then
     [[ "${RIPH_ROOT}" == "/" ]] || riph_die "--enable-timers is only valid for real production root"
-    systemctl daemon-reload
     systemctl enable --now riph-router-ip.path riph-reconcile.timer
 fi
 
