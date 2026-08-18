@@ -19,8 +19,8 @@ mkdir -p \
     "${T}/bin"
 
 cp "${ROOT}/config/config.env.example" "${T}/etc/router-ip-push-hardening/config.env"
-sed -i 's/^LEGACY_STREAM_AUDIT_COMPAT=1$/LEGACY_STREAM_AUDIT_COMPAT=0/' \
-    "${T}/etc/router-ip-push-hardening/config.env"
+grep -Fx 'LEGACY_STREAM_AUDIT_COMPAT=0' "${T}/etc/router-ip-push-hardening/config.env" >/dev/null \
+    || fail 'production config example must default legacy audit compatibility off'
 printf '%s\n' '78.111.154.96' >"${T}/var/lib/router-ip-push/ips/AX3200.ipv4"
 printf '%s\n' 'STREAM_SENTINEL' >"${T}/etc/nginx/stream-enabled/stream.conf"
 printf '%s\n' 'LEGACY_WATCH' >"${T}/etc/nginx/stream-enabled/00-sni-watch.conf"
