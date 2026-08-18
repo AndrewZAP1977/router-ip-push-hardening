@@ -27,6 +27,16 @@ make_root "${T1}"
 make_root "${T2}"
 printf '%s\n' 'PREINSTALL_STREAM_SENTINEL' >"${T1}/etc/nginx/stream-enabled/stream.conf"
 
+# Structural safety assertions: the installer transaction must use EXIT rollback
+# (explicit riph_die/exit paths included) and must resynchronize the live temporary
+# Router-IP owner after a failed production install restores an older Nginx snapshot.
+grep -Fq 'trap restore_install_on_exit EXIT' "${INSTALLER}" \
+    || fail 'installer is not protected by EXIT rollback'
+grep -Fq 'resync_temporary_hotfix_after_error' "${INSTALLER}" \
+    || fail 'installer has no post-rollback temporary-hotfix resync hook'
+grep -Fq 'disable --now "${RIPH_PATH_UNIT}" "${RIPH_TIMER_UNIT}"' "${INSTALLER}" \
+    || fail 'installer rollback does not remove partial RIPH automatic ownership first'
+
 echo 'TEST I1: test-root install + apply'
 export RIPH_NGINX_BIN="${T1}/usr/local/bin/nginx-stub"
 export RIPH_SYSTEMCTL_BIN="${T1}/usr/local/bin/systemctl-stub"
@@ -42,7 +52,9 @@ export RIPH_SYSTEMCTL_BIN="${T1}/usr/local/bin/systemctl-stub"
 [[ -f "${T1}/etc/fail2ban/action.d/riph-ufw-443.conf" ]] || fail 'fail2ban action not installed'
 [[ -f "${T1}/etc/systemd/system/riph-router-ip.path" ]] || fail 'router IP path unit not installed'
 [[ -f "${T1}/etc/systemd/system/riph-reconcile.timer" ]] || fail 'reconcile timer not installed'
-grep -Fqx 'OnUnitActiveSec=1min' "${T1}/etc/systemd/system/riph-reconcile.timer" || fail 'installed reconcile fallback is not one minute'
+grep -Fqx 'OnActiveSec=1min' "${T1}/etc/systemd/system/riph-reconcile.timer" || fail 'installed reconcile fallback does not start one minute after activation'
+grep -Fqx 'OnUnitActiveSec=1min' "${T1}/etc/systemd/system/riph-reconcile.timer" || fail 'installed reconcile fallback recurrence is not one minute'
+! grep -Fq 'OnBootSec=' "${T1}/etc/systemd/system/riph-reconcile.timer" || fail 'installed reconcile timer still uses boot-relative first trigger'
 [[ ! -e "${T1}/etc/systemd/system/riph-guard.timer" ]] || fail 'redundant guard timer was installed'
 [[ -f "${T1}/etc/nginx/stream-enabled/stream.conf" ]] || fail 'stream config not applied'
 grep -F 'access_log /var/log/nginx/riph-stream-sni.log riph_stream_sni;' "${T1}/etc/nginx/stream-enabled/stream.conf" >/dev/null || fail 'dedicated audit log missing'
@@ -51,7 +63,7 @@ backup_stream="$(find "${T1}/var/lib/router-ip-push-hardening/install-backups" -
 [[ -n "${backup_stream}" ]] || fail 'install backup did not capture pre-install stream.conf'
 grep -Fx 'PREINSTALL_STREAM_SENTINEL' "${backup_stream}" >/dev/null || fail 'pre-install stream snapshot mismatch'
 
-echo 'TEST I2: failed apply restores pre-install files'
+echo 'TEST I2: failed apply restores pre-install files via EXIT transaction'
 mkdir -p "${T2}/usr/local/sbin"
 printf '%s\n' 'PREEXISTING_ADMIN_SENTINEL' >"${T2}/usr/local/sbin/riph-admin"
 chmod 0700 "${T2}/usr/local/sbin/riph-admin"
