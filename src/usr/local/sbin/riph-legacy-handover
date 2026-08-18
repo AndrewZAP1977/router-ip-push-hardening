@@ -26,7 +26,7 @@ quiesce  Stop feeding new external :443 events to the legacy stream log while
          leaving the legacy jail/config active so existing 6h bans expire naturally.
 retire   Remove legacy 00-sni-watch.conf, legacy jail config, dynamic trusted-ignore
          override and the temporary RIPH-owned trusted UFW shield. Refuses until
-         both RIPH jails are active and the legacy ban list is empty.
+         both RIPH jails are active and the legacy ban list is reliably readable and empty.
 
 Options:
   --root DIR       Test root prefix.
@@ -93,12 +93,16 @@ jail_active() {
 
 legacy_bans() {
     if jail_active "${LEGACY_JAIL}"; then
-        "${F2B_BIN}" get "${LEGACY_JAIL}" banip 2>/dev/null || true
+        "${F2B_BIN}" get "${LEGACY_JAIL}" banip 2>/dev/null
     fi
 }
 
 normalized_legacy_bans() {
-    legacy_bans | tr '\n' ' ' | xargs 2>/dev/null || true
+    local raw
+    if ! raw="$(legacy_bans)"; then
+        return 1
+    fi
+    printf '%s\n' "${raw}" | tr '\n' ' ' | xargs 2>/dev/null
 }
 
 compat_value() {
@@ -108,8 +112,16 @@ compat_value() {
 }
 
 print_status() {
-    local bans
-    bans="$(normalized_legacy_bans)"
+    local bans ban_state
+    ban_state="none/unknown"
+    if jail_active "${LEGACY_JAIL}"; then
+        if bans="$(normalized_legacy_bans)"; then
+            ban_state="${bans:-none}"
+        else
+            ban_state="ERROR: unreadable"
+        fi
+    fi
+
     printf 'Legacy handover status\n======================\n'
     printf 'compat external legacy log: %s\n' "$(compat_value)"
     printf 'legacy 00-sni-watch.conf:    %s\n' "$([[ -f "${LEGACY_WATCH}" ]] && echo present || echo absent)"
@@ -117,7 +129,7 @@ print_status() {
     printf 'legacy trusted override:     %s\n' "$([[ -f "${LEGACY_IGNORE_OVERRIDE}" ]] && echo present || echo absent)"
     if jail_active "${LEGACY_JAIL}"; then
         printf 'legacy jail runtime:         active\n'
-        printf 'legacy banned IPs:           %s\n' "${bans:-none}"
+        printf 'legacy banned IPs:           %s\n' "${ban_state}"
     else
         printf 'legacy jail runtime:         inactive\n'
         printf 'legacy banned IPs:           none/unknown\n'
@@ -149,6 +161,14 @@ require_legacy_protected() {
         || riph_die "legacy dynamic trusted-ignore override missing: ${LEGACY_IGNORE_OVERRIDE}; activate RIPH jails through riph-fail2ban-activate first"
     grep -Fq 'ignorecommand = /usr/local/sbin/riph-fail2ban-ignore <ip>' "${LEGACY_IGNORE_OVERRIDE}" \
         || riph_die "legacy trusted-ignore override has unexpected content"
+}
+
+read_legacy_bans_or_die() {
+    local context="$1" bans
+    if ! bans="$(normalized_legacy_bans)"; then
+        riph_die "cannot reliably read legacy ${LEGACY_JAIL} ban list during ${context}; refusing to mutate legacy protection"
+    fi
+    printf '%s\n' "${bans}"
 }
 
 quiesce_cmd() {
@@ -195,7 +215,7 @@ retire_cmd() {
     [[ -x "${GUARD_BIN}" || -f "${GUARD_BIN}" ]] \
         || riph_die "trusted guard not found for legacy shield retirement: ${GUARD_BIN}"
 
-    bans="$(normalized_legacy_bans)"
+    bans="$(read_legacy_bans_or_die 'retirement preflight')"
     [[ -z "${bans}" ]] || riph_die "legacy jail still has banned IP(s): ${bans}; retirement refused"
 
     if (( DRY_RUN == 1 )); then
@@ -265,8 +285,9 @@ retire_cmd() {
 
     # Re-check after the legacy logger is definitely no longer receiving data.
     # A buffered pre-quiesce line may have been processed just before this point;
-    # if it created a fresh 6h ban, do not retire the jail yet.
-    bans="$(normalized_legacy_bans)"
+    # if it created a fresh 6h ban, do not retire the jail yet. Failure to read the
+    # ban list is also a hard stop and rolls the logger move back.
+    bans="$(read_legacy_bans_or_die 'post-logger retirement check')"
     [[ -z "${bans}" ]] || riph_die "legacy jail gained/retained ban(s) after logger shutdown: ${bans}; retirement rolled back"
 
     mv "${LEGACY_JAIL_FILE}" "${retire_dir}/nginx-stream-sni-reject.local"
