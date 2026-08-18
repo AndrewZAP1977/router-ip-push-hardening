@@ -131,7 +131,7 @@ if (( DRY_RUN == 1 )); then
     bash "${APPLY}" "${apply_args[@]}"
 else
     converged=0
-    for attempt in $(seq 1 "${MAX_CONVERGENCE_ATTEMPTS}"); do
+    for ((attempt = 1; attempt <= MAX_CONVERGENCE_ATTEMPTS; attempt++)); do
         # Trust/routing is the primary safety state. If an apply transaction fails,
         # fail hard; riph-apply has already restored its previous Nginx state.
         bash "${APPLY}" "${apply_args[@]}"
