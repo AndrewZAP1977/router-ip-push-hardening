@@ -57,6 +57,11 @@ case "${cmd}" in
         for unit in "$@"; do
             printf '%s\n' enabled >"${state}/${unit}.enabled"
             printf '%s\n' active >"${state}/${unit}.active"
+            if [[ "${unit}" == riph-router-ip.path && -n "${RIPH_TEST_IP_AFTER_FIRST:-}" ]]; then
+                tmp="${RIPH_TEST_IP_FILE}.receiver.$$"
+                printf '%s\n' "${RIPH_TEST_IP_AFTER_FIRST}" >"${tmp}"
+                mv -f "${tmp}" "${RIPH_TEST_IP_FILE}"
+            fi
         done
         ;;
     stop)
@@ -87,14 +92,15 @@ while (($#)); do
         *) shift ;;
     esac
 done
+ip="$(tr -d '[:space:]' <"${root}/var/lib/router-ip-push/ips/AX3200.ipv4")"
 mkdir -p "${root}/etc/nginx/stream-enabled"
-cat >"${root}/etc/nginx/stream-enabled/05-router-ip-push-source-allow.conf" <<'EOF_ALLOW'
-geo $router_ip_push_source_allowed {
+cat >"${root}/etc/nginx/stream-enabled/05-router-ip-push-source-allow.conf" <<EOF_ALLOW
+geo \$router_ip_push_source_allowed {
         default 0;
-        78.111.154.96/32 1; # router-ip-push:AX3200 current
+        ${ip}/32 1; # router-ip-push:AX3200 current
 }
 EOF_ALLOW
-printf '%s\n' called >>"${RIPH_TEST_RECONCILE_LOG:?}"
+printf '%s\n' "${ip}" >>"${RIPH_TEST_RECONCILE_LOG:?}"
 EOF_RECONCILE_OK
 chmod +x "${CASE_OK}/bin/reconcile-stub"
 
@@ -103,6 +109,10 @@ export RIPH_RECONCILE_BIN="${CASE_OK}/bin/reconcile-stub"
 export RIPH_TEST_SYSTEMD_STATE="${CASE_OK}/state"
 export RIPH_TEST_RECONCILE_LOG="${CASE_OK}/reconcile.log"
 export RIPH_HOTFIX_LOCK="${CASE_OK}/hotfix.lock"
+export RIPH_TEST_IP_FILE="${CASE_OK}/var/lib/router-ip-push/ips/AX3200.ipv4"
+# Simulate the ISP/Router IP Push changing the address after the first reconcile
+# but before/while RIPH automatic ownership becomes active.
+export RIPH_TEST_IP_AFTER_FIRST='78.111.154.97'
 
 bash "${HANDOVER}" --root "${CASE_OK}" takeover >/dev/null
 [[ "$(cat "${CASE_OK}/state/router-ip-push-nginx-hotfix.path.enabled")" == disabled ]] \
@@ -113,8 +123,15 @@ bash "${HANDOVER}" --root "${CASE_OK}" takeover >/dev/null
     || fail 'RIPH path is not active after successful takeover'
 [[ "$(cat "${CASE_OK}/state/riph-reconcile.timer.active")" == active ]] \
     || fail 'RIPH timer is not active after successful takeover'
-[[ "$(wc -l <"${CASE_OK}/reconcile.log")" == 1 ]] || fail 'reconcile was not called exactly once'
+[[ "$(wc -l <"${CASE_OK}/reconcile.log")" == 2 ]] || fail 'handover must perform exactly two explicit reconciles'
+[[ "$(sed -n '1p' "${CASE_OK}/reconcile.log")" == '78.111.154.96' ]] \
+    || fail 'first reconcile did not consume the starting IP'
+[[ "$(sed -n '2p' "${CASE_OK}/reconcile.log")" == '78.111.154.97' ]] \
+    || fail 'second reconcile did not consume the IP changed during handover'
+grep -Fq '78.111.154.97/32 1;' "${CASE_OK}/etc/nginx/stream-enabled/05-router-ip-push-source-allow.conf" \
+    || fail 'final allowlist does not contain the IP changed during handover'
 
+unset RIPH_TEST_IP_AFTER_FIRST
 CASE_FAIL="${T}/fail"
 make_case "${CASE_FAIL}"
 cat >"${CASE_FAIL}/bin/reconcile-stub" <<'EOF_RECONCILE_FAIL'
@@ -128,6 +145,7 @@ export RIPH_RECONCILE_BIN="${CASE_FAIL}/bin/reconcile-stub"
 export RIPH_TEST_SYSTEMD_STATE="${CASE_FAIL}/state"
 export RIPH_TEST_RECONCILE_LOG="${CASE_FAIL}/reconcile.log"
 export RIPH_HOTFIX_LOCK="${CASE_FAIL}/hotfix.lock"
+export RIPH_TEST_IP_FILE="${CASE_FAIL}/var/lib/router-ip-push/ips/AX3200.ipv4"
 
 if bash "${HANDOVER}" --root "${CASE_FAIL}" takeover >/dev/null 2>&1; then
     fail 'handover unexpectedly succeeded when reconcile failed'
