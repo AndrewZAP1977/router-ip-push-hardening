@@ -25,7 +25,7 @@ status   Show overlap state. Read-only.
 quiesce  Stop feeding new external :443 events to the legacy stream log while
          leaving the legacy jail/config active so existing 6h bans expire naturally.
 retire   Remove legacy 00-sni-watch.conf and legacy jail config from active include
-         paths. Refuses to run until both RIPH jails are active and legacy ban list is empty.
+         paths. Refuses until both RIPH jails are active and legacy ban list is empty.
 
 Options:
   --root DIR       Test root prefix.
@@ -65,6 +65,8 @@ while (($#)); do
     esac
 done
 
+(($# == 0)) || riph_die "unexpected trailing arguments"
+
 CONFIG_FILE="$(riph_root_path "${CONFIG_PATH}")"
 riph_load_config "${CONFIG_FILE}"
 riph_prepare_dirs
@@ -92,6 +94,10 @@ legacy_bans() {
     fi
 }
 
+normalized_legacy_bans() {
+    legacy_bans | tr '\n' ' ' | xargs 2>/dev/null || true
+}
+
 compat_value() {
     local value="${LEGACY_STREAM_AUDIT_COMPAT:-0}"
     [[ "${value}" == 0 || "${value}" == 1 ]] || riph_die "LEGACY_STREAM_AUDIT_COMPAT must be 0 or 1"
@@ -100,7 +106,7 @@ compat_value() {
 
 print_status() {
     local bans
-    bans="$(legacy_bans | tr '\n' ' ' | xargs 2>/dev/null || true)"
+    bans="$(normalized_legacy_bans)"
     printf 'Legacy handover status\n======================\n'
     printf 'compat external legacy log: %s\n' "$(compat_value)"
     printf 'legacy 00-sni-watch.conf:    %s\n' "$([[ -f "${LEGACY_WATCH}" ]] && echo present || echo absent)"
@@ -147,6 +153,7 @@ quiesce_cmd() {
         return 0
     fi
 
+    local config_backup
     config_backup="${CONFIG_FILE}.riph-pre-quiesce.$$"
     cp -a "${CONFIG_FILE}" "${config_backup}"
     if ! set_compat_zero; then
@@ -165,18 +172,20 @@ quiesce_cmd() {
 }
 
 retire_cmd() {
+    local bans backup_id backup_dir retire_dir
+
     require_riph_jails
     [[ "$(compat_value)" == 0 ]] || riph_die "legacy external logging is still enabled; run quiesce first"
     [[ -f "${LEGACY_WATCH}" ]] || riph_die "legacy watch file already absent"
     [[ -f "${LEGACY_JAIL_FILE}" ]] || riph_die "legacy jail file already absent"
     jail_active "${LEGACY_JAIL}" || riph_die "legacy jail is not active; inspect state before retirement"
 
-    bans="$(legacy_bans | tr '\n' ' ' | xargs 2>/dev/null || true)"
+    bans="$(normalized_legacy_bans)"
     [[ -z "${bans}" ]] || riph_die "legacy jail still has banned IP(s): ${bans}; retirement refused"
 
     if (( DRY_RUN == 1 )); then
         riph_log "dry-run: would archive 00-sni-watch.conf and legacy jail .local"
-        riph_log "dry-run: would validate/reload Nginx and Fail2ban; legacy filter/action files stay installed"
+        riph_log "dry-run: would validate/reload Nginx and reload Fail2ban; legacy filter/action files stay installed"
         return 0
     fi
 
@@ -189,27 +198,49 @@ retire_cmd() {
     cp -a "${LEGACY_WATCH}" "${backup_dir}/00-sni-watch.conf"
     cp -a "${LEGACY_JAIL_FILE}" "${backup_dir}/nginx-stream-sni-reject.local"
 
-    rollback_retire() {
+    RETIRE_STARTED=0
+    RETIRE_COMMITTED=0
+    rollback_retire_on_exit() {
         local rc=$?
-        trap - ERR
-        riph_log "legacy retirement failed; restoring active legacy files"
-        [[ -f "${retire_dir}/00-sni-watch.conf" ]] && mv -f "${retire_dir}/00-sni-watch.conf" "${LEGACY_WATCH}" || true
-        [[ -f "${retire_dir}/nginx-stream-sni-reject.local" ]] && mv -f "${retire_dir}/nginx-stream-sni-reject.local" "${LEGACY_JAIL_FILE}" || true
-        cp -a "${backup_dir}/config.env" "${CONFIG_FILE}" || true
-        cp -a "${backup_dir}/stream.conf" "${STREAM_FILE}" || true
-        if [[ "${RIPH_ROOT}" == "/" ]]; then
-            "${NGINX_BIN}" -t >/dev/null 2>&1 && "${SYSTEMCTL_BIN}" reload nginx >/dev/null 2>&1 || true
-            "${F2B_BIN}" -t >/dev/null 2>&1 && "${F2B_BIN}" reload >/dev/null 2>&1 || true
+        trap - EXIT
+
+        if (( RETIRE_STARTED == 1 && RETIRE_COMMITTED == 0 )); then
+            riph_log "legacy retirement failed; restoring active legacy files"
+            [[ -f "${retire_dir}/00-sni-watch.conf" ]] \
+                && mv -f "${retire_dir}/00-sni-watch.conf" "${LEGACY_WATCH}" || true
+            [[ -f "${retire_dir}/nginx-stream-sni-reject.local" ]] \
+                && mv -f "${retire_dir}/nginx-stream-sni-reject.local" "${LEGACY_JAIL_FILE}" || true
+            cp -a "${backup_dir}/config.env" "${CONFIG_FILE}" || true
+            cp -a "${backup_dir}/stream.conf" "${STREAM_FILE}" || true
+
+            if [[ "${RIPH_ROOT}" == "/" ]]; then
+                if "${NGINX_BIN}" -t >/dev/null 2>&1; then
+                    "${SYSTEMCTL_BIN}" reload nginx >/dev/null 2>&1 || true
+                fi
+                if "${F2B_BIN}" -t >/dev/null 2>&1; then
+                    "${F2B_BIN}" reload >/dev/null 2>&1 || true
+                fi
+            fi
         fi
         exit "${rc}"
     }
-    trap rollback_retire ERR
+    trap rollback_retire_on_exit EXIT
+    RETIRE_STARTED=1
 
+    # First remove the old stream-level logger. After quiesce the external :443
+    # server already has only the RIPH server-level access_log, so this operation
+    # removes remaining legacy bridge logging without changing routing.
     mv "${LEGACY_WATCH}" "${retire_dir}/00-sni-watch.conf"
     if [[ "${RIPH_ROOT}" == "/" ]]; then
         "${NGINX_BIN}" -t
         "${SYSTEMCTL_BIN}" reload nginx
     fi
+
+    # Re-check after the legacy logger is definitely no longer receiving data.
+    # A buffered pre-quiesce line may have been processed just before this point;
+    # if it created a fresh 6h ban, do not retire the jail yet.
+    bans="$(normalized_legacy_bans)"
+    [[ -z "${bans}" ]] || riph_die "legacy jail gained/retained ban(s) after logger shutdown: ${bans}; retirement rolled back"
 
     mv "${LEGACY_JAIL_FILE}" "${retire_dir}/nginx-stream-sni-reject.local"
     if [[ "${RIPH_ROOT}" == "/" ]]; then
@@ -220,7 +251,8 @@ retire_cmd() {
         jail_active "${RIPH_JAIL_2}" || riph_die "RIPH private-abuse jail lost during retirement"
     fi
 
-    trap - ERR
+    RETIRE_COMMITTED=1
+    trap - EXIT
     riph_log "legacy stream watch/jail retired; filter/action files retained for forensic rollback"
     riph_log "retirement backup: ${backup_dir}"
     riph_log "retired active files: ${retire_dir}"
