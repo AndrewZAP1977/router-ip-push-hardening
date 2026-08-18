@@ -52,6 +52,7 @@ fi
 run ls -la /etc/nginx/stream-enabled
 
 for file in \
+    /etc/nginx/stream-enabled/00-sni-watch.conf \
     /etc/nginx/stream-enabled/05-router-ip-push-source-allow.conf \
     /etc/nginx/stream-enabled/06-router-ip-push-fake-site-bridges.conf \
     /etc/nginx/stream-enabled/stream.conf; do
@@ -76,6 +77,25 @@ if [[ -e /usr/local/libexec/router-ip-push-receiver ]]; then
     run stat -c '%A %U:%G %s %n' /usr/local/libexec/router-ip-push-receiver
 fi
 
+section 'Temporary Router IP Push Nginx hotfix'
+if [[ -e /usr/local/sbin/router-ip-push-nginx-hotfix ]]; then
+    run stat -c '%A %U:%G %s %y %n' /usr/local/sbin/router-ip-push-nginx-hotfix
+else
+    printf '/usr/local/sbin/router-ip-push-nginx-hotfix does not exist\n'
+fi
+for unit in \
+    router-ip-push-nginx-hotfix.path \
+    router-ip-push-nginx-hotfix.service \
+    router-ip-push-nginx-hotfix.timer; do
+    printf '%-42s enabled=%-12s active=%s\n' \
+        "${unit}" \
+        "$(systemctl is-enabled "${unit}" 2>/dev/null || true)" \
+        "$(systemctl is-active "${unit}" 2>/dev/null || true)"
+done
+if [[ -d /var/backups/router-ip-push-nginx-hotfix ]]; then
+    run ls -lt /var/backups/router-ip-push-nginx-hotfix
+fi
+
 section 'Existing hardening state'
 if [[ -d /etc/router-ip-push-hardening ]]; then
     run find /etc/router-ip-push-hardening -maxdepth 1 -type f -printf '%M %u:%g %s %p\n'
@@ -96,7 +116,11 @@ section 'Fail2ban'
 if command -v fail2ban-client >/dev/null 2>&1; then
     run systemctl is-active fail2ban
     run fail2ban-client status
-    for jail in nginx-stream-sni-reject nginx-stream-private-sni-abuse; do
+    for jail in \
+        nginx-stream-sni-reject \
+        nginx-stream-private-sni-abuse \
+        riph-nginx-stream-sni-reject \
+        riph-nginx-stream-private-sni-abuse; do
         if fail2ban-client status "${jail}" >/dev/null 2>&1; then
             run fail2ban-client status "${jail}"
         else
@@ -122,13 +146,15 @@ for unit in riph-router-ip.path riph-reconcile.service riph-reconcile.timer riph
         "$(systemctl is-active "${unit}" 2>/dev/null || true)"
 done
 
-section 'Existing stream audit log tail'
-if [[ -f /var/log/nginx/stream-sni.log ]]; then
-    run stat -c 'inode=%i size=%s mtime=%y %n' /var/log/nginx/stream-sni.log
-    tail -n 30 /var/log/nginx/stream-sni.log 2>&1 || true
-else
-    printf '/var/log/nginx/stream-sni.log does not exist\n'
-fi
+section 'Stream audit logs'
+for log in /var/log/nginx/stream-sni.log /var/log/nginx/riph-stream-sni.log; do
+    if [[ -f "${log}" ]]; then
+        run stat -c 'inode=%i size=%s mtime=%y %n' "${log}"
+        tail -n 30 "${log}" 2>&1 || true
+    else
+        printf '%s does not exist\n' "${log}"
+    fi
+done
 
 section 'Preflight complete'
 printf 'No configuration, firewall, service or package changes were requested by this script.\n'
