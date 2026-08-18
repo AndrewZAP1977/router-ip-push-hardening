@@ -21,8 +21,8 @@ Implemented on `agent/core-apply-v1`:
 - dedicated route-aware audit log `/var/log/nginx/riph-stream-sni.log` on external `:443` only;
 - staged legacy audit compatibility so the existing `/var/log/nginx/stream-sni.log` jail can remain active during migration;
 - transactional `riph-apply` with `flock`, backup, `nginx -t`, reload gating and rollback;
-- Router IP change detection via `systemd.path`;
-- 5-minute reconcile for grace expiry and trusted-unban protection;
+- Router IP change detection via `systemd.path` watching `/var/lib/router-ip-push/ips`;
+- 1-minute fallback reconcile for a missed path event, grace expiry and trusted-unban protection;
 - isolated RIPH Fail2ban jails:
   - `riph-nginx-stream-sni-reject`: 3 attempts / 5 minutes / 8 hour ban;
   - `riph-nginx-stream-private-sni-abuse`: 3 attempts / 2 minutes / 12 hour ban;
@@ -56,7 +56,37 @@ v1 must not modify:
 Automatic bans never block all ports. The automatic Fail2ban action affects only
 TCP/443 so Router IP Push over SSH can still report a changed home address.
 
-## Current Hexabyte migration state
+## 2026-08-17 Router-IP incident
+
+A real ISP address change exposed the missing consumer in the old staging setup:
+
+- Router IP Push correctly changed AX3200 from `78.111.155.187` to `78.111.154.96`;
+- the staging Nginx allowlist remained on the old address;
+- the new home address was therefore classified untrusted and `treda` was sent to
+  bridge `9543` / fake site instead of Xray `8443`;
+- manually synchronizing the allowlist and reloading Nginx restored the links.
+
+The exact A -> B transition is now a dedicated regression test. RIPH is required to
+make B trusted on the first reconcile, retain A only as 4-hour grace, and remove A
+after grace expiry.
+
+Until full RIPH ownership is validated, Hexabyte uses a temporary safeguard:
+
+- `router-ip-push-nginx-hotfix.path`;
+- `router-ip-push-nginx-hotfix.timer` with 1-minute fallback;
+- `router-ip-push-nginx-hotfix.service`;
+- `/usr/local/sbin/router-ip-push-nginx-hotfix`.
+
+That temporary writer must not remain active alongside RIPH. `riph-hotfix-handover`
+transfers ownership under the same hotfix lock, disables temporary triggers, runs a
+strict RIPH reconcile, enables the RIPH path/timer, runs a second reconcile to catch
+an IP change occurring during the transition, and verifies the current Router IP is
+present in the generated allowlist. On failure it re-enables the temporary hotfix.
+
+The installer detects an active temporary hotfix. A production apply while it owns
+the allowlist is accepted only as an atomic `--apply --enable-timers` handover.
+
+## Current Hexabyte legacy security migration
 
 Read-only preflight confirmed the manually tested routing topology and also found
 existing legacy security components:
@@ -64,12 +94,12 @@ existing legacy security components:
 - `/etc/nginx/stream-enabled/00-sni-watch.conf`;
 - legacy log `/var/log/nginx/stream-sni.log`;
 - active legacy jail `nginx-stream-sni-reject`;
-- five existing manual UFW 443 denies.
+- existing manual UFW 443 denies.
 
-RIPH v1 deliberately does **not** overwrite those names. During the first controlled
-routing test, the external `:443` server writes both the legacy audit log and the new
-RIPH route-aware log. The legacy jail remains active until the explicit handover
-phase.
+RIPH v1 deliberately does **not** overwrite those names. During the controlled
+routing migration, the external `:443` server writes both the legacy audit log and
+the new RIPH route-aware log. The legacy jail remains active until the explicit
+Fail2ban handover phase.
 
 See `docs/HEXABYTE_LEGACY_MIGRATION.md`.
 
@@ -96,6 +126,13 @@ It performs:
 The tests use temporary `/tmp/riph-*` roots and stub Nginx/systemctl/UFW commands.
 `test-fail2ban-regex.sh` skips locally when `fail2ban-regex` is unavailable.
 
+Important Router-IP regressions include:
+
+- `tests/test-ip-change-incident.sh` — exact 2026-08-17 address transition;
+- `tests/test-systemd-watch.sh` — directory path watch + 1-minute fallback;
+- `tests/test-hotfix-handover.sh` — ownership transfer, rollback, and IP change in
+  the middle of the handover.
+
 ## Main commands after deployment
 
 ```bash
@@ -107,6 +144,7 @@ riph-admin ufw-status
 riph-admin harvest
 riph-admin harvest-checkpoint
 riph-admin backups
+riph-hotfix-handover status
 ```
 
 Interactive administration:
