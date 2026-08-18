@@ -44,7 +44,7 @@ load_ids() (
     RIPH_ROOT="${T}"
     # shellcheck source=../src/usr/local/libexec/riph-common.sh
     source "${COMMON}"
-    riph_load_config /etc/router-ip-push-hardening/config.env
+    riph_load_config "$(riph_root_path /etc/router-ip-push-hardening/config.env)"
     printf '%s\n' "${RIPH_ROUTER_IDS[*]}"
 )
 
