@@ -11,7 +11,7 @@ private source-IP/SNI policy and must remain private.
 
 **[Практическая инструкция РИФ на русском → docs/USER_GUIDE_RU.md](docs/USER_GUIDE_RU.md)**
 
-Там есть краткое объяснение работы, установка/обновление, диагностика и описание **всех 22 пунктов интерактивного меню с примерами**. Большие разделы сворачиваются.
+Там есть краткое объяснение работы, установка/обновление, добавление дополнительных Router IP Push роутеров и описание **всех 22 пунктов интерактивного меню с примерами**. Большие разделы сворачиваются.
 
 ## Status
 
@@ -31,8 +31,9 @@ Production ownership is RIPH:
   applied-state row.
 
 Dynamic home/router addresses are intentionally **not** permanent static trust.
-They are consumed from Router IP Push only for router IDs explicitly listed in
-`ROUTER_IDS`.
+RIPH automatically discovers additional routers that have a valid Router IP Push
+registration under `/etc/router-ip-push/routers.d/` and have sent at least one
+current IPv4 update. A stray `.ipv4` file without a valid registration is not enough.
 
 GitHub Actions is intentionally manual-only (`workflow_dispatch`) and was not run
 during the production validation.
@@ -42,6 +43,8 @@ during the production validation.
 v1 includes:
 
 - Router IP Push current IPv4 as a trusted source;
+- automatic discovery of validly registered Router IP Push routers after their first update;
+- optional explicit Router IP IDs for compatibility/special cases;
 - static trusted IPv4/CIDR entries;
 - configurable previous-IP grace (4 hours by default);
 - generated Nginx `geo $router_ip_push_source_allowed`;
@@ -130,10 +133,10 @@ Completed on 2026-08-18:
 12. repeated automatic `riph-reconcile.service` runs accepted the physical
     ownership state with `manual_conflicts=0`.
 
-At validation time SmartBox-mother was temporarily represented by a known source IP.
-That address is dynamic and is no longer part of the permanent static-trust example;
-future SmartBox-mother trust should come from Router IP Push after its router ID is
-explicitly configured in RIPH.
+At validation time SmartBox-mother was temporarily represented by a known provider
+source IP. That address is dynamic and has been removed from permanent static trust.
+Future SmartBox-mother trust comes from its normal Router IP Push registration and
+first update, after which RIPH discovers it automatically.
 
 Permanent static trusted examples are localhost, VPS_GR `5.61.39.137/32`, Spectra
 `45.87.41.121/32` and Hexabyte `194.104.94.182/32`.
@@ -159,6 +162,7 @@ The tests use temporary `/tmp/riph-*` roots and stub Nginx/systemctl/UFW command
 Important regressions include:
 
 - `tests/test-ip-change-incident.sh` — exact 2026-08-17 address transition;
+- `tests/test-router-auto-discovery.sh` — registered-router trust discovery and rejection of stray/unregistered state;
 - `tests/test-systemd-watch.sh` — directory path watch + 1-minute fallback;
 - `tests/test-hotfix-handover.sh` — ownership transfer, rollback, and IP change in
   the middle of handover;
@@ -205,8 +209,10 @@ The Nginx allowlist is generated and must not be edited manually. Effective trus
 sources are derived from:
 
 1. `/etc/router-ip-push-hardening/trusted-static.list`;
-2. `/var/lib/router-ip-push/ips/<ROUTER_ID>.ipv4` for IDs configured in `ROUTER_IDS`;
-3. non-expired entries in `/etc/router-ip-push-hardening/previous-ip-grace.json`.
+2. explicit Router IP IDs (if configured) plus valid registrations from
+   `/etc/router-ip-push/routers.d/<router_id>.json` that have a current Router IP Push IPv4;
+3. `/var/lib/router-ip-push/ips/<router_id>.ipv4` / Router IP Push state for those effective IDs;
+4. non-expired entries in `/etc/router-ip-push-hardening/previous-ip-grace.json`.
 
 Manual-deny ownership is derived from the configured source lists plus the
 project-owned applied-state file, but state is trusted only when the corresponding
