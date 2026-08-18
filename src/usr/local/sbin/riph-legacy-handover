@@ -24,8 +24,8 @@ Usage: riph-legacy-handover [options] [status|quiesce|retire]
 status   Show overlap state. Read-only.
 quiesce  Stop feeding new external :443 events to the legacy stream log while
          leaving the legacy jail/config active so existing 6h bans expire naturally.
-retire   Remove legacy 00-sni-watch.conf, legacy jail config and the temporary
-         RIPH legacy-trusted ignore override from active include paths. Refuses until
+retire   Remove legacy 00-sni-watch.conf, legacy jail config, dynamic trusted-ignore
+         override and the temporary RIPH-owned trusted UFW shield. Refuses until
          both RIPH jails are active and the legacy ban list is empty.
 
 Options:
@@ -79,6 +79,7 @@ STREAM_FILE="$(riph_root_path "${STREAM_OUTPUT:-/etc/nginx/stream-enabled/stream
 BACKUP_ROOT="$(riph_root_path "${RIPH_STATE_DIR}/backups")"
 RETIRE_ROOT="$(riph_root_path "${RIPH_STATE_DIR}/runtime/legacy-retired")"
 APPLY_BIN="${RIPH_APPLY_BIN:-${SCRIPT_DIR}/riph-apply}"
+GUARD_BIN="${RIPH_GUARD_BIN:-${SCRIPT_DIR}/riph-trusted-unban-guard}"
 F2B_BIN="${RIPH_FAIL2BAN_CLIENT_BIN:-fail2ban-client}"
 NGINX_BIN="${RIPH_NGINX_BIN:-nginx}"
 SYSTEMCTL_BIN="${RIPH_SYSTEMCTL_BIN:-systemctl}"
@@ -191,13 +192,15 @@ retire_cmd() {
     [[ -f "${LEGACY_JAIL_FILE}" ]] || riph_die "legacy jail file already absent"
     jail_active "${LEGACY_JAIL}" || riph_die "legacy jail is not active; inspect state before retirement"
     require_legacy_protected
+    [[ -x "${GUARD_BIN}" || -f "${GUARD_BIN}" ]] \
+        || riph_die "trusted guard not found for legacy shield retirement: ${GUARD_BIN}"
 
     bans="$(normalized_legacy_bans)"
     [[ -z "${bans}" ]] || riph_die "legacy jail still has banned IP(s): ${bans}; retirement refused"
 
     if (( DRY_RUN == 1 )); then
         riph_log "dry-run: would archive 00-sni-watch.conf, legacy jail .local and RIPH legacy-ignore override"
-        riph_log "dry-run: would validate/reload Nginx and reload Fail2ban; legacy filter/action files stay installed"
+        riph_log "dry-run: would validate/reload Nginx, reload Fail2ban, then remove only RIPH-owned legacy trusted UFW shields"
         return 0
     fi
 
@@ -213,6 +216,7 @@ retire_cmd() {
 
     RETIRE_STARTED=0
     RETIRE_COMMITTED=0
+    SHIELD_REMOVAL_STARTED=0
     rollback_retire_on_exit() {
         local rc=$?
         trap - EXIT
@@ -234,6 +238,14 @@ retire_cmd() {
                 fi
                 if "${F2B_BIN}" -t >/dev/null 2>&1; then
                     "${F2B_BIN}" reload >/dev/null 2>&1 || true
+                fi
+            fi
+
+            # If shield cleanup had begun, recreate/synchronize only project-owned
+            # current-IP shields after the legacy coexistence files are restored.
+            if (( SHIELD_REMOVAL_STARTED == 1 )); then
+                if ! bash "${GUARD_BIN}" --root "${RIPH_ROOT}" --config "${CONFIG_PATH}" >/dev/null 2>&1; then
+                    riph_log "WARNING: legacy files restored but trusted UFW shield resync failed"
                 fi
             fi
         fi
@@ -267,9 +279,15 @@ retire_cmd() {
         jail_active "${RIPH_JAIL_2}" || riph_die "RIPH private-abuse jail lost during retirement"
     fi
 
+    # Only after the legacy jail is no longer active is it safe to remove the
+    # project-owned ALLOW shield that protected a newly recycled ISP IP from an
+    # old ambiguous legacy DENY. Never delete the legacy DENY itself here.
+    SHIELD_REMOVAL_STARTED=1
+    bash "${GUARD_BIN}" --root "${RIPH_ROOT}" --config "${CONFIG_PATH}" --legacy-shield-remove-all
+
     RETIRE_COMMITTED=1
     trap - EXIT
-    riph_log "legacy stream watch/jail/trusted-ignore override retired; filter/action files retained for forensic rollback"
+    riph_log "legacy stream watch/jail/trusted-ignore/shield retired; filter/action files retained for forensic rollback"
     riph_log "retirement backup: ${backup_dir}"
     riph_log "retired active files: ${retire_dir}"
 }
