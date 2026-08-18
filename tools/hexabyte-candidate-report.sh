@@ -232,7 +232,11 @@ awk -v include_path="${TMP}/stream-enabled/*.conf" '
     }
     {print}
 ' /etc/nginx/nginx.conf >"${TMP}/nginx.conf"
-nginx -t -q -e stderr -p /etc/nginx -c "${TMP}/nginx.conf"
+# Keep Nginx's compiled/default prefix exactly as production nginx -t does.
+# Overriding -p here changes the base for relative load_module paths on Debian
+# (for example modules/ngx_http_auth_pam_module.so) and can produce a false
+# candidate failure even while the real production configuration validates.
+nginx -t -q -e stderr -c "${TMP}/nginx.conf"
 printf 'PASS: temporary candidate passes nginx -t\n'
 
 section 'Fail2ban regex compatibility on this Debian host'
