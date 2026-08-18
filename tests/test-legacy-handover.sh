@@ -24,6 +24,11 @@ make_case() {
     printf '%s\n' 'STREAM_SENTINEL' >"${t}/etc/nginx/stream-enabled/stream.conf"
     printf '%s\n' 'LEGACY_WATCH' >"${t}/etc/nginx/stream-enabled/00-sni-watch.conf"
     printf '%s\n' '[nginx-stream-sni-reject]' >"${t}/etc/fail2ban/jail.d/nginx-stream-sni-reject.local"
+    cat >"${t}/etc/fail2ban/jail.d/zz-riph-legacy-trusted-ignore.local" <<'EOF_OVERRIDE'
+# Managed by router-ip-push-hardening during legacy coexistence.
+[nginx-stream-sni-reject]
+ignorecommand = /usr/local/sbin/riph-fail2ban-ignore <ip>
+EOF_OVERRIDE
 
     cat >"${t}/usr/local/bin/apply-stub" <<'EOF_APPLY'
 #!/usr/bin/env bash
@@ -69,6 +74,8 @@ grep -Fx 'LEGACY_STREAM_AUDIT_COMPAT=0' "${CASE_NORMAL}/etc/router-ip-push-harde
     || fail 'quiesce retired watch too early'
 [[ -f "${CASE_NORMAL}/etc/fail2ban/jail.d/nginx-stream-sni-reject.local" ]] \
     || fail 'quiesce retired jail too early'
+[[ -f "${CASE_NORMAL}/etc/fail2ban/jail.d/zz-riph-legacy-trusted-ignore.local" ]] \
+    || fail 'quiesce retired trusted-ignore protection too early'
 
 if "${HANDOVER}" --root "${CASE_NORMAL}" retire >/dev/null 2>&1; then
     fail 'retirement succeeded with legacy bans present'
@@ -82,14 +89,18 @@ fi
     || fail 'watch file not retired'
 [[ ! -e "${CASE_NORMAL}/etc/fail2ban/jail.d/nginx-stream-sni-reject.local" ]] \
     || fail 'legacy jail file not retired'
+[[ ! -e "${CASE_NORMAL}/etc/fail2ban/jail.d/zz-riph-legacy-trusted-ignore.local" ]] \
+    || fail 'legacy trusted-ignore override not retired'
 find "${CASE_NORMAL}/var/lib/router-ip-push-hardening/runtime/legacy-retired" -type f -name '00-sni-watch.conf' | grep -q . \
     || fail 'retired watch archive missing'
 find "${CASE_NORMAL}/var/lib/router-ip-push-hardening/runtime/legacy-retired" -type f -name 'nginx-stream-sni-reject.local' | grep -q . \
     || fail 'retired jail archive missing'
+find "${CASE_NORMAL}/var/lib/router-ip-push-hardening/runtime/legacy-retired" -type f -name 'zz-riph-legacy-trusted-ignore.local' | grep -q . \
+    || fail 'retired legacy trusted-ignore override archive missing'
 
 # Simulate a buffered pre-quiesce reject being processed after the initial empty
 # ban check but before the legacy jail file is retired. The second ban check must
-# abort and the EXIT transaction must put 00-sni-watch.conf back in place.
+# abort and the EXIT transaction must restore every legacy coexistence file.
 CASE_LATE="${BASE}/late-ban"
 make_case "${CASE_LATE}"
 sed -i 's/^LEGACY_STREAM_AUDIT_COMPAT=1$/LEGACY_STREAM_AUDIT_COMPAT=0/' \
@@ -132,6 +143,8 @@ fi
     || fail 'late-ban rollback did not restore legacy watch'
 [[ -f "${CASE_LATE}/etc/fail2ban/jail.d/nginx-stream-sni-reject.local" ]] \
     || fail 'late-ban rollback changed legacy jail file'
+[[ -f "${CASE_LATE}/etc/fail2ban/jail.d/zz-riph-legacy-trusted-ignore.local" ]] \
+    || fail 'late-ban rollback lost legacy trusted-ignore protection'
 grep -Fx 'STREAM_SENTINEL' "${CASE_LATE}/etc/nginx/stream-enabled/stream.conf" >/dev/null \
     || fail 'late-ban rollback did not restore stream config'
 
