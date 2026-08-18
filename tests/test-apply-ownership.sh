@@ -41,4 +41,23 @@ grep -Fq 'temporary Router IP Push Nginx hotfix still owns the allowlist' "${OUT
 [[ ! -e "${T}/var/lib/router-ip-push-hardening" ]] \
     || fail 'ownership guard ran too late; RIPH state directory was already created'
 
-echo 'PASS: apply temporary-hotfix ownership gate'
+# The same ownership state must not block read-only candidate generation. Build a
+# complete test-root input and verify --dry-run reaches the candidate diff path.
+mkdir -p "${T}/var/lib/router-ip-push/ips"
+cp "${ROOT}/config/trusted-static.list.example" "${T}/etc/router-ip-push-hardening/trusted-static.list"
+cp "${ROOT}/config/previous-ip-grace.json.example" "${T}/etc/router-ip-push-hardening/previous-ip-grace.json"
+printf '%s\n' '78.111.154.96' >"${T}/var/lib/router-ip-push/ips/AX3200.ipv4"
+
+DRY_OUT="${T}/dry-run.txt"
+bash "${APPLY}" --root "${T}" --dry-run --reason 'ownership-safe candidate' >"${DRY_OUT}" 2>&1
+grep -Fq 'dry-run:' "${DRY_OUT}" || fail 'dry-run did not reach candidate reporting'
+grep -Fq '78.111.154.96/32' "${DRY_OUT}" || fail 'dry-run candidate lost current Router IP'
+
+# Dry-run may create private test-root runtime scratch/state directories, but it
+# must not install the generated Nginx targets.
+[[ ! -e "${T}/etc/nginx/stream-enabled/05-router-ip-push-source-allow.conf" ]] \
+    || fail 'dry-run unexpectedly installed allowlist'
+[[ ! -e "${T}/etc/nginx/stream-enabled/stream.conf" ]] \
+    || fail 'dry-run unexpectedly installed stream config'
+
+echo 'PASS: apply temporary-hotfix ownership gate and dry-run exception'
