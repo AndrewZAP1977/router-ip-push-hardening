@@ -16,6 +16,7 @@ make_case() {
     mkdir -p \
         "${t}/etc/router-ip-push-hardening" \
         "${t}/etc/fail2ban/jail.d" \
+        "${t}/etc/fail2ban/filter.d" \
         "${t}/var/lib/router-ip-push/ips" \
         "${t}/var/log/nginx" \
         "${t}/usr/local/bin"
@@ -28,6 +29,8 @@ make_case() {
     : >"${t}/var/log/nginx/riph-stream-sni.log"
     cp "${ROOT}/src/etc/fail2ban/jail.d/riph-nginx-stream-sni-reject.local" "${t}/etc/fail2ban/jail.d/"
     cp "${ROOT}/src/etc/fail2ban/jail.d/riph-nginx-stream-private-sni-abuse.local" "${t}/etc/fail2ban/jail.d/"
+    cp "${ROOT}/src/etc/fail2ban/filter.d/riph-nginx-stream-sni-reject.conf" "${t}/etc/fail2ban/filter.d/"
+    cp "${ROOT}/src/etc/fail2ban/filter.d/riph-nginx-stream-private-sni-abuse.conf" "${t}/etc/fail2ban/filter.d/"
 
     cat >"${t}/usr/local/bin/f2b-stub" <<EOF_STUB
 #!/usr/bin/env bash
