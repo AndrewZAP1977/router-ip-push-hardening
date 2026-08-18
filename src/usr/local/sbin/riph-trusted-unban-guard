@@ -146,6 +146,7 @@ legacy_shield_current_ips() {
 
 legacy_shield_mutate() {
     local mode="$1" row number source current_ip
+    local current_output owned_output after_output
     local -a current_ips=() owned=() delete_numbers=()
     local -A desired=() kept=() present=()
 
@@ -155,13 +156,24 @@ legacy_shield_mutate() {
     flock -w 15 8 || riph_die "timed out waiting for RIPH UFW lock"
 
     if [[ "${mode}" == sync ]]; then
-        mapfile -t current_ips < <(legacy_shield_current_ips)
+        if ! current_output="$(legacy_shield_current_ips)"; then
+            riph_die "failed to read current Router IPs for legacy trusted shield"
+        fi
+        if [[ -n "${current_output}" ]]; then
+            mapfile -t current_ips <<<"${current_output}"
+        fi
         for current_ip in "${current_ips[@]}"; do
             desired["${current_ip}"]=1
         done
     fi
 
-    mapfile -t owned < <(legacy_shield_rules)
+    if ! owned_output="$(legacy_shield_rules)"; then
+        riph_die "failed to inspect UFW numbered rules for legacy trusted shield"
+    fi
+    if [[ -n "${owned_output}" ]]; then
+        mapfile -t owned <<<"${owned_output}"
+    fi
+
     for row in "${owned[@]}"; do
         [[ -n "${row}" ]] || continue
         number="${row%%$'\t'*}"
@@ -186,6 +198,8 @@ legacy_shield_mutate() {
     fi
 
     if [[ "${mode}" == remove-all ]]; then
+        flock -u 8
+        exec 8>&-
         riph_log "legacy trusted shield remove-all complete"
         return 0
     fi
@@ -194,10 +208,15 @@ legacy_shield_mutate() {
     # current-IP shields. Prepend is deliberate: the old unmarked legacy DENY may
     # already exist and must remain untouched until its own 6h expiry.
     if (( DRY_RUN == 0 )); then
-        while IFS=$'\t' read -r _number source; do
-            [[ -n "${source}" ]] || continue
-            present["${source}"]=1
-        done < <(legacy_shield_rules)
+        if ! after_output="$(legacy_shield_rules)"; then
+            riph_die "failed to re-read UFW numbered rules after legacy shield cleanup"
+        fi
+        if [[ -n "${after_output}" ]]; then
+            while IFS=$'\t' read -r _number source; do
+                [[ -n "${source}" ]] || continue
+                present["${source}"]=1
+            done <<<"${after_output}"
+        fi
     else
         for source in "${!kept[@]}"; do
             present["${source}"]=1
@@ -212,6 +231,11 @@ legacy_shield_mutate() {
             LC_ALL=C "${UFW_BIN}" prepend allow proto tcp from "${current_ip}" to any port 443 comment "${LEGACY_SHIELD_MARKER}"
         fi
     done
+
+    # Do not carry the shared UFW lock into Fail2ban unban calls below. A project
+    # Fail2ban action may invoke riph-fail2ban-ufw, which takes this same lock.
+    flock -u 8
+    exec 8>&-
 
     riph_log "legacy trusted shield synchronized for ${#current_ips[@]} current Router IP(s)"
 }
