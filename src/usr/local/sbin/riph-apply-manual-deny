@@ -104,6 +104,11 @@ mkdir -p "$(dirname "${UFW_LOCK_FILE}")"
 exec 8>"${UFW_LOCK_FILE}"
 flock -w 15 8 || riph_die "timed out waiting for RIPH UFW lock"
 
+UFW_BIN="${RIPH_UFW_BIN:-ufw}"
+if ! command -v "${UFW_BIN}" >/dev/null 2>&1 && [[ ! -x "${UFW_BIN}" ]]; then
+    riph_die "ufw executable not found: ${UFW_BIN}"
+fi
+
 NOW_EPOCH="$(riph_now_epoch)"
 STATIC_FILE="$(riph_root_path "${RIPH_CONFIG_DIR}/trusted-static.list")"
 GRACE_FILE="$(riph_root_path "${RIPH_CONFIG_DIR}/previous-ip-grace.json")"
@@ -178,6 +183,38 @@ validate_state_file() {
 }
 validate_state_file "${OLD_STATE}"
 
+ufw_owned_rule_present() {
+    local scope="$1" cidr="$2" marker source line status
+    marker="riph-manual-${scope}"
+    source="${cidr}"
+    [[ "${source}" == */32 ]] && source="${source%/32}"
+
+    if ! status="$(LC_ALL=C "${UFW_BIN}" status numbered 2>/dev/null)"; then
+        riph_die "failed to inspect UFW numbered rules; refusing to trust manual-deny ownership state"
+    fi
+
+    while IFS= read -r line; do
+        [[ " ${line} " == *" ${source} "* || " ${line} " == *" ${cidr} "* ]] || continue
+        [[ "${line}" == *"# ${marker}"* ]] || continue
+        [[ "${line}" =~ [[:space:]]DENY[[:space:]]+IN[[:space:]] ]] || continue
+        if [[ "${scope}" == 443 ]]; then
+            [[ "${line}" =~ [[:space:]]443/tcp([[:space:]]|$) ]] || continue
+        fi
+        return 0
+    done <<<"${status}"
+    return 1
+}
+
+# The state file is an ownership claim, not merely desired configuration. Refuse
+# to trust it unless every recorded row has a physically visible project marker.
+# This catches UFW's successful duplicate no-op behavior where it can print
+# "Skipping adding existing rule" while leaving an older unmarked rule intact.
+while IFS=$'\t' read -r scope cidr; do
+    [[ -n "${scope:-}" ]] || continue
+    ufw_owned_rule_present "${scope}" "${cidr}" \
+        || riph_die "manual-deny ownership drift: state claims ${scope} ${cidr}, but no matching RIPH-marked UFW rule exists"
+done <"${OLD_STATE}"
+
 REMOVALS="${RUNTIME_DIR}/manual-deny-remove.$$.tsv"
 ADDITIONS="${RUNTIME_DIR}/manual-deny-add.$$.tsv"
 trap 'rm -f "${TRUSTED_ENTRIES}" "${DESIRED}" "${OLD_STATE}" "${REMOVALS}" "${ADDITIONS}"' EXIT
@@ -194,7 +231,7 @@ while IFS= read -r row; do
 done <"${DESIRED}"
 
 if [[ ! -s "${REMOVALS}" && ! -s "${ADDITIONS}" ]]; then
-    riph_log "manual deny state already matches desired lists"
+    riph_log "manual deny state already matches desired lists and owned UFW rules"
     exit 0
 fi
 
@@ -212,19 +249,30 @@ if (( DRY_RUN == 1 )); then
     exit 0
 fi
 
-UFW_BIN="${RIPH_UFW_BIN:-ufw}"
-if ! command -v "${UFW_BIN}" >/dev/null 2>&1 && [[ ! -x "${UFW_BIN}" ]]; then
-    riph_die "ufw executable not found: ${UFW_BIN}"
-fi
-
 ufw_add() {
-    local scope="$1" cidr="$2"
+    local scope="$1" cidr="$2" output
     if [[ "${scope}" == "443" ]]; then
-        LC_ALL=C "${UFW_BIN}" prepend deny proto tcp from "${cidr}" to any port 443 \
-            comment riph-manual-443
+        if ! output="$(LC_ALL=C "${UFW_BIN}" prepend deny proto tcp from "${cidr}" to any port 443 \
+            comment riph-manual-443 2>&1)"; then
+            printf '%s\n' "${output}" >&2
+            return 1
+        fi
     else
-        LC_ALL=C "${UFW_BIN}" prepend deny from "${cidr}" comment riph-manual-all
+        if ! output="$(LC_ALL=C "${UFW_BIN}" prepend deny from "${cidr}" comment riph-manual-all 2>&1)"; then
+            printf '%s\n' "${output}" >&2
+            return 1
+        fi
     fi
+
+    if [[ "${output}" == *"Skipping adding existing rule"* ]]; then
+        printf '%s\n' "${output}" >&2
+        return 1
+    fi
+
+    ufw_owned_rule_present "${scope}" "${cidr}" || {
+        printf 'UFW add returned success but RIPH-owned rule is not visible: %s %s\n' "${scope}" "${cidr}" >&2
+        return 1
+    }
 }
 
 ufw_delete() {
@@ -234,6 +282,11 @@ ufw_delete() {
             comment riph-manual-443
     else
         LC_ALL=C "${UFW_BIN}" --force delete deny from "${cidr}" comment riph-manual-all
+    fi
+
+    if ufw_owned_rule_present "${scope}" "${cidr}"; then
+        printf 'UFW delete returned success but RIPH-owned rule is still visible: %s %s\n' "${scope}" "${cidr}" >&2
+        return 1
     fi
 }
 
