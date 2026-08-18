@@ -21,7 +21,7 @@ usage() {
 Usage: riph-fail2ban-activate [options]
 
 Safely enables only the two RIPH Fail2ban jails. The legacy Hexabyte
-nginx-stream-sni-reject jail is deliberately left active and untouched.
+nginx-stream-sni-reject jail is deliberately left active during coexistence.
 
 Options:
   --root DIR       Test root prefix.
@@ -32,6 +32,10 @@ Options:
 Production activation is refused until RIPH owns the allowlist, its path/timer are
 active, the current Router IP is in the active allowlist and the installed filters
 pass a local fail2ban-regex compatibility check.
+
+While the legacy jail remains active, activation also installs a late jail.d/*.local
+override that gives the legacy jail the same dynamic trusted-source ignorecommand.
+Existing legacy bans are never force-unbanned by this helper.
 USAGE
 }
 
@@ -67,6 +71,7 @@ riph_prepare_dirs
 
 JAIL_REJECT="$(riph_root_path /etc/fail2ban/jail.d/riph-nginx-stream-sni-reject.local)"
 JAIL_PRIVATE="$(riph_root_path /etc/fail2ban/jail.d/riph-nginx-stream-private-sni-abuse.local)"
+LEGACY_IGNORE_OVERRIDE="$(riph_root_path /etc/fail2ban/jail.d/zz-riph-legacy-trusted-ignore.local)"
 FILTER_REJECT="$(riph_root_path /etc/fail2ban/filter.d/riph-nginx-stream-sni-reject.conf)"
 FILTER_PRIVATE="$(riph_root_path /etc/fail2ban/filter.d/riph-nginx-stream-private-sni-abuse.conf)"
 AUDIT_LOG="$(riph_root_path "${STREAM_AUDIT_LOG:-/var/log/nginx/riph-stream-sni.log}")"
@@ -161,8 +166,14 @@ validate_installed_filters() {
 2026-08-17T14:00:03+00:00 src=198.51.100.7 route=www sni=nukla.layerupzap.ru upstream=127.0.0.1:7443 status=200 session=0.300
 EOF_LOG
 
-    reject_out="$("${F2B_REGEX_BIN}" "${t}/sample.log" "${FILTER_REJECT}" --usedns=no -o ip | sort -u)"
-    private_out="$("${F2B_REGEX_BIN}" "${t}/sample.log" "${FILTER_PRIVATE}" --usedns=no -o ip | sort -u)"
+    if ! reject_out="$("${F2B_REGEX_BIN}" "${t}/sample.log" "${FILTER_REJECT}" --usedns=no -o ip | sort -u)"; then
+        rm -rf "${t}"
+        riph_die "installed reject filter could not be evaluated"
+    fi
+    if ! private_out="$("${F2B_REGEX_BIN}" "${t}/sample.log" "${FILTER_PRIVATE}" --usedns=no -o ip | sort -u)"; then
+        rm -rf "${t}"
+        riph_die "installed private-abuse filter could not be evaluated"
+    fi
     rm -rf "${t}"
 
     [[ "${reject_out}" == '203.0.113.10' ]] \
@@ -209,13 +220,29 @@ if jail_active "${LEGACY_JAIL}"; then
 fi
 LEGACY_BEFORE="$(legacy_bans | tr '\n' ' ' | xargs 2>/dev/null || true)"
 
+# Never use the legacy generic actionunban to repair a trusted-source collision:
+# its UFW deletion is unmarked/ambiguous. If a current Router IP is already in the
+# legacy ban list, stop before mutation and inspect that rule separately.
+if (( LEGACY_ACTIVE_BEFORE == 1 )) && [[ -n "${LEGACY_BEFORE}" ]]; then
+    for router_id in "${RIPH_ROUTER_IDS[@]}"; do
+        if current_ip="$(riph_current_router_ip "${router_id}" 2>/dev/null)"; then
+            for banned_ip in ${LEGACY_BEFORE}; do
+                if [[ "${banned_ip}" == "${current_ip}" ]]; then
+                    riph_die "current ${router_id} IP ${current_ip} is already banned by legacy ${LEGACY_JAIL}; automatic unban refused"
+                fi
+            done
+        fi
+    done
+fi
+
 if (( DRY_RUN == 1 )); then
     riph_log "dry-run: would enable ${RIPH_JAIL_REJECT}"
     riph_log "dry-run: would enable ${RIPH_JAIL_PRIVATE}"
     if (( LEGACY_ACTIVE_BEFORE == 1 )); then
+        riph_log "dry-run: would add dynamic trusted ignorecommand override to ${LEGACY_JAIL}"
         riph_log "legacy jail would remain active; current bans: ${LEGACY_BEFORE:-none}"
     else
-        riph_log "legacy jail is currently inactive; RIPH activation will not create/modify it"
+        riph_log "legacy jail is currently inactive; no legacy ignore override would be added"
     fi
     exit 0
 fi
@@ -223,6 +250,11 @@ fi
 mkdir -p "${BACKUP_DIR}"
 cp -a "${JAIL_REJECT}" "${BACKUP_DIR}/"
 cp -a "${JAIL_PRIVATE}" "${BACKUP_DIR}/"
+if [[ -e "${LEGACY_IGNORE_OVERRIDE}" ]]; then
+    cp -a "${LEGACY_IGNORE_OVERRIDE}" "${BACKUP_DIR}/zz-riph-legacy-trusted-ignore.local"
+else
+    : >"${BACKUP_DIR}/zz-riph-legacy-trusted-ignore.local.absent"
+fi
 
 set_enabled_true() {
     local file="$1" tmp
@@ -237,9 +269,27 @@ set_enabled_true() {
     rm -f "${tmp}"
 }
 
-restore_jails() {
+write_legacy_ignore_override() {
+    local tmp
+    tmp="${LEGACY_IGNORE_OVERRIDE}.riph-activate.$$"
+    cat >"${tmp}" <<'EOF_OVERRIDE'
+# Managed by router-ip-push-hardening during legacy coexistence.
+# Keep the legacy reject jail from banning current/static/grace trusted sources.
+[nginx-stream-sni-reject]
+ignorecommand = /usr/local/sbin/riph-fail2ban-ignore <ip>
+EOF_OVERRIDE
+    install -m 0644 "${tmp}" "${LEGACY_IGNORE_OVERRIDE}"
+    rm -f "${tmp}"
+}
+
+restore_activation_files() {
     cp -a "${BACKUP_DIR}/$(basename "${JAIL_REJECT}")" "${JAIL_REJECT}" || true
     cp -a "${BACKUP_DIR}/$(basename "${JAIL_PRIVATE}")" "${JAIL_PRIVATE}" || true
+    if [[ -f "${BACKUP_DIR}/zz-riph-legacy-trusted-ignore.local.absent" ]]; then
+        rm -f "${LEGACY_IGNORE_OVERRIDE}"
+    else
+        cp -a "${BACKUP_DIR}/zz-riph-legacy-trusted-ignore.local" "${LEGACY_IGNORE_OVERRIDE}" || true
+    fi
 }
 
 ACTIVATION_STARTED=0
@@ -249,8 +299,8 @@ restore_on_exit() {
     trap - EXIT
 
     if (( ACTIVATION_STARTED == 1 && ACTIVATION_COMMITTED == 0 )); then
-        riph_log "activation failed; restoring pre-activation RIPH jail files"
-        restore_jails
+        riph_log "activation failed; restoring pre-activation RIPH/legacy override files"
+        restore_activation_files
         if [[ "${RIPH_ROOT}" == "/" ]]; then
             if "${F2B_BIN}" -t >/dev/null 2>&1; then
                 "${F2B_BIN}" reload >/dev/null 2>&1 || true
@@ -264,6 +314,9 @@ ACTIVATION_STARTED=1
 
 set_enabled_true "${JAIL_REJECT}"
 set_enabled_true "${JAIL_PRIVATE}"
+if (( LEGACY_ACTIVE_BEFORE == 1 )); then
+    write_legacy_ignore_override
+fi
 
 if [[ "${RIPH_ROOT}" == "/" ]]; then
     "${F2B_BIN}" -t
@@ -289,5 +342,5 @@ fi
 
 ACTIVATION_COMMITTED=1
 trap - EXIT
-riph_log "RIPH Fail2ban jails activated; legacy jail state left under legacy ownership"
+riph_log "RIPH Fail2ban jails activated; legacy jail remains active under dynamic trusted ignore protection"
 riph_log "activation backup: ${BACKUP_DIR}"
