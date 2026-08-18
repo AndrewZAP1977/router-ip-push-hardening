@@ -1,177 +1,218 @@
 # РИФ — практическая инструкция
 
 > **РИФ = Router IP Push Hardening (RIPH).**  
-> Эта страница — не описание внутренностей проекта, а инструкция для обычного использования.
+> Это пользовательская инструкция. Внутренняя архитектура и история миграции лежат в других документах.
 
 ## РИФ за 30 секунд
 
-РИФ стоит на VPS между внешним интернетом и приватными Xray/SNI-маршрутами.
-
-Главная идея:
+РИФ стоит на VPS перед приватными Xray/SNI-маршрутами и решает две основные задачи:
 
 ```text
-Router IP Push сообщает текущий внешний IP роутера
+Router IP Push сообщает VPS текущий внешний IP роутера
                     ↓
-РИФ считает этот IP доверенным
+РИФ автоматически считает IP зарегистрированного роутера доверенным
                     ↓
-приватный SNI с доверенного IP → Xray
-приватный SNI с чужого IP       → fake/reject
+private SNI + trusted IP   → Xray
+private SNI + чужой IP     → fake site
+неизвестный/пустой SNI     → reject
                     ↓
-Fail2ban может временно заблокировать сканеры только на TCP/443
+Fail2ban может временно банить сканеры на TCP/443
 ```
 
-Если внешний IP настроенного роутера изменился, Router IP Push обновляет его на VPS, а РИФ автоматически перестраивает allowlist. Предыдущий IP по умолчанию остаётся доверенным ещё 4 часа — это страховка от гонок и задержек.
+Если провайдер поменял внешний IP роутера, Router IP Push обновляет его на VPS, а РИФ сам перестраивает allowlist. Предыдущий IP по умолчанию остаётся доверенным ещё 4 часа, чтобы смена адреса не оборвала рабочее соединение из-за гонки или задержки.
 
-**Важно:** Router IP Push и РИФ — два отдельных проекта. Сам факт регистрации нового роутера в Router IP Push ещё не делает его доверенным в РИФ. Его `router_id` должен быть один раз добавлен в `ROUTER_IDS` в `/etc/router-ip-push-hardening/config.env`. После этого его IP уже меняется полностью автоматически.
+## Самое важное про несколько роутеров
+
+**Дополнительного разрешения в РИФ после регистрации Router IP Push не требуется.**
+
+Нормальная последовательность такая:
+
+```text
+1. Ставим Router IP Push на роутер.
+2. Регистрируем/синхронизируем этот роутер с нужным VPS по инструкции Router IP Push.
+3. Роутер делает первый update и VPS получает его текущий внешний IPv4.
+4. РИФ видит валидную регистрацию Router IP Push и автоматически добавляет этот роутер в trusted allowlist.
+5. Все дальнейшие смены IP обрабатываются автоматически.
+```
+
+Для второго, третьего, пятого роутера повторяются только пункты **1–3**. В конфиг РИФ вручную лезть не нужно.
+
+РИФ не доверяет случайному файлу `*.ipv4`. Для автоматического добавления одновременно нужны:
+
+- валидная регистрация `/etc/router-ip-push/routers.d/<router_id>.json`, созданная серверной регистрацией Router IP Push;
+- первый успешный Router IP Push `update`, после которого появился текущий IPv4.
+
+Поэтому регистрация Router IP Push на VPS является самим актом разрешения этому роутеру пользоваться приватными маршрутами РИФ.
 
 ---
 
 ## Что РИФ делает сам
 
-В нормальной работе ничего нажимать не нужно:
+В нормальной работе ничего нажимать не нужно. РИФ:
 
-- следит за изменениями `/var/lib/router-ip-push/ips/`;
-- запускает reconcile при изменении Router IP Push;
-- раз в минуту делает страховочный reconcile;
-- обновляет Nginx allowlist;
-- проверяет `nginx -t` перед принятием конфигурации;
+- отслеживает изменения `/var/lib/router-ip-push/ips/`;
+- автоматически подхватывает зарегистрированные Router IP Push роутеры после первого update;
+- запускает reconcile при изменении IP;
+- дополнительно запускает страховочный reconcile примерно раз в минуту;
+- создаёт trusted allowlist для Nginx;
+- проверяет `nginx -t` до принятия новой конфигурации;
 - хранит предыдущий IP в grace-периоде;
-- следит, чтобы доверенный IP не оказался под RIPH Fail2ban/manual deny;
-- ведёт отдельный журнал `/var/log/nginx/riph-stream-sni.log`;
-- применяет только свои UFW-правила и проверяет их ownership.
+- не даёт RIPH Fail2ban/manual deny конфликтовать с trusted set;
+- ведёт `/var/log/nginx/riph-stream-sni.log`;
+- управляет только собственными UFW-правилами и проверяет их ownership;
+- делает backup перед опасными изменениями, где это предусмотрено.
 
 ---
 
-## Быстрый старт управления
+# Быстрое управление
 
-На VPS:
+Открыть интерактивное меню:
 
 ```bash
 sudo riph-admin
 ```
 
-Откроется текстовое меню. Ничего запоминать не надо.
-
-Для одной команды без меню:
+Посмотреть общий статус без меню:
 
 ```bash
 sudo riph-admin status
+```
+
+Посмотреть Fail2ban:
+
+```bash
 sudo riph-admin fail2ban-status
+```
+
+Посмотреть связанные UFW-правила:
+
+```bash
 sudo riph-admin ufw-status
 ```
 
-### Условные уровни опасности
+### Уровни действий в этой инструкции
 
 - **Просмотр** — ничего не меняет.
-- **Обычная операция** — меняет только данные РИФ и имеет проверки/rollback.
-- **Осторожно** — может повлиять на доступ к VPS или вернуть старую конфигурацию.
+- **Обычная операция** — штатное изменение через проверки РИФ.
+- **ОСТОРОЖНО** — действие может заметно повлиять на доступ или восстановить старое состояние.
 
 ---
 
-# Пункты интерактивного меню
+# Все пункты интерактивного меню
 
 <details>
 <summary><strong>1. Status — общий статус РИФ</strong> · Просмотр</summary>
 
-Показывает почти всё важное одним экраном:
+Показывает одним экраном:
 
-- текущий IP каждого настроенного Router IP Push роутера;
+- текущие IP всех роутеров, которые сейчас учитывает РИФ;
 - effective trusted set;
-- статические доверенные сети;
+- статические trusted CIDR;
 - previous-IP grace;
-- состояние сгенерированных Nginx-файлов;
+- последние применённые данные;
+- сгенерированные Nginx-файлы;
 - manual deny списки;
 - `nginx -t`;
-- два RIPH Fail2ban jail;
-- systemd path/timer.
+- RIPH Fail2ban jails;
+- path/timer.
 
-**Когда применять:** это первая команда, если «что-то не работает» или просто хочется убедиться, что всё живо.
+**Это первая команда при любой непонятной ситуации.**
 
 ```bash
 sudo riph-admin status
 ```
+
+Пример применения: после установки нового Router IP Push роутера открыть Status и убедиться, что появился его `router_id` и текущий IP.
 
 </details>
 
 <details>
 <summary><strong>2. Apply / regenerate trusted + routing</strong> · Обычная операция</summary>
 
-Принудительно пересобирает доверенный allowlist и Nginx routing из текущих конфигов.
+Принудительно пересобирает trusted allowlist и Nginx routing из текущего состояния.
 
-РИФ делает backup, проверяет новую конфигурацию через `nginx -t` и откатывается при ошибке.
-
-**Обычно не нужен:** автоматический reconcile делает это сам.
-
-Пример: вручную изменили конфигурационный файл и хотим применить именно Nginx/trusted state.
+РИФ делает backup, строит новые файлы, проверяет их через `nginx -t` и не оставляет невалидную конфигурацию.
 
 ```bash
 sudo riph-admin apply
 ```
 
+**Обычно не нужен:** автоматика делает это сама.
+
+Если сомневаешься между Apply и Reconcile, чаще нужен пункт **3 — Reconcile**.
+
 </details>
 
 <details>
-<summary><strong>3. Reconcile — привести всё к актуальному состоянию</strong> · Обычная операция</summary>
+<summary><strong>3. Reconcile — привести РИФ к актуальному состоянию</strong> · Обычная операция</summary>
 
-Предпочтительная ручная команда после изменений Router IP Push или trusted-конфигурации.
+Это предпочтительная ручная команда после изменений Router IP Push или trusted-настроек.
 
 Reconcile:
 
-1. перечитывает текущий Router IP Push;
-2. применяет allowlist/routing;
-3. проверяет, не изменился ли IP прямо во время операции;
-4. при необходимости повторяет convergence;
-5. запускает trusted-unban guard.
+1. перечитывает Router IP Push;
+2. заново определяет зарегистрированные активные роутеры;
+3. применяет trusted/routing;
+4. проверяет, не поменялся ли IP прямо во время операции;
+5. при необходимости повторяет попытку;
+6. запускает trusted-unban guard.
 
 ```bash
 sudo riph-admin reconcile
 ```
 
-Если сомневаешься между **Apply** и **Reconcile**, обычно выбирай **Reconcile**.
+Пример: новый роутер уже зарегистрирован и сделал первый push, но хочется не ждать path/timer — запускаем Reconcile вручную.
 
 </details>
 
 <details>
 <summary><strong>4. Run trusted-unban guard</strong> · Обычная операция</summary>
 
-Проверяет, что доверенные адреса не заблокированы правилами, которыми владеет РИФ.
+Проверяет, что trusted-адреса не оказались заблокированы правилами РИФ.
 
 Guard может:
 
-- снять RIPH Fail2ban ban с доверенного IP;
-- обнаружить конфликт manual deny с trusted set;
-- синхронизировать project-owned защиту.
+- снять RIPH Fail2ban ban с trusted IP;
+- обнаружить пересечение manual deny с trusted set;
+- проверить ownership manual UFW rules.
 
 ```bash
 sudo riph-admin guard
 ```
 
-Обычно guard запускается автоматически внутри reconcile.
+В обычной работе guard запускается внутри каждого reconcile.
 
 </details>
 
 <details>
 <summary><strong>5. Guard log</strong> · Просмотр</summary>
 
-Показывает последние записи журнала trusted-unban guard.
-
-Полезно, если guard что-то разбанивал или сообщал о конфликте.
+Показывает последние записи trusted-unban guard.
 
 ```bash
 sudo riph-admin guard-log
 ```
+
+Полезно, если Status/журнал сообщил, что trusted IP пришлось разбанить или найден manual conflict.
 
 </details>
 
 <details>
 <summary><strong>6. Timers / Router-IP watch</strong> · Просмотр</summary>
 
-Показывает два главных автомата:
+Показывает два автомата:
 
-- `riph-router-ip.path` — реагирует на изменение Router IP Push;
-- `riph-reconcile.timer` — страховочный запуск примерно раз в минуту.
+- `riph-router-ip.path` — реагирует на запись нового Router IP Push IP;
+- `riph-reconcile.timer` — страховочный reconcile примерно раз в минуту.
 
-В норме оба должны быть `enabled` и `active`.
+В норме оба:
+
+```text
+enabled=enabled
+active=active
+```
+
+Команда:
 
 ```bash
 sudo riph-admin timers
@@ -182,22 +223,20 @@ sudo riph-admin timers
 <details>
 <summary><strong>7. Apply manual deny lists</strong> · Обычная операция</summary>
 
-Синхронизирует файлы manual deny с реальными UFW-правилами РИФ.
-
-Обычно не требуется: пункты **10–13** сами вызывают синхронизацию после изменения списка.
-
-Используется скорее после ручного восстановления/редактирования конфигурации.
+Синхронизирует manual deny списки РИФ с его реальными UFW-правилами.
 
 ```bash
 sudo riph-admin manual-deny-apply
 ```
+
+Обычно вручную не нужен: пункты 10–13 после изменения списка вызывают синхронизацию сами.
 
 </details>
 
 <details>
 <summary><strong>8. Add static trusted CIDR</strong> · Обычная операция</summary>
 
-Добавляет **действительно постоянный** IP/CIDR в статический trusted list и запускает reconcile.
+Добавляет **реально постоянный** IP или CIDR в static trusted list.
 
 Пример:
 
@@ -206,26 +245,26 @@ CIDR/IP: 203.0.113.10
 Comment: office static IP
 ```
 
-Командный вариант:
+Командой:
 
 ```bash
 sudo riph-admin trusted-add 203.0.113.10/32 "office static IP"
 ```
 
-**Не использовать для динамического домашнего IP.** Для него нужен Router IP Push.
+**Не добавляй сюда динамический домашний/провайдерский IP.** Для роутеров с меняющимся адресом используется Router IP Push, и зарегистрированные роутеры РИФ подхватывает автоматически.
 
 </details>
 
 <details>
 <summary><strong>9. Remove static trusted CIDR</strong> · Обычная операция</summary>
 
-Удаляет адрес из статического trusted list и запускает reconcile.
+Удаляет адрес из static trusted list и запускает reconcile.
 
 ```bash
 sudo riph-admin trusted-remove 203.0.113.10/32
 ```
 
-Перед удалением убедись, что это не единственный способ доступа к приватному SNI с нужной сети.
+Используется, например, если постоянный офисный/VPS IP больше не должен иметь trusted-доступ.
 
 </details>
 
@@ -236,33 +275,33 @@ sudo riph-admin trusted-remove 203.0.113.10/32
 
 SSH и остальные порты этим правилом не блокируются.
 
-Пример:
+Пример через меню:
 
 ```text
 CIDR/IP: 203.0.113.55
 Comment: repeated scanner
 ```
 
-Или:
+Командой:
 
 ```bash
 sudo riph-admin deny443-add 203.0.113.55/32 "repeated scanner"
 ```
 
-РИФ откажется добавлять сеть, которая пересекается с effective trusted set.
+РИФ не даст добавить CIDR, пересекающийся с effective trusted set.
 
 </details>
 
 <details>
 <summary><strong>11. Remove manual deny 443 CIDR</strong> · Обычная операция</summary>
 
-Удаляет project-owned постоянную блокировку TCP/443.
+Удаляет постоянную project-owned блокировку TCP/443.
 
 ```bash
 sudo riph-admin deny443-remove 203.0.113.55/32
 ```
 
-Это не обязательно снимает отдельный активный Fail2ban ban того же IP — это другой механизм.
+Это не обязательно снимает отдельный Fail2ban ban того же IP — manual deny и Fail2ban являются разными механизмами.
 
 </details>
 
@@ -271,13 +310,11 @@ sudo riph-admin deny443-remove 203.0.113.55/32
 
 Блокирует источник **на всех портах**.
 
-Это исключительная операция. В отличие от deny443, она может отрезать SSH и служебный трафик.
-
 ```bash
 sudo riph-admin denyall-add 203.0.113.55/32 "exceptional full block"
 ```
 
-Если не уверен — используй **10. deny 443**, а не ALL.
+Это может затронуть SSH и служебный трафик. Если нужен обычный постоянный бан сканера HTTPS, используй пункт **10**, а не ALL.
 
 </details>
 
@@ -295,12 +332,12 @@ sudo riph-admin denyall-remove 203.0.113.55/32
 <details>
 <summary><strong>14. RIPH Fail2ban status</strong> · Просмотр</summary>
 
-Показывает состояние только двух jail, которыми занимается РИФ:
+Показывает только два jail РИФ:
 
 - `riph-nginx-stream-sni-reject`;
 - `riph-nginx-stream-private-sni-abuse`.
 
-Видны количество failed/banned и текущие заблокированные IP.
+Можно увидеть количество failed/banned и текущие заблокированные IP.
 
 ```bash
 sudo riph-admin fail2ban-status
@@ -311,20 +348,20 @@ sudo riph-admin fail2ban-status
 <details>
 <summary><strong>15. RIPH Fail2ban unban IP</strong> · Обычная операция</summary>
 
-Просит Fail2ban снять указанный IP с обоих RIPH jail.
+Снимает указанный IPv4 с обоих RIPH Fail2ban jail.
 
 ```bash
 sudo riph-admin fail2ban-unban 203.0.113.55
 ```
 
-Это снимает **только Fail2ban ban**. Если IP одновременно есть в manual deny, постоянная manual-блокировка останется.
+Снимается только Fail2ban ban. Если IP находится в manual deny, постоянная manual-блокировка останется.
 
 </details>
 
 <details>
 <summary><strong>16. Fail2ban validate + reload</strong> · Обычная операция</summary>
 
-Сначала выполняет проверку конфигурации Fail2ban, затем `reload`, после чего запускает trusted guard.
+Сначала проверяет конфигурацию Fail2ban, затем делает `reload`, после чего запускает trusted guard.
 
 ```bash
 sudo riph-admin fail2ban-reload
@@ -332,27 +369,27 @@ sudo riph-admin fail2ban-reload
 
 Это **reload, не restart**.
 
-Обычно применять после осознанного изменения Fail2ban-конфигурации РИФ.
+Обычно команда нужна только после осознанного изменения Fail2ban-конфигурации.
 
 </details>
 
 <details>
 <summary><strong>17. UFW relevant status</strong> · Просмотр</summary>
 
-Показывает связанные с 443/РИФ UFW-правила и project-owned manual-deny state.
+Показывает связанные с TCP/443/РИФ UFW-правила и applied-state manual deny.
 
 ```bash
 sudo riph-admin ufw-status
 ```
 
-Полезно, когда нужно понять: «это Fail2ban, manual deny или вообще не firewall?»
+Полезно для ответа на вопрос: «этот IP заблокирован Fail2ban, manual deny или причина вообще не в firewall?»
 
 </details>
 
 <details>
 <summary><strong>18. Harvest since checkpoint</strong> · Просмотр</summary>
 
-Делает короткую статистику по RIPH stream audit log после последнего checkpoint:
+Строит короткую статистику из stream audit log:
 
 - всего сессий;
 - `reject`;
@@ -367,7 +404,7 @@ sudo riph-admin ufw-status
 sudo riph-admin harvest
 ```
 
-Для всего текущего лога, игнорируя checkpoint:
+По всему текущему логу, игнорируя checkpoint:
 
 ```bash
 sudo riph-admin harvest --all
@@ -376,15 +413,15 @@ sudo riph-admin harvest --all
 </details>
 
 <details>
-<summary><strong>19. Set harvest checkpoint</strong> · Обычная операция, безопасная</summary>
+<summary><strong>19. Set harvest checkpoint</strong> · Обычная безопасная операция</summary>
 
-Запоминает текущую позицию в audit log. После этого пункт **18** покажет статистику только по новым событиям.
+Запоминает текущую позицию в audit log. После этого пункт 18 показывает только новые события после checkpoint.
 
 ```bash
 sudo riph-admin harvest-checkpoint
 ```
 
-Пример применения: поставил checkpoint сегодня, через неделю смотришь статистику только за эту неделю.
+Пример: ставим checkpoint сегодня, через неделю получаем статистику только за прошедшую неделю.
 
 </details>
 
@@ -393,16 +430,14 @@ sudo riph-admin harvest-checkpoint
 
 Показывает последние строки `/var/log/nginx/riph-stream-sni.log`.
 
-По умолчанию 50 строк; в меню можно указать другое число.
-
 ```bash
 sudo riph-admin recent-log 100
 ```
 
-Примеры `route`:
+Основные `route`:
 
-- `xray_1` / `xray_2` — доверенный private SNI попал в Xray;
-- `fake_1` / `fake_2` — private SNI пришёл с недоверенного источника;
+- `xray_1` / `xray_2` — trusted private SNI ушёл в Xray;
+- `fake_1` / `fake_2` — private SNI пришёл с untrusted IP;
 - `reject` — неизвестный/пустой/IP-SNI;
 - `www` — публичный SNI.
 
@@ -411,115 +446,77 @@ sudo riph-admin recent-log 100
 <details>
 <summary><strong>21. List backups</strong> · Просмотр</summary>
 
-Показывает доступные RIPH apply-backup для rollback.
+Показывает доступные apply-backup для rollback.
 
 ```bash
 sudo riph-admin backups
 ```
 
-Ничего не восстанавливает — только список.
+Ничего не восстанавливает — только выводит список.
 
 </details>
 
 <details>
 <summary><strong>22. Rollback</strong> · ОСТОРОЖНО</summary>
 
-Возвращает Nginx/trusted routing к выбранному backup.
+Восстанавливает старый RIPH apply-backup.
 
-В интерактивном меню сначала показывается список backup, затем нужно выбрать ID и отдельно напечатать:
+Меню сначала показывает backup ID, затем просит выбрать ID или `latest`, а потом требует вручную написать:
 
 ```text
 ROLLBACK
 ```
 
-Без этого операция отменяется.
+Только после этого начинается откат.
 
-Командный вариант последнего backup:
+Командный пример:
 
 ```bash
 sudo riph-admin rollback latest
 ```
 
-РИФ делает **ещё один safety snapshot перед rollback**, проверяет восстановленную конфигурацию и пытается вернуть исходное состояние, если откат оказался невалидным.
-
-Не использовать «просто попробовать».
+**Без необходимости не применять.** Если рабочая система ведёт себя странно, сначала лучше сохранить вывод `riph-admin status` и разобраться в причине.
 
 </details>
 
 ---
 
-# Динамический IP и Router IP Push
+# Как добавить ещё один роутер
 
-## Уже настроенный роутер
+На новом роутере:
 
-Для роутера, чей ID уже находится в `ROUTER_IDS`, всё автоматическое.
+1. установить Router IP Push;
+2. создать/получить его registration code;
+3. зарегистрировать этот код на том же VPS серверной частью Router IP Push;
+4. вставить выданный VPS endpoint в Router IP Push на роутере;
+5. дождаться первого успешного `update`.
 
-Например:
+После первого update РИФ сам обнаружит регистрацию и текущий IP. Обычно `riph-router-ip.path` применит изменение сразу; страховочный timer всё равно проверит состояние примерно в течение минуты.
 
-```text
-ROUTER_IDS="AX3200"
+Проверить:
+
+```bash
+sudo riph-admin status
 ```
 
-Router IP Push обновил:
+В выводе должен появиться новый `router_id` и его текущий IPv4.
 
-```text
-/var/lib/router-ip-push/ips/AX3200.ipv4
-```
-
-После этого РИФ сам запускает reconcile и переносит новый IP в allowlist.
-
-## Добавление второго роутера
-
-Порядок безопаснее делать именно такой:
-
-1. установить и зарегистрировать Router IP Push на новом роутере;
-2. убедиться, что на VPS появился его файл `/var/lib/router-ip-push/ips/<router_id>.ipv4`;
-3. один раз добавить `<router_id>` в `ROUTER_IDS`;
-4. выполнить `sudo riph-admin reconcile`;
-5. проверить `sudo riph-admin status`.
-
-Например, если будущий router ID будет `MOTHER`:
-
-```text
-ROUTER_IDS="AX3200 MOTHER"
-```
-
-**Никакой внешний IP маминого роутера в `trusted-static.list` записывать не нужно.** После этой одноразовой привязки Router IP Push будет менять его автоматически.
+**Никакого отдельного `trusted-add` и никакого редактирования `ROUTER_IDS` для такого роутера не требуется.**
 
 ---
 
-# Статический trusted и динамический trusted — не одно и то же
+# Первая установка РИФ
 
-`trusted-static.list` предназначен только для адресов, которые действительно должны оставаться постоянными.
+## Что должно быть заранее
 
-Примеры подходящих статических записей:
+РИФ является дополнением, а не заменой всей VPS-конфигурации. До установки должны быть готовы:
 
-```text
-127.0.0.1/32         # localhost
-5.61.39.137/32       # VPS_GR
-45.87.41.121/32      # Spectra
-194.104.94.182/32    # Hexabyte
-```
-
-Домашние/провайдерские динамические IP туда добавлять не следует — для них существует Router IP Push.
-
----
-
-# Установка и обновление
-
-## Перед установкой
-
-РИФ не является универсальным «поставил на пустой VPS и готово». Он является дополнением к существующей схеме Nginx/Xray и Router IP Push.
-
-Перед production install должны быть подготовлены:
-
-- Nginx stream-конфигурация/порты, соответствующие `config.env`;
+- базовая Nginx/Xray-схема;
 - Router IP Push server;
-- текущий `.ipv4` хотя бы для обязательного ID из `ROUTER_IDS`;
-- UFW и Fail2ban;
-- проверенные значения `PUBLIC_SNI`, private SNI и upstream-портов.
+- хотя бы один работающий Router IP Push роутер с текущим IPv4;
+- UFW/Fail2ban/Nginx в ожидаемом для этой VPS состоянии.
 
-## Проверка перед установкой
+## 1. Read-only проверка
 
 Из каталога репозитория:
 
@@ -527,44 +524,68 @@ ROUTER_IDS="AX3200 MOTHER"
 sudo ./install.sh --check
 ```
 
-Это preflight, он ничего не устанавливает.
+Это preflight без установки файлов.
 
-## Production install
-
-После проверки конфигурации:
+## 2. Установка + trusted/Nginx + автоматика
 
 ```bash
 sudo RIPH_ALLOW_PRODUCTION=1 \
   ./install.sh --install --apply --enable-timers
 ```
 
-Installer делает backup существующих project-файлов, устанавливает РИФ, применяет routing и включает Router-IP watch/timer. Fail2ban jail при первой установке намеренно не активируются этим шагом автоматически.
+Установщик делает backup проектных файлов и не активирует RIPH Fail2ban jails автоматически.
 
-После установки:
+## 3. Проверка
 
 ```bash
 sudo riph-admin status
+sudo riph-admin timers
+sudo nginx -t
 ```
 
-## Обновление уже установленного РИФ
+## 4. Первая активация RIPH Fail2ban
 
-Получить актуальный `main`, затем снова запустить installer. Повторная установка сохраняет уже активированное состояние двух RIPH Fail2ban jail.
-
-Минимальная схема:
+Это отдельный контролируемый шаг:
 
 ```bash
-git pull --ff-only origin main
-sudo ./install.sh --check
-sudo RIPH_ALLOW_PRODUCTION=1 \
-  ./install.sh --install --apply --enable-timers
-sudo riph-admin status
+sudo /usr/local/sbin/riph-fail2ban-activate --dry-run
+sudo /usr/local/sbin/riph-fail2ban-activate
 ```
 
-На production-сервере не следует использовать `--replace-config`, если нет конкретной причины заменить свои рабочие списки/настройки репозиторными примерами.
+После:
+
+```bash
+sudo riph-admin fail2ban-status
+```
+
+На уже настроенном Hexabyte этот этап давно выполнен; повторять его без причины не нужно.
 
 ---
 
-# Где лежат основные данные
+# Как обновить уже установленный РИФ
+
+Обновление кода не должно затирать существующие пользовательские config/list файлы при обычном `--install`.
+
+После получения проверенной новой версии:
+
+```bash
+sudo RIPH_ALLOW_PRODUCTION=1 ./install.sh --install
+```
+
+Затем:
+
+```bash
+sudo riph-admin reconcile
+sudo riph-admin status
+```
+
+`--replace-config` при обычном обновлении **не использовать**, если нет специальной причины: эта опция намеренно заменяет config/list файлами из репозитория.
+
+---
+
+# Что где лежит
+
+Основное:
 
 ```text
 /etc/router-ip-push-hardening/config.env
@@ -572,36 +593,98 @@ sudo riph-admin status
 /etc/router-ip-push-hardening/manual-deny-443.list
 /etc/router-ip-push-hardening/manual-deny-all.list
 /etc/router-ip-push-hardening/previous-ip-grace.json
-
-/var/lib/router-ip-push/ips/<router_id>.ipv4
-/var/lib/router-ip-push/state/<router_id>.json
-
-/var/log/nginx/riph-stream-sni.log
 ```
 
-Сгенерированные Nginx-файлы вручную не редактируются — ими владеет РИФ.
+Router IP Push:
+
+```text
+/etc/router-ip-push/routers.d/<router_id>.json
+/var/lib/router-ip-push/ips/<router_id>.ipv4
+/var/lib/router-ip-push/state/<router_id>.json
+```
+
+Логи/состояние РИФ:
+
+```text
+/var/log/nginx/riph-stream-sni.log
+/var/lib/router-ip-push-hardening/
+```
+
+Сгенерированный Nginx allowlist:
+
+```text
+/etc/nginx/stream-enabled/05-router-ip-push-source-allow.conf
+```
+
+**Сгенерированный allowlist руками не редактировать.** Следующий reconcile всё равно пересоберёт его из источников состояния.
 
 ---
 
-# Если что-то сломалось
+# Если что-то перестало работать
 
-Начинать диагностику в таком порядке:
+Проверять лучше в таком порядке.
+
+### 1. Общий статус
 
 ```bash
 sudo riph-admin status
+```
+
+### 2. Автоматика Router IP Push
+
+```bash
 sudo riph-admin timers
-sudo riph-admin fail2ban-status
-sudo riph-admin ufw-status
-sudo riph-admin recent-log 100
 ```
 
-Не начинать с `ufw reset`, удаления правил по номеру, ручного редактирования generated Nginx-файлов или rollback «наугад».
-
-Если проблема связана с изменением внешнего IP роутера, отдельно проверить:
+### 3. Последние маршруты
 
 ```bash
-cat /var/lib/router-ip-push/ips/<router_id>.ipv4
-sudo riph-admin status
+sudo riph-admin recent-log 50
 ```
 
-Текущий Router IP Push IP должен присутствовать в effective trusted set для этого настроенного `router_id`.
+### 4. Fail2ban
+
+```bash
+sudo riph-admin fail2ban-status
+```
+
+### 5. UFW
+
+```bash
+sudo riph-admin ufw-status
+```
+
+### 6. Строгая проверка trusted-защиты
+
+```bash
+sudo riph-admin guard
+```
+
+### 7. Принудительная синхронизация
+
+```bash
+sudo riph-admin reconcile
+```
+
+Если после этого проблема остаётся, лучше сохранить вывод этих команд до ручного изменения Nginx/UFW/Fail2ban: по нему гораздо проще восстановить причину.
+
+---
+
+# Короткая памятка
+
+```text
+Посмотреть всё                 sudo riph-admin status
+Открыть меню                   sudo riph-admin
+Проверить автоматику           sudo riph-admin timers
+Синхронизировать               sudo riph-admin reconcile
+Fail2ban                       sudo riph-admin fail2ban-status
+UFW                            sudo riph-admin ufw-status
+Последние маршруты             sudo riph-admin recent-log 50
+Статистика                     sudo riph-admin harvest
+Постоянно заблокировать 443    sudo riph-admin deny443-add IP/32 "comment"
+Разблокировать manual 443      sudo riph-admin deny443-remove IP/32
+Разбанить Fail2ban             sudo riph-admin fail2ban-unban IP
+Список backup                  sudo riph-admin backups
+```
+
+Для обычного пользователя главные пункты меню — **1, 6, 14, 17, 18, 20**. Всё остальное чаще нужно только при изменении конфигурации или диагностике.
