@@ -20,6 +20,10 @@ make_case() {
         "${t}/var/lib/router-ip-push/ips" \
         "${t}/usr/local/bin"
     cp "${ROOT}/config/config.env.example" "${t}/etc/router-ip-push-hardening/config.env"
+    # The production default is now compatibility OFF. This test intentionally
+    # recreates the old coexistence phase so quiesce/retire behavior stays covered.
+    sed -i 's/^LEGACY_STREAM_AUDIT_COMPAT=0$/LEGACY_STREAM_AUDIT_COMPAT=1/' \
+        "${t}/etc/router-ip-push-hardening/config.env"
     printf '%s\n' '78.111.154.96' >"${t}/var/lib/router-ip-push/ips/AX3200.ipv4"
     printf '%s\n' 'STREAM_SENTINEL' >"${t}/etc/nginx/stream-enabled/stream.conf"
     printf '%s\n' 'LEGACY_WATCH' >"${t}/etc/nginx/stream-enabled/00-sni-watch.conf"
