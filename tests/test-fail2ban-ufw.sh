@@ -29,6 +29,8 @@ cat >"${STATE}" <<'EOF_STATE'
 [ 2] 443/tcp DENY IN 203.0.113.44 # riph-f2b-nginx-stream-sni-reject
 [ 3] 443/tcp DENY IN 198.51.100.8 # riph-f2b-nginx-stream-sni-reject
 [ 4] 443/tcp DENY IN 1203.0.113.440 # riph-f2b-nginx-stream-sni-reject
+[ 5] 80/tcp  DENY IN 203.0.113.44 # riph-f2b-nginx-stream-sni-reject
+[ 6] 443/tcp ALLOW IN 203.0.113.44 # riph-f2b-nginx-stream-sni-reject
 EOF_STATE
 
 "${HELPER}" unban nginx-stream-sni-reject 203.0.113.44
@@ -37,16 +39,21 @@ grep -Fx -- '--force delete 2' "${CALLS}" >/dev/null || { echo 'FAIL: owned Fail
 ! grep -Fx -- '--force delete 1' "${CALLS}" >/dev/null || { echo 'FAIL: manual rule was deleted' >&2; exit 1; }
 ! grep -Fx -- '--force delete 3' "${CALLS}" >/dev/null || { echo 'FAIL: another IP rule was deleted' >&2; exit 1; }
 ! grep -Fx -- '--force delete 4' "${CALLS}" >/dev/null || { echo 'FAIL: source substring was treated as exact IP' >&2; exit 1; }
+! grep -Fx -- '--force delete 5' "${CALLS}" >/dev/null || { echo 'FAIL: same-marker wrong-port rule was deleted' >&2; exit 1; }
+! grep -Fx -- '--force delete 6' "${CALLS}" >/dev/null || { echo 'FAIL: same-marker ALLOW rule was deleted' >&2; exit 1; }
 
 : >"${CALLS}"
 "${HELPER}" ban nginx-stream-sni-reject 203.0.113.44
-! grep -q . "${CALLS}" || { echo 'FAIL: duplicate owned ban was added' >&2; exit 1; }
+! grep -q . "${CALLS}" || { echo 'FAIL: duplicate owned TCP/443 ban was added' >&2; exit 1; }
 
 cat >"${STATE}" <<'EOF_STATE2'
 [ 1] 443/tcp DENY IN 203.0.113.44 # riph-manual-443
+[ 2] 80/tcp  DENY IN 203.0.113.44 # riph-f2b-nginx-stream-sni-reject
+[ 3] 443/tcp ALLOW IN 203.0.113.44 # riph-f2b-nginx-stream-sni-reject
 EOF_STATE2
+: >"${CALLS}"
 "${HELPER}" ban nginx-stream-sni-reject 203.0.113.44
 expected='prepend deny proto tcp from 203.0.113.44 to any port 443 comment riph-f2b-nginx-stream-sni-reject'
-grep -Fx -- "${expected}" "${CALLS}" >/dev/null || { echo 'FAIL: owned ban was not created' >&2; exit 1; }
+grep -Fx -- "${expected}" "${CALLS}" >/dev/null || { echo 'FAIL: correct owned TCP/443 deny was not created when only wrong-shape same-marker rules existed' >&2; exit 1; }
 
 echo 'PASS: Fail2ban UFW ownership tests'
