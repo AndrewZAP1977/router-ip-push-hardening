@@ -1,0 +1,534 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+COMMON_DEFAULT="/usr/local/libexec/riph-common.sh"
+TRUSTED_DEFAULT="/usr/local/libexec/riph-trusted.sh"
+NET_DEFAULT="/usr/local/libexec/riph-net.sh"
+
+if [[ -f "${SCRIPT_DIR}/../libexec/riph-common.sh" ]]; then
+    # Repository/test layout.
+    # shellcheck source=../libexec/riph-common.sh
+    source "${SCRIPT_DIR}/../libexec/riph-common.sh"
+    # shellcheck source=../libexec/riph-trusted.sh
+    source "${SCRIPT_DIR}/../libexec/riph-trusted.sh"
+    # shellcheck source=../libexec/riph-net.sh
+    source "${SCRIPT_DIR}/../libexec/riph-net.sh"
+else
+    # Installed layout.
+    # shellcheck source=/usr/local/libexec/riph-common.sh
+    source "${COMMON_DEFAULT}"
+    # shellcheck source=/usr/local/libexec/riph-trusted.sh
+    source "${TRUSTED_DEFAULT}"
+    # shellcheck source=/usr/local/libexec/riph-net.sh
+    source "${NET_DEFAULT}"
+fi
+
+RIPH_ROOT="/"
+CONFIG_PATH="/etc/router-ip-push-hardening/config.env"
+PUBLIC_IP=""
+DRY_RUN=0
+
+usage() {
+    cat <<'USAGE'
+Usage: riph-manual-deny-adopt-legacy --public-ip IPv4 [options]
+
+One-time transactional adoption of pre-existing unmarked TCP/443 UFW denies
+that already correspond exactly to manual-deny-443.list.
+
+Options:
+  --public-ip IPv4    Public destination used for temporary TCP/443 bridge rules.
+  --root DIR          Test root prefix (/, /tmp/* or /var/tmp/*).
+  --config PATH       Config path inside root.
+  --dry-run           Validate the complete adoption preflight without mutation.
+  -h, --help          Show this help.
+
+Safety model:
+  1. Require desired list == stale applied-state claim == exact legacy UFW rules.
+  2. Prepend destination-specific riph-adopt-bridge TCP/443 denies.
+  3. Remove only the exact unmarked legacy TCP/443 rules.
+  4. Add and verify exact riph-manual-443 rules, then atomically repair state.
+  5. Remove temporary bridge rules only after all permanent ownership checks pass.
+
+On failure, legacy rules/state are restored while bridge rules remain in place
+until restoration is verified. Unrelated UFW rules are never deleted.
+USAGE
+}
+
+while (($#)); do
+    case "$1" in
+        --public-ip)
+            (($# >= 2)) || riph_die "--public-ip requires a value"
+            PUBLIC_IP="$2"
+            shift 2
+            ;;
+        --root)
+            (($# >= 2)) || riph_die "--root requires a value"
+            RIPH_ROOT="$(riph_validate_root "$2")"
+            shift 2
+            ;;
+        --config)
+            (($# >= 2)) || riph_die "--config requires a value"
+            CONFIG_PATH="$2"
+            shift 2
+            ;;
+        --dry-run)
+            DRY_RUN=1
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            riph_die "unknown argument: $1"
+            ;;
+    esac
+done
+
+[[ -n "${PUBLIC_IP}" ]] || riph_die "--public-ip is required"
+riph_is_ipv4 "${PUBLIC_IP}" || riph_die "invalid --public-ip IPv4: ${PUBLIC_IP}"
+
+riph_require_cmd awk
+riph_require_cmd sort
+riph_require_cmd flock
+riph_require_cmd install
+riph_require_cmd date
+
+CONFIG_FILE="$(riph_root_path "${CONFIG_PATH}")"
+riph_load_config "${CONFIG_FILE}"
+riph_prepare_dirs
+
+UFW_BIN="${RIPH_UFW_BIN:-ufw}"
+if ! command -v "${UFW_BIN}" >/dev/null 2>&1 && [[ ! -x "${UFW_BIN}" ]]; then
+    riph_die "ufw executable not found: ${UFW_BIN}"
+fi
+
+UFW_LOCK_FILE="${RIPH_UFW_LOCK:-$(riph_root_path /run/lock/riph-ufw.lock)}"
+mkdir -p "$(dirname "${UFW_LOCK_FILE}")"
+exec 8>"${UFW_LOCK_FILE}"
+flock -w 15 8 || riph_die "timed out waiting for RIPH UFW lock"
+
+CONFIG_DIR="$(riph_root_path "${RIPH_CONFIG_DIR}")"
+STATE_ROOT="$(riph_root_path "${RIPH_STATE_DIR}")"
+RUNTIME_DIR="${STATE_ROOT}/runtime"
+BACKUP_ROOT="${STATE_ROOT}/backups"
+DENY_443_FILE="${CONFIG_DIR}/manual-deny-443.list"
+DENY_ALL_FILE="${CONFIG_DIR}/manual-deny-all.list"
+STATE_FILE="${RUNTIME_DIR}/manual-deny-applied.tsv"
+STATIC_FILE="${CONFIG_DIR}/trusted-static.list"
+GRACE_FILE="${CONFIG_DIR}/previous-ip-grace.json"
+mkdir -p "${RUNTIME_DIR}" "${BACKUP_ROOT}"
+
+TMP_DIR="$(mktemp -d "${RUNTIME_DIR}/manual-deny-adopt.XXXXXX")"
+DESIRED="${TMP_DIR}/desired.tsv"
+DESIRED_STATE="${TMP_DIR}/desired-state.tsv"
+STATE_NORMALIZED="${TMP_DIR}/state-normalized.tsv"
+TRUSTED="${TMP_DIR}/trusted.tsv"
+LEGACY="${TMP_DIR}/legacy.tsv"
+PRE_STATUS="${TMP_DIR}/ufw-before.txt"
+
+MUTATION_STARTED=0
+COMMITTED=0
+BACKUP_DIR=""
+
+status_numbered() {
+    LC_ALL=C "${UFW_BIN}" status numbered
+}
+
+trim_spaces() {
+    local value="$1"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s\n' "${value}"
+}
+
+normalize_ufw_source() {
+    local source="$1"
+    if riph_is_ipv4 "${source}"; then
+        printf '%s/32\n' "${source}"
+    elif riph_is_ipv4_cidr "${source}"; then
+        riph_normalize_ipv4_cidr "${source}"
+    else
+        return 1
+    fi
+}
+
+parse_status_line() {
+    local line="$1"
+    RULE_NUMBER=""
+    RULE_TO=""
+    RULE_SOURCE=""
+    if [[ "${line}" =~ ^[[:space:]]*\[[[:space:]]*([0-9]+)\][[:space:]]+(.+)[[:space:]]+DENY[[:space:]]+IN[[:space:]]+([^[:space:]]+) ]]; then
+        RULE_NUMBER="${BASH_REMATCH[1]}"
+        RULE_TO="$(trim_spaces "${BASH_REMATCH[2]}")"
+        RULE_SOURCE="${BASH_REMATCH[3]}"
+        return 0
+    fi
+    return 1
+}
+
+rule_numbers() {
+    local kind="$1" wanted="$2" status line normalized marker
+    marker=""
+    case "${kind}" in
+        legacy) marker="" ;;
+        permanent) marker="riph-manual-443" ;;
+        bridge) marker="riph-adopt-bridge" ;;
+        f2b) marker="riph-f2b-" ;;
+        *) riph_die "internal invalid rule kind: ${kind}" ;;
+    esac
+
+    status="$(status_numbered)" || return 1
+    while IFS= read -r line; do
+        parse_status_line "${line}" || continue
+        normalized="$(normalize_ufw_source "${RULE_SOURCE}" 2>/dev/null || true)"
+        [[ "${normalized}" == "${wanted}" ]] || continue
+
+        case "${kind}" in
+            legacy)
+                [[ "${RULE_TO}" == "443/tcp" ]] || continue
+                [[ "${line}" != *"# riph-"* ]] || continue
+                ;;
+            permanent)
+                [[ "${RULE_TO}" == "443/tcp" ]] || continue
+                [[ "${line}" == *"# ${marker}"* ]] || continue
+                ;;
+            bridge)
+                [[ "${RULE_TO}" == *"${PUBLIC_IP}"* ]] || continue
+                [[ "${RULE_TO}" == *"443/tcp"* ]] || continue
+                [[ "${line}" == *"# ${marker}"* ]] || continue
+                ;;
+            f2b)
+                [[ "${RULE_TO}" == "443/tcp" ]] || continue
+                [[ "${line}" == *"# ${marker}"* ]] || continue
+                ;;
+        esac
+        printf '%s\n' "${RULE_NUMBER}"
+    done <<<"${status}"
+}
+
+rule_count() {
+    local kind="$1" cidr="$2" output
+    output="$(rule_numbers "${kind}" "${cidr}" || true)"
+    if [[ -z "${output}" ]]; then
+        printf '0\n'
+    else
+        printf '%s\n' "$(wc -l <<<"${output}" | tr -d ' ')"
+    fi
+}
+
+legacy_comment() {
+    local wanted="$1" status line normalized
+    status="$(status_numbered)" || return 1
+    while IFS= read -r line; do
+        parse_status_line "${line}" || continue
+        [[ "${RULE_TO}" == "443/tcp" ]] || continue
+        [[ "${line}" != *"# riph-"* ]] || continue
+        normalized="$(normalize_ufw_source "${RULE_SOURCE}" 2>/dev/null || true)"
+        [[ "${normalized}" == "${wanted}" ]] || continue
+        if [[ "${line}" == *" # "* ]]; then
+            printf '%s\n' "${line#* # }"
+        else
+            printf '\n'
+        fi
+        return 0
+    done <<<"${status}"
+    return 1
+}
+
+parse_desired() {
+    local raw line cidr comment line_no=0
+    : >"${DESIRED}"
+    [[ -f "${DENY_443_FILE}" ]] || riph_die "manual deny list missing: ${DENY_443_FILE}"
+    while IFS= read -r raw || [[ -n "${raw}" ]]; do
+        ((line_no += 1))
+        line="${raw#"${raw%%[![:space:]]*}"}"
+        [[ -z "${line}" || "${line:0:1}" == "#" ]] && continue
+        cidr="${line%%[[:space:]]*}"
+        riph_is_ipv4_cidr "${cidr}" || riph_die "${DENY_443_FILE}:${line_no}: invalid IPv4/CIDR: ${cidr}"
+        cidr="$(riph_normalize_ipv4_cidr "${cidr}")"
+        comment=""
+        if [[ "${raw}" == *"#"* ]]; then
+            comment="${raw#*#}"
+            comment="$(trim_spaces "${comment}")"
+            comment="${comment//$'\t'/ }"
+        fi
+        printf '%s\t%s\n' "${cidr}" "${comment}" >>"${DESIRED}"
+    done <"${DENY_443_FILE}"
+    sort -u -t $'\t' -k1,1 -o "${DESIRED}" "${DESIRED}"
+    [[ -s "${DESIRED}" ]] || riph_die "manual-deny-443.list has no entries to adopt"
+}
+
+require_manual_all_empty() {
+    local raw line
+    [[ -f "${DENY_ALL_FILE}" ]] || return 0
+    while IFS= read -r raw || [[ -n "${raw}" ]]; do
+        line="${raw#"${raw%%[![:space:]]*}"}"
+        [[ -z "${line}" || "${line:0:1}" == "#" ]] && continue
+        riph_die "manual-deny-all.list must be empty during legacy TCP/443 adoption"
+    done <"${DENY_ALL_FILE}"
+}
+
+normalize_state() {
+    local scope cidr extra
+    : >"${STATE_NORMALIZED}"
+    [[ -f "${STATE_FILE}" ]] || riph_die "applied-state file missing: ${STATE_FILE}"
+    while IFS=$'\t' read -r scope cidr extra; do
+        [[ -n "${scope:-}" ]] || continue
+        [[ -z "${extra:-}" ]] || riph_die "invalid applied-state row"
+        [[ "${scope}" == 443 ]] || riph_die "unexpected applied-state scope during adoption: ${scope}"
+        riph_is_ipv4_cidr "${cidr}" || riph_die "invalid applied-state CIDR: ${cidr}"
+        printf '443\t%s\n' "$(riph_normalize_ipv4_cidr "${cidr}")" >>"${STATE_NORMALIZED}"
+    done <"${STATE_FILE}"
+    sort -u -o "${STATE_NORMALIZED}" "${STATE_NORMALIZED}"
+}
+
+verify_state_exact() {
+    awk -F '\t' '{print "443\t" $1}' "${DESIRED}" | sort -u >"${DESIRED_STATE}"
+    normalize_state
+    cmp -s "${DESIRED_STATE}" "${STATE_NORMALIZED}" \
+        || riph_die "applied state does not exactly match manual-deny-443.list; refusing adoption"
+}
+
+verify_trusted_non_overlap() {
+    local cidr _comment trusted_cidr trusted_comment
+    riph_write_effective_trusted_entries \
+        "${TRUSTED}" "${STATIC_FILE}" "${GRACE_FILE}" "$(date -u '+%s')"
+    while IFS=$'\t' read -r cidr _comment; do
+        [[ -n "${cidr}" ]] || continue
+        while IFS=$'\t' read -r trusted_cidr trusted_comment; do
+            [[ -n "${trusted_cidr}" ]] || continue
+            if riph_ipv4_cidr_overlap "${cidr}" "${trusted_cidr}"; then
+                riph_die "refusing adoption: ${cidr} overlaps effective trusted ${trusted_cidr} (${trusted_comment})"
+            fi
+        done <"${TRUSTED}"
+    done <"${DESIRED}"
+}
+
+verify_preflight_rules() {
+    local cidr _comment legacy_n permanent_n bridge_n f2b_n comment
+    : >"${LEGACY}"
+    while IFS=$'\t' read -r cidr _comment; do
+        [[ -n "${cidr}" ]] || continue
+        legacy_n="$(rule_count legacy "${cidr}")"
+        permanent_n="$(rule_count permanent "${cidr}")"
+        bridge_n="$(rule_count bridge "${cidr}")"
+        f2b_n="$(rule_count f2b "${cidr}")"
+        [[ "${legacy_n}" == 1 ]] || riph_die "expected exactly one unmarked legacy TCP/443 deny for ${cidr}; found ${legacy_n}"
+        [[ "${permanent_n}" == 0 ]] || riph_die "RIPH permanent manual rule already exists for ${cidr}"
+        [[ "${bridge_n}" == 0 ]] || riph_die "stale riph-adopt-bridge rule already exists for ${cidr}"
+        [[ "${f2b_n}" == 0 ]] || riph_die "active RIPH Fail2ban UFW rule overlaps adoption source ${cidr}; retry after that ban is cleared"
+        comment="$(legacy_comment "${cidr}")"
+        comment="${comment//$'\t'/ }"
+        printf '%s\t%s\n' "${cidr}" "${comment}" >>"${LEGACY}"
+    done <"${DESIRED}"
+}
+
+verify_exact_rule_count() {
+    local kind="$1" cidr="$2" expected="$3" actual
+    actual="$(rule_count "${kind}" "${cidr}")"
+    [[ "${actual}" == "${expected}" ]] \
+        || riph_die "UFW verification failed: ${kind} ${cidr} expected=${expected} actual=${actual}"
+}
+
+add_bridge() {
+    local cidr="$1" output
+    if ! output="$(LC_ALL=C "${UFW_BIN}" prepend deny proto tcp from "${cidr}" to "${PUBLIC_IP}" port 443 \
+        comment riph-adopt-bridge 2>&1)"; then
+        printf '%s\n' "${output}" >&2
+        return 1
+    fi
+    [[ "${output}" != *"Skipping adding existing rule"* ]] || {
+        printf '%s\n' "${output}" >&2
+        return 1
+    }
+    verify_exact_rule_count bridge "${cidr}" 1
+}
+
+add_permanent() {
+    local cidr="$1" output
+    if ! output="$(LC_ALL=C "${UFW_BIN}" prepend deny proto tcp from "${cidr}" to any port 443 \
+        comment riph-manual-443 2>&1)"; then
+        printf '%s\n' "${output}" >&2
+        return 1
+    fi
+    [[ "${output}" != *"Skipping adding existing rule"* ]] || {
+        printf '%s\n' "${output}" >&2
+        return 1
+    }
+    verify_exact_rule_count permanent "${cidr}" 1
+}
+
+delete_rule_numbers_desc() {
+    local numbers="$1" number
+    [[ -n "${numbers}" ]] || return 0
+    while IFS= read -r number; do
+        [[ -n "${number}" ]] || continue
+        LC_ALL=C "${UFW_BIN}" --force delete "${number}" >/dev/null
+    done < <(printf '%s\n' "${numbers}" | sort -nr -u)
+}
+
+delete_kind_for_all() {
+    local kind="$1" cidr _comment numbers
+    # Collect all numbers from one fresh status before deleting because UFW
+    # renumbers after every numbered deletion.
+    numbers=""
+    while IFS=$'\t' read -r cidr _comment; do
+        [[ -n "${cidr}" ]] || continue
+        numbers+="$(rule_numbers "${kind}" "${cidr}" || true)"$'\n'
+    done <"${DESIRED}"
+    numbers="$(printf '%s' "${numbers}" | sed '/^[[:space:]]*$/d' || true)"
+    delete_rule_numbers_desc "${numbers}"
+}
+
+restore_legacy_rules() {
+    local cidr comment output
+    while IFS=$'\t' read -r cidr comment; do
+        [[ -n "${cidr}" ]] || continue
+        if [[ "$(rule_count legacy "${cidr}")" == 1 ]]; then
+            continue
+        fi
+        if [[ -n "${comment}" ]]; then
+            output="$(LC_ALL=C "${UFW_BIN}" prepend deny proto tcp from "${cidr}" to any port 443 comment "${comment}" 2>&1 || true)"
+        else
+            output="$(LC_ALL=C "${UFW_BIN}" prepend deny proto tcp from "${cidr}" to any port 443 2>&1 || true)"
+        fi
+        if [[ "$(rule_count legacy "${cidr}")" != 1 ]]; then
+            riph_log "WARNING: failed to restore legacy rule for ${cidr}: ${output}"
+            return 1
+        fi
+    done <"${LEGACY}"
+}
+
+all_legacy_restored() {
+    local cidr _comment
+    while IFS=$'\t' read -r cidr _comment; do
+        [[ -n "${cidr}" ]] || continue
+        [[ "$(rule_count legacy "${cidr}")" == 1 ]] || return 1
+    done <"${LEGACY}"
+    return 0
+}
+
+rollback_adoption() {
+    local cidr _comment
+    riph_log "attempting legacy manual-deny adoption rollback"
+
+    # Keep/add bridge coverage before removing any partially created permanent
+    # rules. A failed rollback therefore remains fail-secure rather than open.
+    while IFS=$'\t' read -r cidr _comment; do
+        [[ -n "${cidr}" ]] || continue
+        if [[ "$(rule_count bridge "${cidr}")" == 0 ]]; then
+            add_bridge "${cidr}" >/dev/null 2>&1 || true
+        fi
+    done <"${DESIRED}"
+
+    delete_kind_for_all permanent >/dev/null 2>&1 || true
+    restore_legacy_rules || true
+
+    if [[ -n "${BACKUP_DIR}" && -f "${BACKUP_DIR}/manual-deny-applied.tsv" ]]; then
+        install -m 0600 "${BACKUP_DIR}/manual-deny-applied.tsv" "${STATE_FILE}.rollback.$$"
+        mv -f "${STATE_FILE}.rollback.$$" "${STATE_FILE}"
+    fi
+
+    if all_legacy_restored; then
+        delete_kind_for_all bridge >/dev/null 2>&1 || true
+        riph_log "legacy manual-deny rules/state restored after failed adoption"
+    else
+        riph_log "WARNING: legacy restoration incomplete; riph-adopt-bridge rules intentionally left in place"
+    fi
+}
+
+cleanup() {
+    local rc=$?
+    trap - EXIT
+    if (( MUTATION_STARTED == 1 && COMMITTED == 0 )); then
+        rollback_adoption || true
+    fi
+    rm -rf "${TMP_DIR}"
+    exit "${rc}"
+}
+trap cleanup EXIT
+
+parse_desired
+require_manual_all_empty
+verify_state_exact
+verify_trusted_non_overlap
+
+if ! status_numbered >"${PRE_STATUS}"; then
+    riph_die "failed to inspect UFW numbered rules"
+fi
+grep -Fqx 'Status: active' "${PRE_STATUS}" \
+    || riph_die "UFW must be active for manual-deny adoption"
+verify_preflight_rules
+
+if (( DRY_RUN == 1 )); then
+    riph_log "dry-run: preflight passed for $(wc -l <"${DESIRED}" | tr -d ' ') legacy TCP/443 manual deny rule(s)"
+    while IFS=$'\t' read -r cidr _comment; do
+        [[ -n "${cidr}" ]] || continue
+        riph_log "dry-run: would bridge ${cidr} -> ${PUBLIC_IP}:443, replace exact unmarked legacy deny with riph-manual-443, then remove bridge"
+    done <"${DESIRED}"
+    exit 0
+fi
+
+BACKUP_ID="manual-deny-adopt-$(date -u '+%Y%m%d-%H%M%S')-$$"
+BACKUP_DIR="${BACKUP_ROOT}/${BACKUP_ID}"
+mkdir -p "${BACKUP_DIR}"
+install -m 0600 "${STATE_FILE}" "${BACKUP_DIR}/manual-deny-applied.tsv"
+install -m 0600 "${DENY_443_FILE}" "${BACKUP_DIR}/manual-deny-443.list"
+install -m 0600 "${DENY_ALL_FILE}" "${BACKUP_DIR}/manual-deny-all.list"
+install -m 0600 "${PRE_STATUS}" "${BACKUP_DIR}/ufw-before.txt"
+install -m 0600 "${LEGACY}" "${BACKUP_DIR}/legacy-rules.tsv"
+MUTATION_STARTED=1
+
+while IFS=$'\t' read -r cidr _comment; do
+    [[ -n "${cidr}" ]] || continue
+    add_bridge "${cidr}" || riph_die "failed to establish temporary adoption bridge for ${cidr}"
+done <"${DESIRED}"
+
+while IFS=$'\t' read -r cidr _comment; do
+    [[ -n "${cidr}" ]] || continue
+    verify_exact_rule_count bridge "${cidr}" 1
+    verify_exact_rule_count legacy "${cidr}" 1
+done <"${DESIRED}"
+
+# Bridges are now verified, so exact legacy rules can be removed without a
+# TCP/443 protection gap. Delete by freshly inspected numbered rule, descending.
+delete_kind_for_all legacy
+while IFS=$'\t' read -r cidr _comment; do
+    [[ -n "${cidr}" ]] || continue
+    verify_exact_rule_count legacy "${cidr}" 0
+    verify_exact_rule_count bridge "${cidr}" 1
+done <"${DESIRED}"
+
+while IFS=$'\t' read -r cidr _comment; do
+    [[ -n "${cidr}" ]] || continue
+    add_permanent "${cidr}" || riph_die "failed to create permanent RIPH manual deny for ${cidr}"
+done <"${DESIRED}"
+
+while IFS=$'\t' read -r cidr _comment; do
+    [[ -n "${cidr}" ]] || continue
+    verify_exact_rule_count permanent "${cidr}" 1
+    verify_exact_rule_count bridge "${cidr}" 1
+done <"${DESIRED}"
+
+STATE_TMP="${STATE_FILE}.adopt.$$"
+install -m 0600 "${DESIRED_STATE}" "${STATE_TMP}"
+mv -f "${STATE_TMP}" "${STATE_FILE}"
+normalize_state
+cmp -s "${DESIRED_STATE}" "${STATE_NORMALIZED}" \
+    || riph_die "repaired applied-state verification failed"
+
+# Permanent rules and state are verified. Only now remove temporary bridge rules.
+delete_kind_for_all bridge
+while IFS=$'\t' read -r cidr _comment; do
+    [[ -n "${cidr}" ]] || continue
+    verify_exact_rule_count permanent "${cidr}" 1
+    verify_exact_rule_count bridge "${cidr}" 0
+    verify_exact_rule_count legacy "${cidr}" 0
+done <"${DESIRED}"
+
+COMMITTED=1
+riph_log "legacy manual TCP/443 denies adopted into RIPH ownership"
+riph_log "adoption backup: ${BACKUP_DIR}"
