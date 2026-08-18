@@ -4,6 +4,11 @@ set -Eeuo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT}"
 
+# GitHub Contents API and archives created on Windows may not preserve executable
+# bits for newly added scripts. Production permissions are enforced by install.sh;
+# normalize only this test checkout so regression results do not depend on transport.
+chmod +x install.sh tests/*.sh tools/*.sh src/usr/local/sbin/*
+
 printf '%s\n' '==> Bash syntax'
 while IFS= read -r -d '' file; do
     bash -n "${file}"
