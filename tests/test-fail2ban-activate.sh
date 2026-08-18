@@ -3,26 +3,33 @@ set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ACTIVATE="${ROOT}/src/usr/local/sbin/riph-fail2ban-activate"
-T="$(mktemp -d /tmp/riph-f2b-activate.XXXXXX)"
-trap 'rm -rf "${T}"' EXIT
+BASE="$(mktemp -d /tmp/riph-f2b-activate.XXXXXX)"
+trap 'rm -rf "${BASE}"' EXIT
 
-mkdir -p \
-    "${T}/etc/router-ip-push-hardening" \
-    "${T}/etc/fail2ban/jail.d" \
-    "${T}/var/lib/router-ip-push/ips" \
-    "${T}/var/log/nginx" \
-    "${T}/usr/local/bin"
-cp "${ROOT}/config/config.env.example" "${T}/etc/router-ip-push-hardening/config.env"
-cp "${ROOT}/config/trusted-static.list.example" "${T}/etc/router-ip-push-hardening/trusted-static.list"
-cp "${ROOT}/config/previous-ip-grace.json.example" "${T}/etc/router-ip-push-hardening/previous-ip-grace.json"
-: >"${T}/etc/router-ip-push-hardening/manual-deny-443.list"
-: >"${T}/etc/router-ip-push-hardening/manual-deny-all.list"
-printf '%s\n' '78.111.155.187' >"${T}/var/lib/router-ip-push/ips/AX3200.ipv4"
-: >"${T}/var/log/nginx/riph-stream-sni.log"
-cp "${ROOT}/src/etc/fail2ban/jail.d/riph-nginx-stream-sni-reject.local" "${T}/etc/fail2ban/jail.d/"
-cp "${ROOT}/src/etc/fail2ban/jail.d/riph-nginx-stream-private-sni-abuse.local" "${T}/etc/fail2ban/jail.d/"
+fail() {
+    echo "FAIL: $*" >&2
+    exit 1
+}
 
-cat >"${T}/usr/local/bin/f2b-stub" <<'EOF_STUB'
+make_case() {
+    local t="$1"
+    mkdir -p \
+        "${t}/etc/router-ip-push-hardening" \
+        "${t}/etc/fail2ban/jail.d" \
+        "${t}/var/lib/router-ip-push/ips" \
+        "${t}/var/log/nginx" \
+        "${t}/usr/local/bin"
+    cp "${ROOT}/config/config.env.example" "${t}/etc/router-ip-push-hardening/config.env"
+    cp "${ROOT}/config/trusted-static.list.example" "${t}/etc/router-ip-push-hardening/trusted-static.list"
+    cp "${ROOT}/config/previous-ip-grace.json.example" "${t}/etc/router-ip-push-hardening/previous-ip-grace.json"
+    : >"${t}/etc/router-ip-push-hardening/manual-deny-443.list"
+    : >"${t}/etc/router-ip-push-hardening/manual-deny-all.list"
+    printf '%s\n' '78.111.154.96' >"${t}/var/lib/router-ip-push/ips/AX3200.ipv4"
+    : >"${t}/var/log/nginx/riph-stream-sni.log"
+    cp "${ROOT}/src/etc/fail2ban/jail.d/riph-nginx-stream-sni-reject.local" "${t}/etc/fail2ban/jail.d/"
+    cp "${ROOT}/src/etc/fail2ban/jail.d/riph-nginx-stream-private-sni-abuse.local" "${t}/etc/fail2ban/jail.d/"
+
+    cat >"${t}/usr/local/bin/f2b-stub" <<'EOF_STUB'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 case "${1:-}" in
@@ -36,14 +43,50 @@ case "${1:-}" in
     -t|reload) exit 0 ;;
 esac
 EOF_STUB
-chmod +x "${T}/usr/local/bin/f2b-stub"
-export RIPH_FAIL2BAN_CLIENT_BIN="${T}/usr/local/bin/f2b-stub"
+    chmod +x "${t}/usr/local/bin/f2b-stub"
+}
 
-"${ACTIVATE}" --root "${T}"
-grep -Fx 'enabled = true' "${T}/etc/fail2ban/jail.d/riph-nginx-stream-sni-reject.local" >/dev/null
-grep -Fx 'enabled = true' "${T}/etc/fail2ban/jail.d/riph-nginx-stream-private-sni-abuse.local" >/dev/null
+CASE_OK="${BASE}/ok"
+make_case "${CASE_OK}"
+cat >"${CASE_OK}/usr/local/bin/guard-ok" <<'EOF_GUARD_OK'
+#!/usr/bin/env bash
+exit 0
+EOF_GUARD_OK
+chmod +x "${CASE_OK}/usr/local/bin/guard-ok"
 
-backup_count="$(find "${T}/var/lib/router-ip-push-hardening/backups" -maxdepth 1 -type d -name 'fail2ban-activate-*' | wc -l)"
-[[ "${backup_count}" -eq 1 ]] || { echo 'FAIL: activation backup missing' >&2; exit 1; }
+export RIPH_FAIL2BAN_CLIENT_BIN="${CASE_OK}/usr/local/bin/f2b-stub"
+export RIPH_GUARD_BIN="${CASE_OK}/usr/local/bin/guard-ok"
+
+"${ACTIVATE}" --root "${CASE_OK}"
+grep -Fx 'enabled = true' "${CASE_OK}/etc/fail2ban/jail.d/riph-nginx-stream-sni-reject.local" >/dev/null \
+    || fail 'reject jail was not enabled'
+grep -Fx 'enabled = true' "${CASE_OK}/etc/fail2ban/jail.d/riph-nginx-stream-private-sni-abuse.local" >/dev/null \
+    || fail 'private-abuse jail was not enabled'
+backup_count="$(find "${CASE_OK}/var/lib/router-ip-push-hardening/backups" -maxdepth 1 -type d -name 'fail2ban-activate-*' | wc -l)"
+[[ "${backup_count}" -eq 1 ]] || fail 'activation backup missing'
+
+# A failure after both jail files were already changed must still restore the
+# original disabled files. EXIT-trap coverage is important because explicit
+# riph_die/exit paths are not guaranteed to run an ERR trap.
+CASE_FAIL="${BASE}/fail"
+make_case "${CASE_FAIL}"
+cp "${CASE_FAIL}/etc/fail2ban/jail.d/riph-nginx-stream-sni-reject.local" "${CASE_FAIL}/reject.before"
+cp "${CASE_FAIL}/etc/fail2ban/jail.d/riph-nginx-stream-private-sni-abuse.local" "${CASE_FAIL}/private.before"
+cat >"${CASE_FAIL}/usr/local/bin/guard-fail" <<'EOF_GUARD_FAIL'
+#!/usr/bin/env bash
+exit 42
+EOF_GUARD_FAIL
+chmod +x "${CASE_FAIL}/usr/local/bin/guard-fail"
+
+export RIPH_FAIL2BAN_CLIENT_BIN="${CASE_FAIL}/usr/local/bin/f2b-stub"
+export RIPH_GUARD_BIN="${CASE_FAIL}/usr/local/bin/guard-fail"
+
+if "${ACTIVATE}" --root "${CASE_FAIL}" >/dev/null 2>&1; then
+    fail 'activation unexpectedly succeeded when late guard failed'
+fi
+cmp -s "${CASE_FAIL}/reject.before" "${CASE_FAIL}/etc/fail2ban/jail.d/riph-nginx-stream-sni-reject.local" \
+    || fail 'reject jail was not restored after activation failure'
+cmp -s "${CASE_FAIL}/private.before" "${CASE_FAIL}/etc/fail2ban/jail.d/riph-nginx-stream-private-sni-abuse.local" \
+    || fail 'private-abuse jail was not restored after activation failure'
 
 echo 'PASS: Fail2ban activation tests'
