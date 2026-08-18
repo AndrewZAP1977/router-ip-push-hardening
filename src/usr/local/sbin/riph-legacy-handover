@@ -87,6 +87,16 @@ LEGACY_JAIL="nginx-stream-sni-reject"
 RIPH_JAIL_1="riph-nginx-stream-sni-reject"
 RIPH_JAIL_2="riph-nginx-stream-private-sni-abuse"
 
+# EXIT traps run after the function that armed them has unwound. Transaction
+# state used by rollback must therefore be script-global, never local to
+# retire_cmd(), otherwise set -u can abort the rollback before files are restored.
+RETIRE_BACKUP_ID=""
+RETIRE_BACKUP_DIR=""
+RETIRE_DIR=""
+RETIRE_STARTED=0
+RETIRE_COMMITTED=0
+SHIELD_REMOVAL_STARTED=0
+
 jail_active() {
     "${F2B_BIN}" status "$1" >/dev/null 2>&1
 }
@@ -203,8 +213,43 @@ quiesce_cmd() {
     riph_log "wait until 'riph-legacy-handover status' shows legacy banned IPs: none, then retire"
 }
 
+rollback_retire_on_exit() {
+    local rc=$?
+    trap - EXIT
+
+    if (( RETIRE_STARTED == 1 && RETIRE_COMMITTED == 0 )); then
+        riph_log "legacy retirement failed; restoring active legacy files"
+        [[ -f "${RETIRE_DIR}/00-sni-watch.conf" ]] \
+            && mv -f "${RETIRE_DIR}/00-sni-watch.conf" "${LEGACY_WATCH}" || true
+        [[ -f "${RETIRE_DIR}/nginx-stream-sni-reject.local" ]] \
+            && mv -f "${RETIRE_DIR}/nginx-stream-sni-reject.local" "${LEGACY_JAIL_FILE}" || true
+        [[ -f "${RETIRE_DIR}/zz-riph-legacy-trusted-ignore.local" ]] \
+            && mv -f "${RETIRE_DIR}/zz-riph-legacy-trusted-ignore.local" "${LEGACY_IGNORE_OVERRIDE}" || true
+        cp -a "${RETIRE_BACKUP_DIR}/config.env" "${CONFIG_FILE}" || true
+        cp -a "${RETIRE_BACKUP_DIR}/stream.conf" "${STREAM_FILE}" || true
+
+        if [[ "${RIPH_ROOT}" == "/" ]]; then
+            if "${NGINX_BIN}" -t >/dev/null 2>&1; then
+                "${SYSTEMCTL_BIN}" reload nginx >/dev/null 2>&1 || true
+            fi
+            if "${F2B_BIN}" -t >/dev/null 2>&1; then
+                "${F2B_BIN}" reload >/dev/null 2>&1 || true
+            fi
+        fi
+
+        # If shield cleanup had begun, recreate/synchronize only project-owned
+        # current-IP shields after the legacy coexistence files are restored.
+        if (( SHIELD_REMOVAL_STARTED == 1 )); then
+            if ! bash "${GUARD_BIN}" --root "${RIPH_ROOT}" --config "${CONFIG_PATH}" >/dev/null 2>&1; then
+                riph_log "WARNING: legacy files restored but trusted UFW shield resync failed"
+            fi
+        fi
+    fi
+    exit "${rc}"
+}
+
 retire_cmd() {
-    local bans backup_id backup_dir retire_dir
+    local bans
 
     require_riph_jails
     [[ "$(compat_value)" == 0 ]] || riph_die "legacy external logging is still enabled; run quiesce first"
@@ -224,60 +269,25 @@ retire_cmd() {
         return 0
     fi
 
-    backup_id="legacy-retire-$(date -u '+%Y%m%d-%H%M%S')-$$"
-    backup_dir="${BACKUP_ROOT}/${backup_id}"
-    retire_dir="${RETIRE_ROOT}/${backup_id}"
-    mkdir -p "${backup_dir}" "${retire_dir}"
-    cp -a "${CONFIG_FILE}" "${backup_dir}/config.env"
-    cp -a "${STREAM_FILE}" "${backup_dir}/stream.conf"
-    cp -a "${LEGACY_WATCH}" "${backup_dir}/00-sni-watch.conf"
-    cp -a "${LEGACY_JAIL_FILE}" "${backup_dir}/nginx-stream-sni-reject.local"
-    cp -a "${LEGACY_IGNORE_OVERRIDE}" "${backup_dir}/zz-riph-legacy-trusted-ignore.local"
+    RETIRE_BACKUP_ID="legacy-retire-$(date -u '+%Y%m%d-%H%M%S')-$$"
+    RETIRE_BACKUP_DIR="${BACKUP_ROOT}/${RETIRE_BACKUP_ID}"
+    RETIRE_DIR="${RETIRE_ROOT}/${RETIRE_BACKUP_ID}"
+    mkdir -p "${RETIRE_BACKUP_DIR}" "${RETIRE_DIR}"
+    cp -a "${CONFIG_FILE}" "${RETIRE_BACKUP_DIR}/config.env"
+    cp -a "${STREAM_FILE}" "${RETIRE_BACKUP_DIR}/stream.conf"
+    cp -a "${LEGACY_WATCH}" "${RETIRE_BACKUP_DIR}/00-sni-watch.conf"
+    cp -a "${LEGACY_JAIL_FILE}" "${RETIRE_BACKUP_DIR}/nginx-stream-sni-reject.local"
+    cp -a "${LEGACY_IGNORE_OVERRIDE}" "${RETIRE_BACKUP_DIR}/zz-riph-legacy-trusted-ignore.local"
 
-    RETIRE_STARTED=0
+    RETIRE_STARTED=1
     RETIRE_COMMITTED=0
     SHIELD_REMOVAL_STARTED=0
-    rollback_retire_on_exit() {
-        local rc=$?
-        trap - EXIT
-
-        if (( RETIRE_STARTED == 1 && RETIRE_COMMITTED == 0 )); then
-            riph_log "legacy retirement failed; restoring active legacy files"
-            [[ -f "${retire_dir}/00-sni-watch.conf" ]] \
-                && mv -f "${retire_dir}/00-sni-watch.conf" "${LEGACY_WATCH}" || true
-            [[ -f "${retire_dir}/nginx-stream-sni-reject.local" ]] \
-                && mv -f "${retire_dir}/nginx-stream-sni-reject.local" "${LEGACY_JAIL_FILE}" || true
-            [[ -f "${retire_dir}/zz-riph-legacy-trusted-ignore.local" ]] \
-                && mv -f "${retire_dir}/zz-riph-legacy-trusted-ignore.local" "${LEGACY_IGNORE_OVERRIDE}" || true
-            cp -a "${backup_dir}/config.env" "${CONFIG_FILE}" || true
-            cp -a "${backup_dir}/stream.conf" "${STREAM_FILE}" || true
-
-            if [[ "${RIPH_ROOT}" == "/" ]]; then
-                if "${NGINX_BIN}" -t >/dev/null 2>&1; then
-                    "${SYSTEMCTL_BIN}" reload nginx >/dev/null 2>&1 || true
-                fi
-                if "${F2B_BIN}" -t >/dev/null 2>&1; then
-                    "${F2B_BIN}" reload >/dev/null 2>&1 || true
-                fi
-            fi
-
-            # If shield cleanup had begun, recreate/synchronize only project-owned
-            # current-IP shields after the legacy coexistence files are restored.
-            if (( SHIELD_REMOVAL_STARTED == 1 )); then
-                if ! bash "${GUARD_BIN}" --root "${RIPH_ROOT}" --config "${CONFIG_PATH}" >/dev/null 2>&1; then
-                    riph_log "WARNING: legacy files restored but trusted UFW shield resync failed"
-                fi
-            fi
-        fi
-        exit "${rc}"
-    }
     trap rollback_retire_on_exit EXIT
-    RETIRE_STARTED=1
 
     # First remove the old stream-level logger. After quiesce the external :443
     # server already has only the RIPH server-level access_log, so this operation
     # removes remaining legacy bridge logging without changing routing.
-    mv "${LEGACY_WATCH}" "${retire_dir}/00-sni-watch.conf"
+    mv "${LEGACY_WATCH}" "${RETIRE_DIR}/00-sni-watch.conf"
     if [[ "${RIPH_ROOT}" == "/" ]]; then
         "${NGINX_BIN}" -t
         "${SYSTEMCTL_BIN}" reload nginx
@@ -290,8 +300,8 @@ retire_cmd() {
     bans="$(read_legacy_bans_or_die 'post-logger retirement check')"
     [[ -z "${bans}" ]] || riph_die "legacy jail gained/retained ban(s) after logger shutdown: ${bans}; retirement rolled back"
 
-    mv "${LEGACY_JAIL_FILE}" "${retire_dir}/nginx-stream-sni-reject.local"
-    mv "${LEGACY_IGNORE_OVERRIDE}" "${retire_dir}/zz-riph-legacy-trusted-ignore.local"
+    mv "${LEGACY_JAIL_FILE}" "${RETIRE_DIR}/nginx-stream-sni-reject.local"
+    mv "${LEGACY_IGNORE_OVERRIDE}" "${RETIRE_DIR}/zz-riph-legacy-trusted-ignore.local"
     if [[ "${RIPH_ROOT}" == "/" ]]; then
         "${F2B_BIN}" -t
         "${F2B_BIN}" reload
@@ -309,8 +319,8 @@ retire_cmd() {
     RETIRE_COMMITTED=1
     trap - EXIT
     riph_log "legacy stream watch/jail/trusted-ignore/shield retired; filter/action files retained for forensic rollback"
-    riph_log "retirement backup: ${backup_dir}"
-    riph_log "retired active files: ${retire_dir}"
+    riph_log "retirement backup: ${RETIRE_BACKUP_DIR}"
+    riph_log "retired active files: ${RETIRE_DIR}"
 }
 
 case "${COMMAND}" in
