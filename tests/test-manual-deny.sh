@@ -10,7 +10,7 @@ mkdir -p "${T}/etc/router-ip-push-hardening" "${T}/var/lib/router-ip-push/ips" "
 cp "${ROOT}/config/config.env.example" "${T}/etc/router-ip-push-hardening/config.env"
 printf '%s\n' '127.0.0.1/32 # localhost' >"${T}/etc/router-ip-push-hardening/trusted-static.list"
 printf '%s\n' '{"version":1,"routers":{}}' >"${T}/etc/router-ip-push-hardening/previous-ip-grace.json"
-printf '%s\n' '192.0.2.25' >"${T}/var/lib/router-ip-push/ips/AX3200.ipv4"
+printf '%s\n' '192.0.2.25' >"${T}/var/lib/router-ip-push/ips/ROUTER_A.ipv4"
 printf '%s\n' '198.51.100.0/24 # scanner test range' >"${T}/etc/router-ip-push-hardening/manual-deny-443.list"
 printf '%s\n' '203.0.113.165 # exceptional test host' >"${T}/etc/router-ip-push-hardening/manual-deny-all.list"
 
