@@ -30,7 +30,7 @@ make_case() {
     cp "${ROOT}/src/etc/fail2ban/filter.d/riph-nginx-stream-sni-reject.conf" "${t}/etc/fail2ban/filter.d/"
     cp "${ROOT}/src/etc/fail2ban/filter.d/riph-nginx-stream-private-sni-abuse.conf" "${t}/etc/fail2ban/filter.d/"
 
-    printf '%s\n' '78.111.154.96' >"${t}/var/lib/router-ip-push/ips/AX3200.ipv4"
+    printf '%s\n' '192.0.2.26' >"${t}/var/lib/router-ip-push/ips/AX3200.ipv4"
     : >"${t}/var/log/nginx/riph-stream-sni.log"
     cat >"${t}/etc/nginx/stream-enabled/stream.conf" <<'EOF_STREAM'
 server {
@@ -40,7 +40,7 @@ EOF_STREAM
     cat >"${t}/etc/nginx/stream-enabled/05-router-ip-push-source-allow.conf" <<'EOF_ALLOW'
 geo $router_ip_push_source_allowed {
     default 0;
-    78.111.154.96/32 1; # router-ip-push:AX3200 current
+    192.0.2.26/32 1; # router-ip-push:AX3200 current
 }
 EOF_ALLOW
 
@@ -137,12 +137,12 @@ grep -Fxq 'enabled = false' "${CASE_HOTFIX}/etc/fail2ban/jail.d/riph-nginx-strea
 CASE_ALLOW="${BASE}/missing-current"
 make_case "${CASE_ALLOW}"
 write_systemctl_stub "${CASE_ALLOW}" 0
-sed -i 's/78\.111\.154\.96\/32/78.111.155.187\/32/' \
+sed -i 's/192\.0\.2\.26\/32/192.0.2.25\/32/' \
     "${CASE_ALLOW}/etc/nginx/stream-enabled/05-router-ip-push-source-allow.conf"
 if run_readiness "${CASE_ALLOW}" "${CASE_ALLOW}/out.txt"; then
     fail 'Fail2ban readiness accepted allowlist missing current Router IP'
 fi
-grep -Fq 'current AX3200 IP 78.111.154.96 is absent from active allowlist' "${CASE_ALLOW}/out.txt" \
+grep -Fq 'current AX3200 IP 192.0.2.26 is absent from active allowlist' "${CASE_ALLOW}/out.txt" \
     || fail 'missing-current readiness refusal missing'
 
 CASE_OK="${BASE}/ok"
