@@ -20,11 +20,11 @@ make_case() {
         "${t}/var/lib/router-ip-push/ips" \
         "${t}/usr/local/bin"
     cp "${ROOT}/config/config.env.example" "${t}/etc/router-ip-push-hardening/config.env"
-    # The production default is now compatibility OFF. This test intentionally
+    # The production default is compatibility OFF. This test intentionally
     # recreates the old coexistence phase so quiesce/retire behavior stays covered.
     sed -i 's/^LEGACY_STREAM_AUDIT_COMPAT=0$/LEGACY_STREAM_AUDIT_COMPAT=1/' \
         "${t}/etc/router-ip-push-hardening/config.env"
-    printf '%s\n' '78.111.154.96' >"${t}/var/lib/router-ip-push/ips/AX3200.ipv4"
+    printf '%s\n' '192.0.2.26' >"${t}/var/lib/router-ip-push/ips/AX3200.ipv4"
     printf '%s\n' 'STREAM_SENTINEL' >"${t}/etc/nginx/stream-enabled/stream.conf"
     printf '%s\n' 'LEGACY_WATCH' >"${t}/etc/nginx/stream-enabled/00-sni-watch.conf"
     printf '%s\n' '[nginx-stream-sni-reject]' >"${t}/etc/fail2ban/jail.d/nginx-stream-sni-reject.local"
@@ -55,7 +55,7 @@ EOF_GUARD
 CASE_NORMAL="${BASE}/normal"
 make_case "${CASE_NORMAL}"
 BANS="${CASE_NORMAL}/bans.txt"
-printf '%s\n' '66.132.224.81' >"${BANS}"
+printf '%s\n' '203.0.113.81' >"${BANS}"
 cat >"${CASE_NORMAL}/usr/local/bin/f2b-stub" <<'EOF_STUB'
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -142,7 +142,7 @@ case "${1:-}" in
             count=$((count + 1))
             printf '%s\n' "${count}" >"${RIPH_TEST_BAN_COUNT}"
             if (( count >= 2 )); then
-                printf '%s\n' '66.132.172.105'
+                printf '%s\n' '203.0.113.105'
             fi
         fi
         ;;
