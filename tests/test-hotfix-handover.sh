@@ -21,7 +21,7 @@ make_case() {
         "${c}/bin" \
         "${c}/state"
     cp "${ROOT}/config/config.env.example" "${c}/etc/router-ip-push-hardening/config.env"
-    printf '%s\n' '192.0.2.26' >"${c}/var/lib/router-ip-push/ips/AX3200.ipv4"
+    printf '%s\n' '192.0.2.26' >"${c}/var/lib/router-ip-push/ips/ROUTER_A.ipv4"
 
     printf '%s\n' enabled >"${c}/state/router-ip-push-nginx-hotfix.path.enabled"
     printf '%s\n' active >"${c}/state/router-ip-push-nginx-hotfix.path.active"
@@ -96,22 +96,14 @@ EOF_SYSTEMCTL
 
 assert_hotfix_owner() {
     local c="$1"
-    [[ "$(cat "${c}/state/router-ip-push-nginx-hotfix.path.enabled")" == enabled ]] \
-        || fail 'hotfix path not enabled after rollback'
-    [[ "$(cat "${c}/state/router-ip-push-nginx-hotfix.path.active")" == active ]] \
-        || fail 'hotfix path not active after rollback'
-    [[ "$(cat "${c}/state/router-ip-push-nginx-hotfix.timer.enabled")" == enabled ]] \
-        || fail 'hotfix timer not enabled after rollback'
-    [[ "$(cat "${c}/state/router-ip-push-nginx-hotfix.timer.active")" == active ]] \
-        || fail 'hotfix timer not active after rollback'
-    [[ "$(cat "${c}/state/riph-router-ip.path.enabled")" == disabled ]] \
-        || fail 'RIPH path remained enabled after rollback'
-    [[ "$(cat "${c}/state/riph-router-ip.path.active")" == inactive ]] \
-        || fail 'RIPH path remained active after rollback'
-    [[ "$(cat "${c}/state/riph-reconcile.timer.enabled")" == disabled ]] \
-        || fail 'RIPH timer remained enabled after rollback'
-    [[ "$(cat "${c}/state/riph-reconcile.timer.active")" == inactive ]] \
-        || fail 'RIPH timer remained active after rollback'
+    [[ "$(cat "${c}/state/router-ip-push-nginx-hotfix.path.enabled")" == enabled ]] || fail 'hotfix path not enabled after rollback'
+    [[ "$(cat "${c}/state/router-ip-push-nginx-hotfix.path.active")" == active ]] || fail 'hotfix path not active after rollback'
+    [[ "$(cat "${c}/state/router-ip-push-nginx-hotfix.timer.enabled")" == enabled ]] || fail 'hotfix timer not enabled after rollback'
+    [[ "$(cat "${c}/state/router-ip-push-nginx-hotfix.timer.active")" == active ]] || fail 'hotfix timer not active after rollback'
+    [[ "$(cat "${c}/state/riph-router-ip.path.enabled")" == disabled ]] || fail 'RIPH path remained enabled after rollback'
+    [[ "$(cat "${c}/state/riph-router-ip.path.active")" == inactive ]] || fail 'RIPH path remained active after rollback'
+    [[ "$(cat "${c}/state/riph-reconcile.timer.enabled")" == disabled ]] || fail 'RIPH timer remained enabled after rollback'
+    [[ "$(cat "${c}/state/riph-reconcile.timer.active")" == inactive ]] || fail 'RIPH timer remained active after rollback'
 }
 
 CASE_OK="${T}/ok"
@@ -126,12 +118,12 @@ while (($#)); do
         *) shift ;;
     esac
 done
-ip="$(tr -d '[:space:]' <"${root}/var/lib/router-ip-push/ips/AX3200.ipv4")"
+ip="$(tr -d '[:space:]' <"${root}/var/lib/router-ip-push/ips/ROUTER_A.ipv4")"
 mkdir -p "${root}/etc/nginx/stream-enabled"
 cat >"${root}/etc/nginx/stream-enabled/05-router-ip-push-source-allow.conf" <<EOF_ALLOW
 geo \$router_ip_push_source_allowed {
         default 0;
-        ${ip}/32 1; # router-ip-push:AX3200 current
+        ${ip}/32 1; # router-ip-push:ROUTER_A current
 }
 EOF_ALLOW
 printf '%s\n' "${ip}" >>"${RIPH_TEST_RECONCILE_LOG:?}"
@@ -143,33 +135,23 @@ export RIPH_RECONCILE_BIN="${CASE_OK}/bin/reconcile-stub"
 export RIPH_TEST_SYSTEMD_STATE="${CASE_OK}/state"
 export RIPH_TEST_RECONCILE_LOG="${CASE_OK}/reconcile.log"
 export RIPH_HOTFIX_LOCK="${CASE_OK}/hotfix.lock"
-export RIPH_TEST_IP_FILE="${CASE_OK}/var/lib/router-ip-push/ips/AX3200.ipv4"
+export RIPH_TEST_IP_FILE="${CASE_OK}/var/lib/router-ip-push/ips/ROUTER_A.ipv4"
 export RIPH_TEST_IP_AFTER_FIRST='192.0.2.27'
 
 bash "${HANDOVER}" --root "${CASE_OK}" takeover >/dev/null
-[[ "$(cat "${CASE_OK}/state/router-ip-push-nginx-hotfix.path.enabled")" == disabled ]] \
-    || fail 'hotfix path stayed enabled after successful takeover'
-[[ "$(cat "${CASE_OK}/state/router-ip-push-nginx-hotfix.path.active")" == inactive ]] \
-    || fail 'hotfix path stayed active after successful takeover'
-[[ "$(cat "${CASE_OK}/state/router-ip-push-nginx-hotfix.timer.enabled")" == disabled ]] \
-    || fail 'hotfix timer stayed enabled after successful takeover'
-[[ "$(cat "${CASE_OK}/state/router-ip-push-nginx-hotfix.timer.active")" == inactive ]] \
-    || fail 'hotfix timer stayed active after successful takeover'
-[[ "$(cat "${CASE_OK}/state/riph-router-ip.path.active")" == active ]] \
-    || fail 'RIPH path is not active after successful takeover'
-[[ "$(cat "${CASE_OK}/state/riph-reconcile.timer.active")" == active ]] \
-    || fail 'RIPH timer is not active after successful takeover'
+[[ "$(cat "${CASE_OK}/state/router-ip-push-nginx-hotfix.path.enabled")" == disabled ]] || fail 'hotfix path stayed enabled after successful takeover'
+[[ "$(cat "${CASE_OK}/state/router-ip-push-nginx-hotfix.path.active")" == inactive ]] || fail 'hotfix path stayed active after successful takeover'
+[[ "$(cat "${CASE_OK}/state/router-ip-push-nginx-hotfix.timer.enabled")" == disabled ]] || fail 'hotfix timer stayed enabled after successful takeover'
+[[ "$(cat "${CASE_OK}/state/router-ip-push-nginx-hotfix.timer.active")" == inactive ]] || fail 'hotfix timer stayed active after successful takeover'
+[[ "$(cat "${CASE_OK}/state/riph-router-ip.path.active")" == active ]] || fail 'RIPH path is not active after successful takeover'
+[[ "$(cat "${CASE_OK}/state/riph-reconcile.timer.active")" == active ]] || fail 'RIPH timer is not active after successful takeover'
 [[ "$(wc -l <"${CASE_OK}/reconcile.log")" == 2 ]] || fail 'stable handover should need exactly two explicit reconciles'
-[[ "$(sed -n '1p' "${CASE_OK}/reconcile.log")" == '192.0.2.26' ]] \
-    || fail 'first reconcile did not consume the starting IP'
-[[ "$(sed -n '2p' "${CASE_OK}/reconcile.log")" == '192.0.2.27' ]] \
-    || fail 'post-path reconcile did not consume the IP changed during handover'
-grep -Fq '192.0.2.27/32 1;' "${CASE_OK}/etc/nginx/stream-enabled/05-router-ip-push-source-allow.conf" \
-    || fail 'final allowlist does not contain the IP changed during handover'
+[[ "$(sed -n '1p' "${CASE_OK}/reconcile.log")" == '192.0.2.26' ]] || fail 'first reconcile did not consume the starting IP'
+[[ "$(sed -n '2p' "${CASE_OK}/reconcile.log")" == '192.0.2.27' ]] || fail 'post-path reconcile did not consume the IP changed during handover'
+grep -Fq '192.0.2.27/32 1;' "${CASE_OK}/etc/nginx/stream-enabled/05-router-ip-push-source-allow.conf" || fail 'final allowlist does not contain the IP changed during handover'
 
 unset RIPH_TEST_IP_AFTER_FIRST
 
-# Failure before RIPH activation must restore the temporary owner.
 CASE_FAIL_EARLY="${T}/fail-early"
 make_case "${CASE_FAIL_EARLY}"
 cat >"${CASE_FAIL_EARLY}/bin/reconcile-stub" <<'EOF_RECONCILE_FAIL_EARLY'
@@ -183,16 +165,13 @@ export RIPH_RECONCILE_BIN="${CASE_FAIL_EARLY}/bin/reconcile-stub"
 export RIPH_TEST_SYSTEMD_STATE="${CASE_FAIL_EARLY}/state"
 export RIPH_TEST_RECONCILE_LOG="${CASE_FAIL_EARLY}/reconcile.log"
 export RIPH_HOTFIX_LOCK="${CASE_FAIL_EARLY}/hotfix.lock"
-export RIPH_TEST_IP_FILE="${CASE_FAIL_EARLY}/var/lib/router-ip-push/ips/AX3200.ipv4"
+export RIPH_TEST_IP_FILE="${CASE_FAIL_EARLY}/var/lib/router-ip-push/ips/ROUTER_A.ipv4"
 
 if bash "${HANDOVER}" --root "${CASE_FAIL_EARLY}" takeover >/dev/null 2>&1; then
     fail 'handover unexpectedly succeeded when initial reconcile failed'
 fi
 assert_hotfix_owner "${CASE_FAIL_EARLY}"
 
-# Failure after RIPH path activation must immediately restore the temporary owner.
-# The bounded A->B->C retry now belongs inside riph-reconcile itself, so handover
-# performs exactly one initial reconcile and one post-path reconcile.
 CASE_FAIL_LATE="${T}/fail-late"
 make_case "${CASE_FAIL_LATE}"
 cat >"${CASE_FAIL_LATE}/bin/reconcile-stub" <<'EOF_RECONCILE_FAIL_LATE'
@@ -215,7 +194,7 @@ if (( count == 1 )); then
     cat >"${root}/etc/nginx/stream-enabled/05-router-ip-push-source-allow.conf" <<'EOF_ALLOW'
 geo $router_ip_push_source_allowed {
         default 0;
-        192.0.2.26/32 1; # router-ip-push:AX3200 current
+        192.0.2.26/32 1; # router-ip-push:ROUTER_A current
 }
 EOF_ALLOW
     exit 0
@@ -230,13 +209,12 @@ export RIPH_TEST_SYSTEMD_STATE="${CASE_FAIL_LATE}/state"
 export RIPH_TEST_RECONCILE_LOG="${CASE_FAIL_LATE}/reconcile.log"
 export RIPH_TEST_RECONCILE_COUNT="${CASE_FAIL_LATE}/reconcile.count"
 export RIPH_HOTFIX_LOCK="${CASE_FAIL_LATE}/hotfix.lock"
-export RIPH_TEST_IP_FILE="${CASE_FAIL_LATE}/var/lib/router-ip-push/ips/AX3200.ipv4"
+export RIPH_TEST_IP_FILE="${CASE_FAIL_LATE}/var/lib/router-ip-push/ips/ROUTER_A.ipv4"
 
 if bash "${HANDOVER}" --root "${CASE_FAIL_LATE}" takeover >/dev/null 2>&1; then
     fail 'handover unexpectedly succeeded when the post-path reconcile failed'
 fi
 assert_hotfix_owner "${CASE_FAIL_LATE}"
-[[ "$(cat "${CASE_FAIL_LATE}/reconcile.count")" == 2 ]] \
-    || fail 'late failure should perform exactly initial + post-path reconciles'
+[[ "$(cat "${CASE_FAIL_LATE}/reconcile.count")" == 2 ]] || fail 'late failure should perform exactly initial + post-path reconciles'
 
 echo 'PASS: temporary hotfix ownership handover tests'
