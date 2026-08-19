@@ -7,8 +7,78 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 
 make_root() {
     local t="$1"
-    mkdir -p "${t}/var/lib/router-ip-push/ips" "${t}/usr/local/bin" "${t}/etc/nginx/stream-enabled"
-    printf '%s\n' '78.111.155.187' >"${t}/var/lib/router-ip-push/ips/AX3200.ipv4"
+    mkdir -p \
+        "${t}/var/lib/router-ip-push/ips" \
+        "${t}/var/lib/router-ip-push/state" \
+        "${t}/etc/router-ip-push/routers.d" \
+        "${t}/usr/local/bin" \
+        "${t}/etc/nginx/stream-enabled" \
+        "${t}/etc/nginx/sites-available"
+
+    printf '%s\n' '198.51.100.25' >"${t}/var/lib/router-ip-push/ips/TEST_ROUTER.ipv4"
+    printf '%s\n' '{"version":1,"router_id":"TEST_ROUTER","source_ip":"198.51.100.25","last_seen":"2026-08-19T10:00:00Z"}' \
+        >"${t}/var/lib/router-ip-push/state/TEST_ROUTER.json"
+    printf '%s\n' '{"version":1,"router_id":"TEST_ROUTER","public_key":"ssh-ed25519 AAAA"}' \
+        >"${t}/etc/router-ip-push/routers.d/TEST_ROUTER.json"
+
+    cat >"${t}/etc/nginx/stream-enabled/stream.conf" <<'EOF_STREAM'
+# PREINSTALL_STREAM_SENTINEL
+map $ssl_preread_server_name $sni_name
+{
+    hostnames;
+    public.example.net      www;
+    reality.example.net     xray;
+    xhttp.example.net       xray2;
+    default                 reject;
+}
+
+upstream www
+{
+    server 127.0.0.1:7443;
+}
+
+upstream xray
+{
+    server 127.0.0.1:8443;
+}
+
+upstream reject
+{
+    server 127.0.0.1:9;
+}
+
+upstream xray2 { server 127.0.0.1:8444; }
+
+server
+{
+    proxy_protocol on;
+    proxy_connect_timeout 5s;
+    proxy_timeout 1h;
+    tcp_nodelay on;
+    set_real_ip_from unix:;
+    listen 443;
+    listen [::]:443;
+    proxy_pass $sni_name;
+    ssl_preread on;
+}
+EOF_STREAM
+
+    cat >"${t}/etc/nginx/sites-available/reality.conf" <<'EOF_REALITY'
+server
+{
+    server_name reality.example.net;
+    listen 127.0.0.1:9443 ssl;
+}
+EOF_REALITY
+
+    cat >"${t}/etc/nginx/sites-available/xhttp.conf" <<'EOF_XHTTP'
+server
+{
+    server_name xhttp.example.net;
+    listen 127.0.0.1:9444 ssl;
+}
+EOF_XHTTP
+
     cat >"${t}/usr/local/bin/nginx-stub" <<'EOF_STUB'
 #!/usr/bin/env bash
 exit "${RIPH_TEST_NGINX_EXIT:-0}"
@@ -19,8 +89,6 @@ exit "${RIPH_TEST_SYSTEMCTL_EXIT:-0}"
 EOF_STUB
     cat >"${t}/usr/local/bin/ufw-stub" <<'EOF_STUB'
 #!/usr/bin/env bash
-# Installer test-root has empty manual-deny lists. The production helper now
-# fails closed unless a UFW executable is available, so provide a harmless stub.
 if [[ "${1:-}" == status && "${2:-}" == numbered ]]; then
     printf '%s\n' 'Status: active'
 fi
@@ -38,11 +106,10 @@ make_root "${T1}"
 make_root "${T2}"
 make_root "${T3}"
 make_root "${T4}"
-printf '%s\n' 'PREINSTALL_STREAM_SENTINEL' >"${T1}/etc/nginx/stream-enabled/stream.conf"
 
-# Structural safety assertions: the installer transaction must use EXIT rollback
-# (explicit riph_die/exit paths included) and must resynchronize the live temporary
-# Router-IP owner after a failed production install restores an older Nginx snapshot.
+# Structural safety assertions: installer rollback must cover explicit failures,
+# and a first install must bootstrap routing from the existing stream.conf rather
+# than seed placeholder SNI values.
 grep -Fq 'trap restore_install_on_exit EXIT' "${INSTALLER}" \
     || fail 'installer is not protected by EXIT rollback'
 grep -Fq 'resync_temporary_hotfix_after_error' "${INSTALLER}" \
@@ -51,8 +118,10 @@ grep -Fq 'disable --now "${RIPH_PATH_UNIT}" "${RIPH_TIMER_UNIT}"' "${INSTALLER}"
     || fail 'installer rollback does not remove partial RIPH automatic ownership first'
 grep -Fq 'RIPH_ALLOW_PRODUCTION' "${INSTALLER}" \
     || fail 'installer lost explicit production confirmation gate'
+grep -Fq 'bootstrap-config-from-stream.sh' "${INSTALLER}" \
+    || fail 'installer lost first-install stream bootstrap'
 
-echo 'TEST I1: fresh test-root install + apply'
+echo 'TEST I1: fresh test-root install adopts existing stream routing + applies RIPH'
 export RIPH_NGINX_BIN="${T1}/usr/local/bin/nginx-stub"
 export RIPH_SYSTEMCTL_BIN="${T1}/usr/local/bin/systemctl-stub"
 export RIPH_UFW_BIN="${T1}/usr/local/bin/ufw-stub"
@@ -79,27 +148,37 @@ grep -Fqx 'OnUnitActiveSec=1min' "${T1}/etc/systemd/system/riph-reconcile.timer"
 [[ ! -e "${T1}/etc/systemd/system/riph-guard.timer" ]] || fail 'redundant guard timer was installed'
 grep -Fx '127.0.0.1/32          # localhost' "${T1}/etc/router-ip-push-hardening/trusted-static.list" >/dev/null \
     || fail 'fresh install did not seed localhost static trust'
-grep -Fq '# 203.0.113.10/32' "${T1}/etc/router-ip-push-hardening/trusted-static.list" \
-    || fail 'fresh install did not seed generic static-trust example comments'
-grep -Fx 'ROUTER_AUTO_DISCOVER_REGISTERED=1' "${T1}/etc/router-ip-push-hardening/config.env" >/dev/null \
-    || fail 'fresh install did not enable registered Router IP Push auto-discovery'
-grep -Fx 'ROUTER_REGISTRY_DIR="/etc/router-ip-push/routers.d"' "${T1}/etc/router-ip-push-hardening/config.env" >/dev/null \
-    || fail 'fresh install did not seed Router IP Push registry path'
-grep -Fx 'LEGACY_STREAM_AUDIT_COMPAT=0' "${T1}/etc/router-ip-push-hardening/config.env" >/dev/null \
-    || fail 'fresh install did not use legacy-audit compatibility default OFF'
-[[ -f "${T1}/etc/nginx/stream-enabled/stream.conf" ]] || fail 'stream config not applied'
-grep -F 'access_log /var/log/nginx/riph-stream-sni.log riph_stream_sni;' "${T1}/etc/nginx/stream-enabled/stream.conf" >/dev/null || fail 'dedicated audit log missing'
-! grep -F 'access_log /var/log/nginx/stream-sni.log sni_watch' "${T1}/etc/nginx/stream-enabled/stream.conf" >/dev/null \
-    || fail 'fresh install unexpectedly feeds legacy audit log'
-grep -F 'private-a.example.invalid|1' "${T1}/etc/nginx/stream-enabled/stream.conf" >/dev/null || fail 'private routing missing'
+
+CONFIG="${T1}/etc/router-ip-push-hardening/config.env"
+grep -Fx 'ROUTER_IDS=""' "${CONFIG}" >/dev/null || fail 'fresh imported config retained example explicit router ID'
+grep -Fx 'ROUTER_AUTO_DISCOVER_REGISTERED=1' "${CONFIG}" >/dev/null || fail 'fresh install did not enable Router IP Push auto-discovery'
+grep -Fx 'ROUTER_REGISTRY_DIR="/etc/router-ip-push/routers.d"' "${CONFIG}" >/dev/null || fail 'fresh install did not seed Router IP Push registry path'
+grep -Fx 'PUBLIC_SNI="public.example.net"' "${CONFIG}" >/dev/null || fail 'fresh install did not import public SNI'
+grep -Fx 'PRIVATE_ROUTE_COUNT=2' "${CONFIG}" >/dev/null || fail 'fresh install did not detect both private routes'
+grep -Fx 'PRIVATE_SNI_1="reality.example.net"' "${CONFIG}" >/dev/null || fail 'fresh install did not import Reality SNI'
+grep -Fx 'PRIVATE_SNI_2="xhttp.example.net"' "${CONFIG}" >/dev/null || fail 'fresh install did not import XHTTP SNI'
+grep -Fx 'FAKE_SITE_UPSTREAM_1="127.0.0.1:9443"' "${CONFIG}" >/dev/null || fail 'fresh install did not import Reality fake-site upstream'
+grep -Fx 'FAKE_SITE_UPSTREAM_2="127.0.0.1:9444"' "${CONFIG}" >/dev/null || fail 'fresh install did not import XHTTP fake-site upstream'
+grep -Fx 'LEGACY_STREAM_AUDIT_COMPAT=0' "${CONFIG}" >/dev/null || fail 'fresh install did not use normal audit default'
+
+STREAM="${T1}/etc/nginx/stream-enabled/stream.conf"
+[[ -f "${STREAM}" ]] || fail 'stream config not applied'
+grep -F 'access_log /var/log/nginx/riph-stream-sni.log riph_stream_sni;' "${STREAM}" >/dev/null || fail 'dedicated audit log missing'
+grep -F 'public.example.net|0' "${STREAM}" >/dev/null || fail 'public routing missing after adoption'
+grep -F 'reality.example.net|1' "${STREAM}" >/dev/null || fail 'trusted Reality routing missing after adoption'
+grep -F 'xhttp.example.net|1' "${STREAM}" >/dev/null || fail 'trusted XHTTP routing missing after adoption'
+grep -F 'reality.example.net|0' "${STREAM}" >/dev/null || fail 'untrusted Reality fake routing missing after adoption'
+grep -F 'xhttp.example.net|0' "${STREAM}" >/dev/null || fail 'untrusted XHTTP fake routing missing after adoption'
+
 backup_stream="$(find "${T1}/var/lib/router-ip-push-hardening/install-backups" -path '*/files/etc/nginx/stream-enabled/stream.conf' -type f | head -n 1)"
 [[ -n "${backup_stream}" ]] || fail 'install backup did not capture pre-install stream.conf'
-grep -Fx 'PREINSTALL_STREAM_SENTINEL' "${backup_stream}" >/dev/null || fail 'pre-install stream snapshot mismatch'
+grep -Fq 'PREINSTALL_STREAM_SENTINEL' "${backup_stream}" || fail 'pre-install stream snapshot mismatch'
 
-echo 'TEST I2: failed apply restores pre-install files via EXIT transaction'
+echo 'TEST I2: failed apply restores original pre-RIPH stream + files via EXIT transaction'
 mkdir -p "${T2}/usr/local/sbin"
 printf '%s\n' 'PREEXISTING_ADMIN_SENTINEL' >"${T2}/usr/local/sbin/riph-admin"
 chmod 0700 "${T2}/usr/local/sbin/riph-admin"
+cp "${T2}/etc/nginx/stream-enabled/stream.conf" "${T2}/stream.before"
 export RIPH_NGINX_BIN="${T2}/usr/local/bin/nginx-stub"
 export RIPH_SYSTEMCTL_BIN="${T2}/usr/local/bin/systemctl-stub"
 export RIPH_UFW_BIN="${T2}/usr/local/bin/ufw-stub"
@@ -113,6 +192,7 @@ grep -Fx 'PREEXISTING_ADMIN_SENTINEL' "${T2}/usr/local/sbin/riph-admin" >/dev/nu
 [[ ! -e "${T2}/etc/systemd/system/riph-reconcile.timer" ]] || fail 'new systemd unit was not removed by install rollback'
 [[ ! -e "${T2}/etc/fail2ban/jail.d/riph-nginx-stream-sni-reject.local" ]] || fail 'new RIPH Fail2ban jail was not removed by install rollback'
 [[ ! -e "${T2}/usr/local/sbin/riph-hotfix-handover" ]] || fail 'new handover helper was not removed by install rollback'
+cmp -s "${T2}/stream.before" "${T2}/etc/nginx/stream-enabled/stream.conf" || fail 'original stream.conf was not restored'
 
 echo 'TEST I3: reinstall preserves already-activated RIPH jail flags'
 mkdir -p "${T3}/etc/fail2ban/jail.d"
@@ -146,10 +226,8 @@ EOF_BAD_REJECT
 if "${INSTALLER}" --root "${T4}" --install >"${T4}/out.txt" 2>&1; then
     fail 'installer unexpectedly accepted malformed existing jail enabled state'
 fi
-grep -Fq 'could not preserve existing RIPH jail enabled state' "${T4}/out.txt" \
-    || fail 'malformed jail state refusal message missing'
-grep -Fq 'BAD_JAIL_SENTINEL = 1' "${T4}/etc/fail2ban/jail.d/riph-nginx-stream-sni-reject.local" \
-    || fail 'malformed existing jail was modified before refusal'
+grep -Fq 'could not preserve existing RIPH jail enabled state' "${T4}/out.txt" || fail 'malformed jail state refusal message missing'
+grep -Fq 'BAD_JAIL_SENTINEL = 1' "${T4}/etc/fail2ban/jail.d/riph-nginx-stream-sni-reject.local" || fail 'malformed existing jail was modified before refusal'
 [[ ! -e "${T4}/usr/local/sbin/riph-admin" ]] || fail 'installer mutated project files after malformed jail refusal'
 
 echo 'PASS: installer tests'
