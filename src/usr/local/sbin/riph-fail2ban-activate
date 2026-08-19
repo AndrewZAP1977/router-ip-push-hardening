@@ -352,5 +352,9 @@ fi
 
 ACTIVATION_COMMITTED=1
 trap - EXIT
-riph_log "RIPH Fail2ban jails activated; legacy jail remains active under dynamic trusted ignore protection"
+if (( LEGACY_ACTIVE_BEFORE == 1 )); then
+    riph_log "RIPH Fail2ban jails activated; legacy jail remains active under dynamic trusted ignore protection"
+else
+    riph_log "RIPH Fail2ban jails activated; no legacy jail was active"
+fi
 riph_log "activation backup: ${BACKUP_DIR}"
