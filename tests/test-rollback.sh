@@ -17,7 +17,7 @@ mkdir -p \
 cp "${ROOT}/config/config.env.example" "${T}/etc/router-ip-push-hardening/config.env"
 printf '%s\n' '127.0.0.1/32 # localhost' >"${T}/etc/router-ip-push-hardening/trusted-static.list"
 printf '%s\n' '{"version":1,"routers":{}}' >"${T}/etc/router-ip-push-hardening/previous-ip-grace.json"
-printf '%s\n' '78.111.155.187' >"${T}/var/lib/router-ip-push/ips/AX3200.ipv4"
+printf '%s\n' '192.0.2.25' >"${T}/var/lib/router-ip-push/ips/AX3200.ipv4"
 
 CALL_LOG="${T}/calls.log"
 cat >"${T}/usr/local/bin/nginx-stub" <<EOF_STUB
