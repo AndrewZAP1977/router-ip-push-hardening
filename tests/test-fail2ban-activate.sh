@@ -25,7 +25,7 @@ make_case() {
     cp "${ROOT}/config/previous-ip-grace.json.example" "${t}/etc/router-ip-push-hardening/previous-ip-grace.json"
     : >"${t}/etc/router-ip-push-hardening/manual-deny-443.list"
     : >"${t}/etc/router-ip-push-hardening/manual-deny-all.list"
-    printf '%s\n' '192.0.2.26' >"${t}/var/lib/router-ip-push/ips/AX3200.ipv4"
+    printf '%s\n' '192.0.2.26' >"${t}/var/lib/router-ip-push/ips/ROUTER_A.ipv4"
     : >"${t}/var/log/nginx/riph-stream-sni.log"
     cp "${ROOT}/src/etc/fail2ban/jail.d/riph-nginx-stream-sni-reject.local" "${t}/etc/fail2ban/jail.d/"
     cp "${ROOT}/src/etc/fail2ban/jail.d/riph-nginx-stream-private-sni-abuse.local" "${t}/etc/fail2ban/jail.d/"
