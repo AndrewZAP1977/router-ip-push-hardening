@@ -17,8 +17,8 @@ mkdir -p \
 cp "${ROOT}/config/config.env.example" "${T}/etc/router-ip-push-hardening/config.env"
 printf '%s\n' '127.0.0.1/32 # localhost' >"${T}/etc/router-ip-push-hardening/trusted-static.list"
 printf '%s\n' '{"version":1,"routers":{}}' >"${T}/etc/router-ip-push-hardening/previous-ip-grace.json"
-printf '%s\n' '192.0.2.25' >"${T}/var/lib/router-ip-push/ips/AX3200.ipv4"
-printf '%s\n' '{"version":1,"router_id":"AX3200","source_ip":"192.0.2.25","last_seen":"2026-08-17T14:00:00Z"}' >"${T}/var/lib/router-ip-push/state/AX3200.json"
+printf '%s\n' '192.0.2.25' >"${T}/var/lib/router-ip-push/ips/ROUTER_A.ipv4"
+printf '%s\n' '{"version":1,"router_id":"ROUTER_A","source_ip":"192.0.2.25","last_seen":"2026-08-17T14:00:00Z"}' >"${T}/var/lib/router-ip-push/state/ROUTER_A.json"
 : >"${T}/etc/router-ip-push-hardening/manual-deny-443.list"
 : >"${T}/etc/router-ip-push-hardening/manual-deny-all.list"
 
