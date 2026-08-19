@@ -91,7 +91,7 @@ GRACE="${TEST_ROOT}/etc/router-ip-push-hardening/previous-ip-grace.json"
 STREAM="${TEST_ROOT}/etc/nginx/stream-enabled/stream.conf"
 BRIDGE="${TEST_ROOT}/etc/nginx/stream-enabled/06-router-ip-push-fake-site-bridges.conf"
 assert_contains "${ALLOWLIST}" '78.111.155.187/32'
-assert_contains "${STREAM}" 'treda.layerupzap.ru|1'
+assert_contains "${STREAM}" 'private-a.example.invalid|1'
 assert_contains "${BRIDGE}" 'listen 127.0.0.1:9543 proxy_protocol;'
 assert_eq "$(jq -r '.routers.AX3200.current_ip' "${STATE}")" '78.111.155.187' 'first current ip'
 assert_eq "$(grep -c '^systemctl reload nginx$' "${CALL_LOG}")" '1' 'first reload count'
