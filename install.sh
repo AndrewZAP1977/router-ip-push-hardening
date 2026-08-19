@@ -15,6 +15,7 @@ TEMP_HOTFIX_ACTIVE=0
 HANDOVER_OWNS_TIMERS=0
 INSTALL_STARTED=0
 INSTALL_COMMITTED=0
+BOOTSTRAP_CONFIG_FILE=""
 
 HOTFIX_PATH_UNIT="router-ip-push-nginx-hotfix.path"
 HOTFIX_TIMER_UNIT="router-ip-push-nginx-hotfix.timer"
@@ -46,13 +47,19 @@ Modes (choose one):
 Install options:
   --apply             Apply transactional Nginx/trusted routing only. Does not activate Fail2ban.
   --enable-timers     Enable Router-IP watch and 1-minute reconcile after successful apply.
-  --replace-config    Replace config/list files with repository examples (backed up).
+  --replace-config    Replace existing config/list files with repository examples (backed up).
 
 Global options:
   --root DIR          Test root prefix. Production root is '/'.
   -h, --help          Show this help.
 
-Temporary Hexabyte hotfix ownership:
+First install:
+  If /etc/router-ip-push-hardening/config.env does not exist, the installer reads
+  the existing Nginx stream.conf produced by 3x-ui-installer and bootstraps the
+  RIPH routing config from its public/Reality/XHTTP SNI and loopback upstreams.
+  Unsupported or ambiguous stream layouts fail closed before installation.
+
+Temporary allowlist-hotfix ownership:
   If router-ip-push-nginx-hotfix.path/timer are active, a production --apply
   is allowed only together with --enable-timers. The installer then uses
   riph-hotfix-handover so there is never more than one active allowlist owner.
@@ -111,6 +118,7 @@ for required in \
     config/previous-ip-grace.json.example \
     config/manual-deny-443.list.example \
     config/manual-deny-all.list.example \
+    tools/bootstrap-config-from-stream.sh \
     src/usr/local/libexec/riph-common.sh \
     src/usr/local/libexec/riph-trusted.sh \
     src/usr/local/libexec/riph-net.sh \
@@ -140,7 +148,30 @@ for required in \
     [[ -f "${SCRIPT_DIR}/${required}" ]] || riph_die "repository is incomplete: ${required}"
 done
 
-CONFIG_SOURCE="${SCRIPT_DIR}/config/config.env.example"
+cleanup_bootstrap_config() {
+    if [[ -n "${BOOTSTRAP_CONFIG_FILE}" ]]; then
+        rm -f "${BOOTSTRAP_CONFIG_FILE}"
+        BOOTSTRAP_CONFIG_FILE=""
+    fi
+}
+
+CONFIG_TEMPLATE="${SCRIPT_DIR}/config/config.env.example"
+CONFIG_TARGET="$(riph_root_path /etc/router-ip-push-hardening/config.env)"
+CONFIG_SOURCE="${CONFIG_TEMPLATE}"
+
+if [[ -f "${CONFIG_TARGET}" && "${REPLACE_CONFIG}" != "1" ]]; then
+    CONFIG_SOURCE="${CONFIG_TARGET}"
+elif [[ ! -f "${CONFIG_TARGET}" && "${REPLACE_CONFIG}" != "1" ]]; then
+    BOOTSTRAP_CONFIG_FILE="$(mktemp /tmp/riph-bootstrap-config.XXXXXX)"
+    rm -f "${BOOTSTRAP_CONFIG_FILE}"
+    trap cleanup_bootstrap_config EXIT
+    bash "${SCRIPT_DIR}/tools/bootstrap-config-from-stream.sh" \
+        --root "${RIPH_ROOT}" \
+        --template "${CONFIG_TEMPLATE}" \
+        --output "${BOOTSTRAP_CONFIG_FILE}"
+    CONFIG_SOURCE="${BOOTSTRAP_CONFIG_FILE}"
+fi
+
 riph_load_config "${CONFIG_SOURCE}"
 
 unit_state() {
@@ -206,6 +237,8 @@ preflight() {
 preflight
 if [[ "${MODE}" == "check" ]]; then
     riph_log "preflight OK for root ${RIPH_ROOT}"
+    cleanup_bootstrap_config
+    trap - EXIT
     exit 0
 fi
 
@@ -268,6 +301,17 @@ mapfile -t FILE_SPECS <<'EOF_SPECS'
 /etc/router-ip-push-hardening/manual-deny-443.list|config/manual-deny-443.list.example|0600|seed
 /etc/router-ip-push-hardening/manual-deny-all.list|config/manual-deny-all.list.example|0600|seed
 EOF_SPECS
+
+resolve_source_file() {
+    local logical="$1" source_rel="$2"
+    if [[ "${logical}" == "/etc/router-ip-push-hardening/config.env" \
+       && -n "${BOOTSTRAP_CONFIG_FILE}" \
+       && "${REPLACE_CONFIG}" != "1" ]]; then
+        printf '%s\n' "${BOOTSTRAP_CONFIG_FILE}"
+    else
+        printf '%s\n' "${SCRIPT_DIR}/${source_rel}"
+    fi
+}
 
 read_existing_jail_enabled() {
     local logical="$1" target value
@@ -430,13 +474,14 @@ restore_install_on_exit() {
         restore_install_backup || true
         restore_production_unit_states_after_error || true
         restore_runtime_services_after_error || true
-        # The ISP/Router IP may have changed while installation was in progress.
+        # The Router IP may have changed while installation was in progress.
         # A pre-install Nginx snapshot can therefore be stale by the time it is
         # restored. Re-run the original temporary owner once so the recovered
         # allowlist converges to the current Router IP before returning failure.
         resync_temporary_hotfix_after_error || true
     fi
 
+    cleanup_bootstrap_config
     exit "${rc}"
 }
 trap restore_install_on_exit EXIT
@@ -449,7 +494,7 @@ capture_existing_jail_states
 for spec in "${FILE_SPECS[@]}"; do
     IFS='|' read -r logical source_rel mode policy <<<"${spec}"
     target="$(riph_root_path "${logical}")"
-    source_file="${SCRIPT_DIR}/${source_rel}"
+    source_file="$(resolve_source_file "${logical}" "${source_rel}")"
     [[ -f "${source_file}" ]] || riph_die "missing source file: ${source_rel}"
     snapshot_target "${logical}" "${target}"
 done
@@ -467,7 +512,7 @@ INSTALL_STARTED=1
 for spec in "${FILE_SPECS[@]}"; do
     IFS='|' read -r logical source_rel mode policy <<<"${spec}"
     target="$(riph_root_path "${logical}")"
-    source_file="${SCRIPT_DIR}/${source_rel}"
+    source_file="$(resolve_source_file "${logical}" "${source_rel}")"
     if [[ "${policy}" == seed && -e "${target}" && "${REPLACE_CONFIG}" != "1" ]]; then
         continue
     fi
@@ -477,6 +522,7 @@ for spec in "${FILE_SPECS[@]}"; do
     mv -f "${temp}" "${target}"
     preserve_jail_enabled_state "${logical}" "${target}"
 done
+cleanup_bootstrap_config
 
 if [[ "${RIPH_ROOT}" == "/" ]]; then
     # Unit files may have been updated even when --enable-timers was not requested.
