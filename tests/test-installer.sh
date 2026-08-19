@@ -77,19 +77,21 @@ grep -Fqx 'OnActiveSec=1min' "${T1}/etc/systemd/system/riph-reconcile.timer" || 
 grep -Fqx 'OnUnitActiveSec=1min' "${T1}/etc/systemd/system/riph-reconcile.timer" || fail 'installed reconcile fallback recurrence is not one minute'
 ! grep -Fq 'OnBootSec=' "${T1}/etc/systemd/system/riph-reconcile.timer" || fail 'installed reconcile timer still uses boot-relative first trigger'
 [[ ! -e "${T1}/etc/systemd/system/riph-guard.timer" ]] || fail 'redundant guard timer was installed'
-! grep -Fq '176.110.189.199/32' "${T1}/etc/router-ip-push-hardening/trusted-static.list" \
-    || fail 'fresh install seeded a dynamic SmartBox-mother address as permanent static trust'
+grep -Fx '127.0.0.1/32          # localhost' "${T1}/etc/router-ip-push-hardening/trusted-static.list" >/dev/null \
+    || fail 'fresh install did not seed localhost static trust'
+grep -Fq '# 203.0.113.10/32' "${T1}/etc/router-ip-push-hardening/trusted-static.list" \
+    || fail 'fresh install did not seed generic static-trust example comments'
 grep -Fx 'ROUTER_AUTO_DISCOVER_REGISTERED=1' "${T1}/etc/router-ip-push-hardening/config.env" >/dev/null \
     || fail 'fresh install did not enable registered Router IP Push auto-discovery'
 grep -Fx 'ROUTER_REGISTRY_DIR="/etc/router-ip-push/routers.d"' "${T1}/etc/router-ip-push-hardening/config.env" >/dev/null \
     || fail 'fresh install did not seed Router IP Push registry path'
 grep -Fx 'LEGACY_STREAM_AUDIT_COMPAT=0' "${T1}/etc/router-ip-push-hardening/config.env" >/dev/null \
-    || fail 'fresh install did not use retired legacy-audit default'
+    || fail 'fresh install did not use legacy-audit compatibility default OFF'
 [[ -f "${T1}/etc/nginx/stream-enabled/stream.conf" ]] || fail 'stream config not applied'
 grep -F 'access_log /var/log/nginx/riph-stream-sni.log riph_stream_sni;' "${T1}/etc/nginx/stream-enabled/stream.conf" >/dev/null || fail 'dedicated audit log missing'
 ! grep -F 'access_log /var/log/nginx/stream-sni.log sni_watch' "${T1}/etc/nginx/stream-enabled/stream.conf" >/dev/null \
-    || fail 'fresh install unexpectedly feeds retired legacy audit log'
-grep -F 'treda.layerupzap.ru|1' "${T1}/etc/nginx/stream-enabled/stream.conf" >/dev/null || fail 'private routing missing'
+    || fail 'fresh install unexpectedly feeds legacy audit log'
+grep -F 'private-a.example.invalid|1' "${T1}/etc/nginx/stream-enabled/stream.conf" >/dev/null || fail 'private routing missing'
 backup_stream="$(find "${T1}/var/lib/router-ip-push-hardening/install-backups" -path '*/files/etc/nginx/stream-enabled/stream.conf' -type f | head -n 1)"
 [[ -n "${backup_stream}" ]] || fail 'install backup did not capture pre-install stream.conf'
 grep -Fx 'PREINSTALL_STREAM_SENTINEL' "${backup_stream}" >/dev/null || fail 'pre-install stream snapshot mismatch'
