@@ -13,6 +13,7 @@ RIPH — приватный слой защиты и маршрутизации 
 
 - автоматически получает текущие IPv4 зарегистрированных Router IP Push роутеров;
 - автоматически обнаруживает новые зарегистрированные роутеры после их первого валидного push;
+- при первой установке автоматически перенимает штатную Nginx Stream-маршрутизацию 3x-ui-installer;
 - поддерживает статические доверенные IPv4/CIDR для VPS и других узлов с постоянным адресом;
 - хранит предыдущий динамический IP в grace-периоде после смены адреса;
 - генерирует Nginx allowlist и SNI-маршрутизацию;
@@ -59,9 +60,34 @@ unknown / empty / IP-SNI
 
 Bridge нужен потому, что внешний stream listener передаёт PROXY protocol, а обычный fake HTTPS upstream ожидает чистый TLS.
 
-## Быстрый старт
+## Первая установка поверх 3x-ui-installer
 
-Сначала настрой `config/config.env.example` и `config/trusted-static.list.example` под свою схему.
+Нормальный порядок для новой VPS:
+
+```text
+3x-ui-installer
+    -> создаёт рабочий Nginx stream.conf и fake HTTPS upstream
+
+Router IP Push
+    -> регистрация роутера на VPS
+    -> первый успешный push
+
+RIPH
+    -> читает существующий stream.conf
+    -> проверяет его штатную структуру
+    -> автоматически переносит public / Reality / XHTTP SNI и upstream в свой config.env
+    -> делает backup исходного stream.conf
+    -> генерирует защищённый RIPH-managed stream.conf + allowlist + bridge config
+```
+
+Для штатного `stream.conf` от 3x-ui-installer **не нужно вручную переписывать SNI в `config.env` перед первой установкой**.
+
+Поддерживаются оба штатных варианта:
+
+- public SNI + Reality (`xray`);
+- public SNI + Reality (`xray`) + отдельный XHTTP SNI (`xray2`).
+
+Importer также сверяет private SNI с соответствующим fake HTTPS site и перенимает его loopback listen-порт. Если исходный stream layout неизвестен, неполон или неоднозначен, установка останавливается до изменения production-файлов.
 
 Read-only preflight:
 
@@ -81,6 +107,8 @@ sudo env RIPH_ALLOW_PRODUCTION=1 \
 ```bash
 sudo riph-admin status
 ```
+
+`config/config.env.example` и `config/trusted-static.list.example` нужны как reference/defaults и для нестандартной ручной конфигурации. Для штатной первой установки routing-поля `config.env` автоматически берутся из уже работающего Nginx.
 
 > `--replace-config` не используется при обычном обновлении существующей установки: рабочие config/list файлы должны сохраняться.
 
@@ -131,7 +159,7 @@ config/       примеры конфигурации и управляемых 
 docs/         пользовательская и архитектурная документация
 src/          устанавливаемые файлы RIPH
 tests/        локальная regression suite
-tools/        вспомогательные read-only/preflight инструменты
+tools/        bootstrap/preflight инструменты
 install.sh    production/test-root installer
 ```
 
