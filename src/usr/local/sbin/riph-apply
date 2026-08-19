@@ -96,11 +96,11 @@ riph_load_config "${CONFIG_FILE}"
 NGINX_BIN="${RIPH_NGINX_BIN:-nginx}"
 SYSTEMCTL_BIN="${RIPH_SYSTEMCTL_BIN:-systemctl}"
 
-# The live temporary Hexabyte safeguard and RIPH both write the same staging
-# allowlist. Normal production apply must never run while that temporary writer
-# still owns the file. riph-hotfix-handover disables/stops those units under the
-# shared hotfix lock before it invokes reconcile/apply, so the handover itself
-# naturally passes this gate. Dry-run is read-only and remains allowed.
+# A temporary pre-RIPH safeguard and RIPH can write the same staging allowlist.
+# Normal production apply must never run while that temporary writer still owns
+# the file. riph-hotfix-handover disables/stops those units under the shared
+# hotfix lock before it invokes reconcile/apply, so the handover itself naturally
+# passes this gate. Dry-run is read-only and remains allowed.
 temporary_hotfix_owns_allowlist() {
     local unit
     for unit in \

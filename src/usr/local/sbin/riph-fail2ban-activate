@@ -20,7 +20,7 @@ usage() {
     cat <<'USAGE'
 Usage: riph-fail2ban-activate [options]
 
-Safely enables only the two RIPH Fail2ban jails. The legacy Hexabyte
+Safely enables only the two RIPH Fail2ban jails. The legacy
 nginx-stream-sni-reject jail is deliberately left active during coexistence.
 
 Options:
@@ -163,9 +163,9 @@ validate_installed_filters() {
     t="$(mktemp -d /tmp/riph-f2b-activate-regex.XXXXXX)"
     cat >"${t}/sample.log" <<'EOF_LOG'
 2026-08-17T14:00:00+00:00 src=203.0.113.10 route=reject sni=- upstream=127.0.0.1:9 status=502 session=0.001
-2026-08-17T14:00:01+00:00 src=203.0.113.11 route=fake_1 sni=treda.layerupzap.ru upstream=127.0.0.1:9543 status=200 session=1.000
-2026-08-17T14:00:02+00:00 src=203.0.113.12 route=fake_2 sni=trongo.layerupzap.ru upstream=127.0.0.1:9544 status=200 session=1.100
-2026-08-17T14:00:03+00:00 src=198.51.100.7 route=www sni=nukla.layerupzap.ru upstream=127.0.0.1:7443 status=200 session=0.300
+2026-08-17T14:00:01+00:00 src=203.0.113.11 route=fake_1 sni=private-a.example.net upstream=127.0.0.1:9543 status=200 session=1.000
+2026-08-17T14:00:02+00:00 src=203.0.113.12 route=fake_2 sni=private-b.example.net upstream=127.0.0.1:9544 status=200 session=1.100
+2026-08-17T14:00:03+00:00 src=198.51.100.7 route=www sni=public.example.net upstream=127.0.0.1:7443 status=200 session=0.300
 EOF_LOG
 
     if ! reject_out="$("${F2B_REGEX_BIN}" "${t}/sample.log" "${FILTER_REJECT}" --usedns=no -o ip | sort -u)"; then
