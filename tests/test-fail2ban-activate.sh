@@ -60,7 +60,9 @@ chmod +x "${CASE_OK}/usr/local/bin/guard-ok"
 export RIPH_FAIL2BAN_CLIENT_BIN="${CASE_OK}/usr/local/bin/f2b-stub"
 export RIPH_GUARD_BIN="${CASE_OK}/usr/local/bin/guard-ok"
 
-"${ACTIVATE}" --root "${CASE_OK}"
+"${ACTIVATE}" --root "${CASE_OK}" >"${CASE_OK}/out.txt" 2>&1
+grep -Fq 'RIPH Fail2ban jails activated; legacy jail remains active under dynamic trusted ignore protection' "${CASE_OK}/out.txt" \
+    || fail 'legacy-active success message is wrong'
 grep -Fx 'enabled = true' "${CASE_OK}/etc/fail2ban/jail.d/riph-nginx-stream-sni-reject.local" >/dev/null \
     || fail 'reject jail was not enabled'
 grep -Fx 'enabled = true' "${CASE_OK}/etc/fail2ban/jail.d/riph-nginx-stream-private-sni-abuse.local" >/dev/null \
@@ -71,6 +73,39 @@ grep -Fx 'ignorecommand = /usr/local/sbin/riph-fail2ban-ignore <ip>' "${LEGACY_O
     || fail 'legacy dynamic trusted ignore override is wrong'
 backup_count="$(find "${CASE_OK}/var/lib/router-ip-push-hardening/backups" -maxdepth 1 -type d -name 'fail2ban-activate-*' | wc -l)"
 [[ "${backup_count}" -eq 1 ]] || fail 'activation backup missing'
+
+# When no legacy jail is active, report that state accurately and do not create
+# a legacy ignore override.
+CASE_NO_LEGACY="${BASE}/no-legacy"
+make_case "${CASE_NO_LEGACY}"
+cat >"${CASE_NO_LEGACY}/usr/local/bin/f2b-stub" <<'EOF_NO_LEGACY_F2B'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+case "${1:-}" in
+    status)
+        if [[ "${2:-}" == nginx-stream-sni-reject ]]; then
+            exit 1
+        fi
+        exit 0
+        ;;
+    get|set|-t|reload) exit 0 ;;
+esac
+EOF_NO_LEGACY_F2B
+chmod +x "${CASE_NO_LEGACY}/usr/local/bin/f2b-stub"
+cat >"${CASE_NO_LEGACY}/usr/local/bin/guard-ok" <<'EOF_NO_LEGACY_GUARD'
+#!/usr/bin/env bash
+exit 0
+EOF_NO_LEGACY_GUARD
+chmod +x "${CASE_NO_LEGACY}/usr/local/bin/guard-ok"
+
+export RIPH_FAIL2BAN_CLIENT_BIN="${CASE_NO_LEGACY}/usr/local/bin/f2b-stub"
+export RIPH_GUARD_BIN="${CASE_NO_LEGACY}/usr/local/bin/guard-ok"
+
+"${ACTIVATE}" --root "${CASE_NO_LEGACY}" >"${CASE_NO_LEGACY}/out.txt" 2>&1
+grep -Fq 'RIPH Fail2ban jails activated; no legacy jail was active' "${CASE_NO_LEGACY}/out.txt" \
+    || fail 'no-legacy success message is wrong'
+[[ ! -e "${CASE_NO_LEGACY}/etc/fail2ban/jail.d/zz-riph-legacy-trusted-ignore.local" ]] \
+    || fail 'legacy ignore override was created without an active legacy jail'
 
 # A failure after both jail files and the legacy protection override were already
 # changed must restore the original disabled/absent state.
