@@ -36,7 +36,7 @@ cp "${ROOT}/config/trusted-static.list.example" "${FS}/etc/router-ip-push-harden
 cp "${ROOT}/config/previous-ip-grace.json.example" "${FS}/etc/router-ip-push-hardening/previous-ip-grace.json"
 : >"${FS}/etc/router-ip-push-hardening/manual-deny-443.list"
 : >"${FS}/etc/router-ip-push-hardening/manual-deny-all.list"
-printf '%s\n' '78.111.154.96' >"${FS}/var/lib/router-ip-push/ips/AX3200.ipv4"
+printf '%s\n' '192.0.2.26' >"${FS}/var/lib/router-ip-push/ips/AX3200.ipv4"
 cat >"${FS}/etc/fail2ban/jail.d/zz-riph-legacy-trusted-ignore.local" <<'EOF_OVERRIDE'
 [nginx-stream-sni-reject]
 ignorecommand = /usr/local/sbin/riph-fail2ban-ignore <ip>
@@ -64,12 +64,12 @@ export RIPH_FAIL2BAN_CLIENT_BIN="${T}/missing-fail2ban-client"
 # Current Router IP is already under an ambiguous unmarked legacy DENY. Guard must
 # prepend the project ALLOW shield and must not touch that old DENY.
 cat >"${STATE}" <<'EOF_STATE1'
-[ 1] 443/tcp DENY IN 78.111.154.96
-[ 2] 80/tcp  ALLOW IN 78.111.154.96 # riph-legacy-trusted-shield
+[ 1] 443/tcp DENY IN 192.0.2.26
+[ 2] 80/tcp  ALLOW IN 192.0.2.26 # riph-legacy-trusted-shield
 EOF_STATE1
 : >"${CALLS}"
 bash "${R}/sbin/riph-trusted-unban-guard" --root "${FS}" --now-epoch 1000 >/dev/null
-expected='prepend allow proto tcp from 78.111.154.96 to any port 443 comment riph-legacy-trusted-shield'
+expected='prepend allow proto tcp from 192.0.2.26 to any port 443 comment riph-legacy-trusted-shield'
 grep -Fx -- "${expected}" "${CALLS}" >/dev/null \
     || fail 'guard did not prepend current Router IP shield'
 ! grep -Fq -- '--force delete 1' "${CALLS}" \
@@ -79,11 +79,11 @@ grep -Fx -- "${expected}" "${CALLS}" >/dev/null \
 
 # After Router IP changes, stale project shield is removed, current exact project
 # shield is retained, and legacy DENY remains untouched.
-printf '%s\n' '78.111.154.97' >"${FS}/var/lib/router-ip-push/ips/AX3200.ipv4"
+printf '%s\n' '192.0.2.27' >"${FS}/var/lib/router-ip-push/ips/AX3200.ipv4"
 cat >"${STATE}" <<'EOF_STATE2'
-[ 1] 443/tcp ALLOW IN 78.111.154.96 # riph-legacy-trusted-shield
-[ 2] 443/tcp DENY IN 78.111.154.97
-[ 3] 443/tcp ALLOW IN 78.111.154.97 # riph-legacy-trusted-shield
+[ 1] 443/tcp ALLOW IN 192.0.2.26 # riph-legacy-trusted-shield
+[ 2] 443/tcp DENY IN 192.0.2.27
+[ 3] 443/tcp ALLOW IN 192.0.2.27 # riph-legacy-trusted-shield
 [ 4] 443/tcp DENY IN 203.0.113.44 # riph-legacy-trusted-shield
 EOF_STATE2
 : >"${CALLS}"
@@ -96,14 +96,14 @@ grep -Fx -- '--force delete 1' "${CALLS}" >/dev/null \
     || fail 'current exact project shield was removed'
 ! grep -Fx -- '--force delete 4' "${CALLS}" >/dev/null \
     || fail 'same-marker DENY was mistaken for project ALLOW shield'
-! grep -Fq 'prepend allow proto tcp from 78.111.154.97' "${CALLS}" \
+! grep -Fq 'prepend allow proto tcp from 192.0.2.27' "${CALLS}" \
     || fail 'duplicate current project shield was prepended'
 
 # Retirement cleanup mode removes only exact project-owned 443/tcp ALLOW shields.
 cat >"${STATE}" <<'EOF_STATE3'
-[ 1] 443/tcp ALLOW IN 78.111.154.97 # riph-legacy-trusted-shield
-[ 2] 443/tcp DENY IN 78.111.154.97
-[ 3] 80/tcp  ALLOW IN 78.111.154.97 # riph-legacy-trusted-shield
+[ 1] 443/tcp ALLOW IN 192.0.2.27 # riph-legacy-trusted-shield
+[ 2] 443/tcp DENY IN 192.0.2.27
+[ 3] 80/tcp  ALLOW IN 192.0.2.27 # riph-legacy-trusted-shield
 EOF_STATE3
 : >"${CALLS}"
 bash "${R}/sbin/riph-trusted-unban-guard" --root "${FS}" --legacy-shield-remove-all >/dev/null
