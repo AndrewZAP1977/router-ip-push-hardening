@@ -24,7 +24,7 @@ make_case() {
     # recreates the old coexistence phase so quiesce/retire behavior stays covered.
     sed -i 's/^LEGACY_STREAM_AUDIT_COMPAT=0$/LEGACY_STREAM_AUDIT_COMPAT=1/' \
         "${t}/etc/router-ip-push-hardening/config.env"
-    printf '%s\n' '192.0.2.26' >"${t}/var/lib/router-ip-push/ips/AX3200.ipv4"
+    printf '%s\n' '192.0.2.26' >"${t}/var/lib/router-ip-push/ips/ROUTER_A.ipv4"
     printf '%s\n' 'STREAM_SENTINEL' >"${t}/etc/nginx/stream-enabled/stream.conf"
     printf '%s\n' 'LEGACY_WATCH' >"${t}/etc/nginx/stream-enabled/00-sni-watch.conf"
     printf '%s\n' '[nginx-stream-sni-reject]' >"${t}/etc/fail2ban/jail.d/nginx-stream-sni-reject.local"
