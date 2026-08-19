@@ -40,8 +40,8 @@ exit 0
 EOF_STUB
 cat >"${T}/usr/local/bin/ufw-stub" <<'EOF_STUB'
 #!/usr/bin/env bash
-# This incident regression has empty manual-deny lists. The production helper
-# now validates UFW availability fail-closed, so provide a harmless test-root UFW.
+# This regression has empty manual-deny lists. The production helper validates
+# UFW availability fail-closed, so provide a harmless test-root UFW.
 if [[ "${1:-}" == status && "${2:-}" == numbered ]]; then
     printf '%s\n' 'Status: active'
 fi
@@ -56,8 +56,8 @@ export RIPH_SYSTEMCTL_BIN="${T}/usr/local/bin/systemctl-stub"
 export RIPH_UFW_BIN="${T}/usr/local/bin/ufw-stub"
 export RIPH_FAIL2BAN_CLIENT_BIN="${T}/usr/local/bin/fail2ban-not-installed"
 
-OLD_IP='78.111.155.187'
-NEW_IP='78.111.154.96'
+OLD_IP='192.0.2.25'
+NEW_IP='192.0.2.26'
 ALLOW="${T}/etc/nginx/stream-enabled/05-router-ip-push-source-allow.conf"
 GRACE="${T}/etc/router-ip-push-hardening/previous-ip-grace.json"
 STATE="${T}/etc/router-ip-push-hardening/last-apply-state.json"
@@ -67,8 +67,8 @@ printf '%s\n' "${OLD_IP}" >"${IP_FILE}"
 printf '%s\n' "{\"version\":1,\"router_id\":\"AX3200\",\"source_ip\":\"${OLD_IP}\",\"last_seen\":\"2026-08-17T03:51:00Z\"}" \
     >"${T}/var/lib/router-ip-push/state/AX3200.json"
 
-# Establish the previously working state from the real incident.
-bash "${RECONCILE}" --root "${T}" --reason 'incident baseline' --now-epoch 1000
+# Establish the previously working state.
+bash "${RECONCILE}" --root "${T}" --reason 'IP-change baseline' --now-epoch 1000
 
 grep -Fq "${OLD_IP}/32" "${ALLOW}" || fail 'baseline old IP is not trusted'
 [[ "$(jq -r '.routers.AX3200.current_ip' "${STATE}")" == "${OLD_IP}" ]] \
@@ -85,9 +85,9 @@ printf '%s\n' "{\"version\":1,\"router_id\":\"AX3200\",\"source_ip\":\"${NEW_IP}
 
 bash "${RECONCILE}" --root "${T}" --reason 'Router IP Push changed AX3200' --now-epoch 2000
 
-# Critical regression assertions from the 2026-08-17 outage:
-# B must become trusted on the first reconcile, while A remains trusted only as
-# previous-IP grace. This prevents B from being routed to fake_1/fake_2.
+# The new address must become trusted on the first reconcile, while the old one
+# remains trusted only as previous-IP grace. This prevents the new current IP
+# from being routed to fake_1/fake_2.
 grep -Fq "${NEW_IP}/32" "${ALLOW}" || fail 'new Router IP did not become trusted immediately'
 grep -Fq "${OLD_IP}/32" "${ALLOW}" || fail 'old Router IP was not retained for grace'
 grep -Fq 'router-ip-push:AX3200 current' "${ALLOW}" || fail 'new IP is not marked current'
@@ -103,11 +103,11 @@ grep -Fq 'previous grace until' "${ALLOW}" || fail 'old IP is not marked grace'
 [[ "$(grep -c '^systemctl reload nginx$' "${CALL_LOG}")" == 2 ]] \
     || fail 'IP transition did not cause exactly one additional Nginx reload'
 
-# Once grace expires, only B remains trusted.
+# Once grace expires, only the new address remains trusted.
 bash "${RECONCILE}" --root "${T}" --reason 'grace expiry check' --now-epoch "$((2000 + 4 * 3600 + 1))"
 grep -Fq "${NEW_IP}/32" "${ALLOW}" || fail 'new IP disappeared after grace expiry'
 if grep -Fq "${OLD_IP}/32" "${ALLOW}"; then
     fail 'old IP remained trusted after grace expiry'
 fi
 
-echo 'PASS: exact Router IP change incident regression'
+echo 'PASS: Router IP change regression'
