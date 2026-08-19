@@ -12,7 +12,7 @@ fail() {
 }
 
 make_case() {
-    local t="$1" legacy_ban="${2:-66.132.224.81}"
+    local t="$1" legacy_ban="${2:-203.0.113.81}"
     mkdir -p \
         "${t}/etc/router-ip-push-hardening" \
         "${t}/etc/fail2ban/jail.d" \
@@ -25,7 +25,7 @@ make_case() {
     cp "${ROOT}/config/previous-ip-grace.json.example" "${t}/etc/router-ip-push-hardening/previous-ip-grace.json"
     : >"${t}/etc/router-ip-push-hardening/manual-deny-443.list"
     : >"${t}/etc/router-ip-push-hardening/manual-deny-all.list"
-    printf '%s\n' '78.111.154.96' >"${t}/var/lib/router-ip-push/ips/AX3200.ipv4"
+    printf '%s\n' '192.0.2.26' >"${t}/var/lib/router-ip-push/ips/AX3200.ipv4"
     : >"${t}/var/log/nginx/riph-stream-sni.log"
     cp "${ROOT}/src/etc/fail2ban/jail.d/riph-nginx-stream-sni-reject.local" "${t}/etc/fail2ban/jail.d/"
     cp "${ROOT}/src/etc/fail2ban/jail.d/riph-nginx-stream-private-sni-abuse.local" "${t}/etc/fail2ban/jail.d/"
@@ -102,7 +102,7 @@ cmp -s "${CASE_FAIL}/private.before" "${CASE_FAIL}/etc/fail2ban/jail.d/riph-ngin
 # dynamic ignore override and continue to the trusted guard, whose UFW-shield logic
 # is covered separately by test-guard-legacy-shield.sh.
 CASE_BANNED="${BASE}/current-banned"
-make_case "${CASE_BANNED}" '78.111.154.96'
+make_case "${CASE_BANNED}" '192.0.2.26'
 cat >"${CASE_BANNED}/usr/local/bin/guard-ok" <<'EOF_GUARD_OK2'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"${RIPH_TEST_GUARD_COLLISION_LOG:?}"
