@@ -1,10 +1,10 @@
-# Static trusted IPv4/CIDR entries for the private Hexabyte deployment.
+# Static trusted IPv4/CIDR entries.
 # Format:
 #   IPv4[/prefix] [# comment]
 #
-# Dynamic router addresses must NOT be listed here. They come from Router IP Push
-# for router IDs explicitly configured in ROUTER_IDS.
+# Dynamic router addresses must NOT be listed here. They come from Router IP Push.
+# Add permanent VPS/admin networks here or with `riph-admin trusted-add`.
+
 127.0.0.1/32          # localhost
-5.61.39.137/32        # VPS_GR
-45.87.41.121/32       # Spectra
-194.104.94.182/32     # Hexabyte
+# 203.0.113.10/32     # example trusted VPS
+# 198.51.100.0/24     # example trusted network
