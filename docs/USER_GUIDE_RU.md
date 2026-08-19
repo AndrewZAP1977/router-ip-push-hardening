@@ -29,30 +29,59 @@ RIPH
 
 ---
 
-## 1. Перед установкой
+## 1. Перед первой установкой
 
 Нужны:
 
+- уже установленный и работающий 3x-ui/Xray/Nginx;
 - уже работающий Router IP Push;
+- минимум одна валидная Router IP Push регистрация с первым успешным push;
 - Nginx со `stream` и include для `/etc/nginx/stream-enabled/*.conf`;
 - UFW в активном состоянии;
 - Fail2ban;
 - `jq`, `flock`, `sha256sum`, стандартные shell tools.
 
-Настрой примеры:
+### Что RIPH делает с существующим `stream.conf`
+
+При **первой** установке, когда файла
 
 ```text
-config/config.env.example
-config/trusted-static.list.example
+/etc/router-ip-push-hardening/config.env
 ```
 
-Особенно проверь:
+ещё нет, installer не использует placeholder SNI из примера. Он читает уже работающий:
 
-- public/private SNI;
-- Xray/fake upstream;
-- bridge listen ports;
-- Router IP Push paths;
-- static trusted entries.
+```text
+/etc/nginx/stream-enabled/stream.conf
+```
+
+и автоматически перенимает штатную конфигурацию 3x-ui-installer:
+
+```text
+public SNI      -> www
+Reality SNI     -> xray
+XHTTP SNI       -> xray2    # если используется отдельный XHTTP SNI
+```
+
+Также проверяются соответствующие loopback upstream и fake HTTPS site:
+
+```text
+/etc/nginx/sites-available/reality.conf
+/etc/nginx/sites-available/xhttp.conf    # если есть отдельный XHTTP SNI
+```
+
+После этого RIPH создаёт свой `config.env`, делает backup исходного `stream.conf` и уже из обнаруженных реальных значений генерирует защищённый routing.
+
+Поддерживаются оба штатных варианта 3x-ui-installer:
+
+```text
+public + Reality
+public + Reality + отдельный XHTTP SNI
+```
+
+Если исходный stream layout неизвестен, неполон или неоднозначен, bootstrap завершается ошибкой **до изменения production-файлов**.
+
+Для обычной штатной первой установки вручную переносить SNI/порты в `config.env` не нужно. `config/config.env.example` остаётся reference/default-файлом для нестандартной ручной конфигурации.
 
 ---
 
@@ -64,15 +93,39 @@ Read-only preflight:
 sudo ./install.sh --check
 ```
 
+На первой установке эта команда также read-only проверяет, что существующий `stream.conf` можно безопасно перенять и что Router IP Push уже имеет валидную регистрацию/current IP.
+
 Если preflight не проходит — production ничего не меняется.
 
 ---
 
 ## 3. Первая установка
 
+Правильный порядок на новой VPS:
+
+```text
+3x-ui-installer
+ -> Router IP Push registration + first push
+ -> RIPH
+```
+
+Установка RIPH:
+
 ```bash
 sudo env RIPH_ALLOW_PRODUCTION=1 \
   ./install.sh --install --apply --enable-timers
+```
+
+Во время первой установки ожидается следующая последовательность:
+
+```text
+existing stream.conf
+ -> parse/validate
+ -> bootstrap production config.env
+ -> install backup
+ -> generate allowlist + RIPH stream.conf + bridge config
+ -> nginx -t
+ -> reload only after successful validation
 ```
 
 После установки:
@@ -85,9 +138,12 @@ sudo riph-admin status
 
 - правильные router ID/current IP;
 - правильный Effective trusted set;
+- реальные public/private SNI сохранились;
 - `nginx -t` = OK;
 - оба RIPH timer/watch = enabled/active;
 - корректный Fail2ban status.
+
+Важно: повторный запуск базового 3x-ui-installer может заново создать его обычный `stream.conf`. Поэтому штатный порядок — сначала базовый installer, затем RIPH. После намеренного изменения базовой Nginx/Xray-схемы RIPH нужно повторно согласовать/применить.
 
 ---
 
@@ -102,7 +158,7 @@ sudo env RIPH_ALLOW_PRODUCTION=1 \
 
 **Не добавляй `--replace-config` при обычном обновлении.**
 
-Installer обновит project files, но сохранит существующие рабочие config/list файлы.
+Installer обновит project files, но сохранит существующие рабочие config/list файлы. Авто-bootstrap из базового `stream.conf` выполняется только когда production `config.env` ещё отсутствует.
 
 После обновления:
 
@@ -539,6 +595,16 @@ sudo nginx -t
 sudo fail2ban-client -t
 sudo riph-admin timers
 ```
+
+Если **первая** установка останавливается на bootstrap `stream.conf`, не запускай `--replace-config` наугад. Сначала проверь исходный базовый routing:
+
+```bash
+sudo cat /etc/nginx/stream-enabled/stream.conf
+sudo cat /etc/nginx/sites-available/reality.conf
+sudo test ! -e /etc/nginx/sites-available/xhttp.conf || sudo cat /etc/nginx/sites-available/xhttp.conf
+```
+
+Bootstrap специально fail-closed: неизвестную схему он не должен молча превращать в другую.
 
 Если Router IP Push уже обновил IP, но RIPH его не видит:
 
