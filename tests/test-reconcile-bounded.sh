@@ -23,7 +23,7 @@ cp "${ROOT}/src/usr/local/sbin/riph-reconcile" "${R}/sbin/riph-reconcile"
 cp "${ROOT}/src/usr/local/libexec/riph-common.sh" "${R}/libexec/riph-common.sh"
 chmod +x "${R}/sbin/riph-reconcile"
 cp "${ROOT}/config/config.env.example" "${FS}/etc/router-ip-push-hardening/config.env"
-printf '%s\n' '78.111.154.96' >"${FS}/var/lib/router-ip-push/ips/AX3200.ipv4"
+printf '%s\n' '192.0.2.26' >"${FS}/var/lib/router-ip-push/ips/AX3200.ipv4"
 
 cat >"${R}/sbin/riph-apply" <<'EOF_APPLY'
 #!/usr/bin/env bash
@@ -55,9 +55,9 @@ EOF_ALLOW
 # Simulate a continuously moving ISP source: every successful apply is followed
 # by Router IP Push atomically publishing another address before verification.
 case "${count}" in
-    1) next='78.111.154.97' ;;
-    2) next='78.111.154.98' ;;
-    3) next='78.111.154.99' ;;
+    1) next='192.0.2.27' ;;
+    2) next='192.0.2.28' ;;
+    3) next='192.0.2.29' ;;
     *) next='' ;;
 esac
 if [[ -n "${next}" ]]; then
@@ -90,13 +90,13 @@ fi
 grep -Fq 'Router IP did not converge into active allowlist after 3 attempts' "${T}/out.txt" \
     || fail 'bounded-convergence failure message missing'
 
-# The third successful apply remains a valid Nginx/trusted transaction for .98;
-# live Router IP has already advanced to .99. Do not roll that successful apply
+# The third successful apply remains a valid Nginx/trusted transaction for .28;
+# live Router IP has already advanced to .29. Do not roll that successful apply
 # backward merely because convergence failed; the path/timer retry is the next
 # convergence attempt.
-[[ "$(jq -r '.routers.AX3200.current_ip' "${FS}/etc/router-ip-push-hardening/last-apply-state.json")" == '78.111.154.98' ]] \
+[[ "$(jq -r '.routers.AX3200.current_ip' "${FS}/etc/router-ip-push-hardening/last-apply-state.json")" == '192.0.2.28' ]] \
     || fail 'last successful apply state was unexpectedly rolled back'
-[[ "$(tr -d '[:space:]' <"${FS}/var/lib/router-ip-push/ips/AX3200.ipv4")" == '78.111.154.99' ]] \
+[[ "$(tr -d '[:space:]' <"${FS}/var/lib/router-ip-push/ips/AX3200.ipv4")" == '192.0.2.29' ]] \
     || fail 'live Router IP movement simulation is wrong'
 
 echo 'PASS: bounded Router IP convergence under continuous change'
