@@ -55,7 +55,7 @@ cat >"${TEST_ROOT}/etc/router-ip-push-hardening/previous-ip-grace.json" <<'EOF'
 EOF
 
 printf '%s\n' '192.0.2.25' \
-    >"${TEST_ROOT}/var/lib/router-ip-push/ips/AX3200.ipv4"
+    >"${TEST_ROOT}/var/lib/router-ip-push/ips/ROUTER_A.ipv4"
 
 CALL_LOG="${TEST_ROOT}/calls.log"
 cat >"${TEST_ROOT}/usr/local/bin/nginx-stub" <<EOF
@@ -81,7 +81,7 @@ GEN_OUT="${TEST_ROOT}/generated.conf"
 assert_contains "${GEN_OUT}" '127.0.0.1/32'
 assert_contains "${GEN_OUT}" '198.51.100.10/32'
 assert_contains "${GEN_OUT}" '192.0.2.25/32'
-assert_contains "${GEN_OUT}" 'router-ip-push:AX3200 current'
+assert_contains "${GEN_OUT}" 'router-ip-push:ROUTER_A current'
 
 echo "TEST 2: first apply writes trusted/routing state and reloads once"
 "${APPLY}" --root "${TEST_ROOT}" --reason "initial test" --now-epoch 1000
@@ -93,7 +93,7 @@ BRIDGE="${TEST_ROOT}/etc/nginx/stream-enabled/06-router-ip-push-fake-site-bridge
 assert_contains "${ALLOWLIST}" '192.0.2.25/32'
 assert_contains "${STREAM}" 'private-a.example.invalid|1'
 assert_contains "${BRIDGE}" 'listen 127.0.0.1:9543 proxy_protocol;'
-assert_eq "$(jq -r '.routers.AX3200.current_ip' "${STATE}")" '192.0.2.25' 'first current ip'
+assert_eq "$(jq -r '.routers.ROUTER_A.current_ip' "${STATE}")" '192.0.2.25' 'first current ip'
 assert_eq "$(grep -c '^systemctl reload nginx$' "${CALL_LOG}")" '1' 'first reload count'
 
 echo "TEST 3: unchanged apply performs no reload"
@@ -102,13 +102,13 @@ assert_eq "$(grep -c '^systemctl reload nginx$' "${CALL_LOG}")" '1' 'unchanged r
 
 echo "TEST 4: IP change adds previous grace and reloads"
 printf '%s\n' '192.0.2.55' \
-    >"${TEST_ROOT}/var/lib/router-ip-push/ips/AX3200.ipv4"
+    >"${TEST_ROOT}/var/lib/router-ip-push/ips/ROUTER_A.ipv4"
 "${APPLY}" --root "${TEST_ROOT}" --reason "router ip changed" --now-epoch 2000
 assert_contains "${ALLOWLIST}" '192.0.2.55/32'
 assert_contains "${ALLOWLIST}" '192.0.2.25/32'
 assert_contains "${ALLOWLIST}" 'previous grace until'
-assert_eq "$(jq -r '.routers.AX3200.ip' "${GRACE}")" '192.0.2.25' 'grace previous ip'
-assert_eq "$(jq -r '.routers.AX3200.expires_at_epoch' "${GRACE}")" "$((2000 + 4 * 3600))" 'grace expiry'
+assert_eq "$(jq -r '.routers.ROUTER_A.ip' "${GRACE}")" '192.0.2.25' 'grace previous ip'
+assert_eq "$(jq -r '.routers.ROUTER_A.expires_at_epoch' "${GRACE}")" "$((2000 + 4 * 3600))" 'grace expiry'
 assert_eq "$(grep -c '^systemctl reload nginx$' "${CALL_LOG}")" '2' 'changed reload count'
 
 echo "TEST 5: reconcile after grace expiry removes previous IP"
@@ -120,7 +120,7 @@ assert_eq "$(grep -c '^systemctl reload nginx$' "${CALL_LOG}")" '3' 'expiry relo
 
 echo "TEST 6: failed nginx validation restores all previous files"
 printf '%s\n' '192.0.2.99' \
-    >"${TEST_ROOT}/var/lib/router-ip-push/ips/AX3200.ipv4"
+    >"${TEST_ROOT}/var/lib/router-ip-push/ips/ROUTER_A.ipv4"
 cp "${ALLOWLIST}" "${TEST_ROOT}/allowlist.before-failure"
 cp "${STATE}" "${TEST_ROOT}/state.before-failure"
 cp "${GRACE}" "${TEST_ROOT}/grace.before-failure"
