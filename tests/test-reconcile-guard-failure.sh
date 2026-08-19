@@ -23,7 +23,7 @@ cp "${ROOT}/src/usr/local/sbin/riph-reconcile" "${R}/sbin/riph-reconcile"
 cp "${ROOT}/src/usr/local/libexec/riph-common.sh" "${R}/libexec/riph-common.sh"
 chmod +x "${R}/sbin/riph-reconcile"
 cp "${ROOT}/config/config.env.example" "${FS}/etc/router-ip-push-hardening/config.env"
-printf '%s\n' '78.111.154.96' >"${FS}/var/lib/router-ip-push/ips/AX3200.ipv4"
+printf '%s\n' '192.0.2.26' >"${FS}/var/lib/router-ip-push/ips/AX3200.ipv4"
 
 cat >"${R}/sbin/riph-apply" <<'EOF_APPLY'
 #!/usr/bin/env bash
@@ -76,7 +76,7 @@ reset_case() {
     rm -f \
         "${FS}/etc/router-ip-push-hardening/last-apply-state.json" \
         "${FS}/etc/nginx/stream-enabled/05-router-ip-push-source-allow.conf"
-    printf '%s\n' '78.111.154.96' >"${FS}/var/lib/router-ip-push/ips/AX3200.ipv4"
+    printf '%s\n' '192.0.2.26' >"${FS}/var/lib/router-ip-push/ips/AX3200.ipv4"
     unset RIPH_TEST_CHANGE_IP_AFTER_FIRST || true
 }
 
@@ -105,13 +105,13 @@ fi
 [[ "$(wc -l <"${RIPH_TEST_APPLY_LOG}")" == 1 ]] || fail 'failed apply was not called exactly once'
 [[ ! -s "${RIPH_TEST_GUARD_LOG}" ]] || fail 'guard ran after failed primary apply'
 
-# Exact race class: first apply commits B=.96, then Router IP Push atomically moves
-# to C=.97 before reconcile verifies the transaction. Reconcile must detect the
+# Race class: first apply commits B=.26, then Router IP Push atomically moves
+# to C=.27 before reconcile verifies the transaction. Reconcile must detect the
 # mismatch and perform a second apply immediately, without waiting for timer/path.
 reset_case
 export RIPH_TEST_APPLY_EXIT=0
 export RIPH_TEST_GUARD_EXIT=0
-export RIPH_TEST_CHANGE_IP_AFTER_FIRST='78.111.154.97'
+export RIPH_TEST_CHANGE_IP_AFTER_FIRST='192.0.2.27'
 if ! bash "${R}/sbin/riph-reconcile" --root "${FS}" --reason 'mid-transaction Router IP change' >"${T}/out3.txt" 2>&1; then
     fail 'reconcile failed to converge after one mid-transaction Router IP change'
 fi
@@ -121,9 +121,9 @@ fi
     || fail 'guard should run once only after Router IP convergence'
 grep -Fq 'Router IP changed or active allowlist moved during reconcile attempt 1; retrying' "${T}/out3.txt" \
     || fail 'mid-transaction convergence retry message missing'
-[[ "$(jq -r '.routers.AX3200.current_ip' "${FS}/etc/router-ip-push-hardening/last-apply-state.json")" == '78.111.154.97' ]] \
+[[ "$(jq -r '.routers.AX3200.current_ip' "${FS}/etc/router-ip-push-hardening/last-apply-state.json")" == '192.0.2.27' ]] \
     || fail 'last state did not converge to the new Router IP'
-grep -Fq '78.111.154.97/32 1;' "${FS}/etc/nginx/stream-enabled/05-router-ip-push-source-allow.conf" \
+grep -Fq '192.0.2.27/32 1;' "${FS}/etc/nginx/stream-enabled/05-router-ip-push-source-allow.conf" \
     || fail 'active allowlist did not converge to the new Router IP'
 
 unset RIPH_TEST_CHANGE_IP_AFTER_FIRST
