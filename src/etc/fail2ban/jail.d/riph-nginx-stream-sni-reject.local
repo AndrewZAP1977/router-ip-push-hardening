@@ -1,6 +1,6 @@
 # Managed by router-ip-push-hardening.
-# Installed disabled; Phase 7 explicitly activates project jails after routing checks.
-# Name/log are intentionally isolated from the legacy Hexabyte jail.
+# Installed disabled; activate only after routing/trusted-state validation.
+# Name/log are intentionally isolated from any pre-existing legacy jail.
 
 [riph-nginx-stream-sni-reject]
 enabled = false
