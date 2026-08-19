@@ -46,12 +46,12 @@ grep -Fq 'temporary Router IP Push Nginx hotfix still owns the allowlist' "${OUT
 mkdir -p "${T}/var/lib/router-ip-push/ips"
 cp "${ROOT}/config/trusted-static.list.example" "${T}/etc/router-ip-push-hardening/trusted-static.list"
 cp "${ROOT}/config/previous-ip-grace.json.example" "${T}/etc/router-ip-push-hardening/previous-ip-grace.json"
-printf '%s\n' '78.111.154.96' >"${T}/var/lib/router-ip-push/ips/AX3200.ipv4"
+printf '%s\n' '192.0.2.26' >"${T}/var/lib/router-ip-push/ips/AX3200.ipv4"
 
 DRY_OUT="${T}/dry-run.txt"
 bash "${APPLY}" --root "${T}" --dry-run --reason 'ownership-safe candidate' >"${DRY_OUT}" 2>&1
 grep -Fq 'dry-run:' "${DRY_OUT}" || fail 'dry-run did not reach candidate reporting'
-grep -Fq '78.111.154.96/32' "${DRY_OUT}" || fail 'dry-run candidate lost current Router IP'
+grep -Fq '192.0.2.26/32' "${DRY_OUT}" || fail 'dry-run candidate lost current Router IP'
 
 # Dry-run may create private test-root runtime scratch/state directories, but it
 # must not install the generated Nginx targets.
