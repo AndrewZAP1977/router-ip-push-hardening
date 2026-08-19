@@ -21,7 +21,7 @@ make_case() {
         "${c}/bin" \
         "${c}/state"
     cp "${ROOT}/config/config.env.example" "${c}/etc/router-ip-push-hardening/config.env"
-    printf '%s\n' '78.111.154.96' >"${c}/var/lib/router-ip-push/ips/AX3200.ipv4"
+    printf '%s\n' '192.0.2.26' >"${c}/var/lib/router-ip-push/ips/AX3200.ipv4"
 
     printf '%s\n' enabled >"${c}/state/router-ip-push-nginx-hotfix.path.enabled"
     printf '%s\n' active >"${c}/state/router-ip-push-nginx-hotfix.path.active"
@@ -144,7 +144,7 @@ export RIPH_TEST_SYSTEMD_STATE="${CASE_OK}/state"
 export RIPH_TEST_RECONCILE_LOG="${CASE_OK}/reconcile.log"
 export RIPH_HOTFIX_LOCK="${CASE_OK}/hotfix.lock"
 export RIPH_TEST_IP_FILE="${CASE_OK}/var/lib/router-ip-push/ips/AX3200.ipv4"
-export RIPH_TEST_IP_AFTER_FIRST='78.111.154.97'
+export RIPH_TEST_IP_AFTER_FIRST='192.0.2.27'
 
 bash "${HANDOVER}" --root "${CASE_OK}" takeover >/dev/null
 [[ "$(cat "${CASE_OK}/state/router-ip-push-nginx-hotfix.path.enabled")" == disabled ]] \
@@ -160,11 +160,11 @@ bash "${HANDOVER}" --root "${CASE_OK}" takeover >/dev/null
 [[ "$(cat "${CASE_OK}/state/riph-reconcile.timer.active")" == active ]] \
     || fail 'RIPH timer is not active after successful takeover'
 [[ "$(wc -l <"${CASE_OK}/reconcile.log")" == 2 ]] || fail 'stable handover should need exactly two explicit reconciles'
-[[ "$(sed -n '1p' "${CASE_OK}/reconcile.log")" == '78.111.154.96' ]] \
+[[ "$(sed -n '1p' "${CASE_OK}/reconcile.log")" == '192.0.2.26' ]] \
     || fail 'first reconcile did not consume the starting IP'
-[[ "$(sed -n '2p' "${CASE_OK}/reconcile.log")" == '78.111.154.97' ]] \
+[[ "$(sed -n '2p' "${CASE_OK}/reconcile.log")" == '192.0.2.27' ]] \
     || fail 'post-path reconcile did not consume the IP changed during handover'
-grep -Fq '78.111.154.97/32 1;' "${CASE_OK}/etc/nginx/stream-enabled/05-router-ip-push-source-allow.conf" \
+grep -Fq '192.0.2.27/32 1;' "${CASE_OK}/etc/nginx/stream-enabled/05-router-ip-push-source-allow.conf" \
     || fail 'final allowlist does not contain the IP changed during handover'
 
 unset RIPH_TEST_IP_AFTER_FIRST
@@ -215,7 +215,7 @@ if (( count == 1 )); then
     cat >"${root}/etc/nginx/stream-enabled/05-router-ip-push-source-allow.conf" <<'EOF_ALLOW'
 geo $router_ip_push_source_allowed {
         default 0;
-        78.111.154.96/32 1; # router-ip-push:AX3200 current
+        192.0.2.26/32 1; # router-ip-push:AX3200 current
 }
 EOF_ALLOW
     exit 0
