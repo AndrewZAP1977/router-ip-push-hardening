@@ -18,7 +18,7 @@ make_case() {
     cp "${ROOT}/config/config.env.example" "${t}/etc/router-ip-push-hardening/config.env"
     printf '%s\n' '127.0.0.1/32 # localhost' >"${t}/etc/router-ip-push-hardening/trusted-static.list"
     printf '%s\n' '{"version":1,"routers":{}}' >"${t}/etc/router-ip-push-hardening/previous-ip-grace.json"
-    printf '%s\n' '192.0.2.25' >"${t}/var/lib/router-ip-push/ips/AX3200.ipv4"
+    printf '%s\n' '192.0.2.25' >"${t}/var/lib/router-ip-push/ips/ROUTER_A.ipv4"
     cat >"${t}/etc/router-ip-push-hardening/manual-deny-443.list" <<'EOF_LIST'
 203.0.113.44/32 # old exact scanner
 198.51.100.0/24 # old scanner range
