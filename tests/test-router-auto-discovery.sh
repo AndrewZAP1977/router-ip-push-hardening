@@ -26,7 +26,10 @@ sync_provider() {
 }
 
 load_state() (
+    # riph-common consumes this global after being sourced.
+    # shellcheck disable=SC2034
     RIPH_ROOT="${T}"
+    # shellcheck disable=SC1090
     source "${COMMON}"
     riph_load_config "$(riph_root_path /etc/router-ip-push-hardening/config.env)"
     printf 'status=%s\n' "${RIPH_ROUTER_IP_PUSH_PROVIDER_STATUS}"
