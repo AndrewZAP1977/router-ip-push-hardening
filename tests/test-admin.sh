@@ -3,6 +3,7 @@ set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ADMIN="${ROOT}/src/usr/local/sbin/riph-admin"
+SYNC="${ROOT}/src/usr/local/sbin/riph-provider-router-ip-push-sync"
 T="$(mktemp -d /tmp/riph-admin-test.XXXXXX)"
 trap 'rm -rf "${T}"' EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
@@ -11,14 +12,13 @@ mkdir -p \
     "${T}/etc/router-ip-push-hardening" \
     "${T}/etc/nginx/stream-enabled" \
     "${T}/var/lib/router-ip-push/ips" \
-    "${T}/var/lib/router-ip-push/state" \
     "${T}/var/log/nginx" \
     "${T}/usr/local/bin"
 cp "${ROOT}/config/config.env.example" "${T}/etc/router-ip-push-hardening/config.env"
 printf '%s\n' '127.0.0.1/32 # localhost' >"${T}/etc/router-ip-push-hardening/trusted-static.list"
 printf '%s\n' '{"version":1,"routers":{}}' >"${T}/etc/router-ip-push-hardening/previous-ip-grace.json"
 printf '%s\n' '192.0.2.25' >"${T}/var/lib/router-ip-push/ips/ROUTER_A.ipv4"
-printf '%s\n' '{"version":1,"router_id":"ROUTER_A","source_ip":"192.0.2.25","last_seen":"2026-08-17T14:00:00Z"}' >"${T}/var/lib/router-ip-push/state/ROUTER_A.json"
+bash "${SYNC}" --root "${T}" --no-reconcile >/dev/null
 : >"${T}/etc/router-ip-push-hardening/manual-deny-443.list"
 : >"${T}/etc/router-ip-push-hardening/manual-deny-all.list"
 
@@ -117,8 +117,9 @@ export RIPH_TEST_UFW_STATE="${UFW_STATE}"
 "${ADMIN}" --root "${T}" apply >/dev/null
 STATUS_OUT="${T}/status.txt"
 "${ADMIN}" --root "${T}" status >"${STATUS_OUT}"
-grep -F 'current=192.0.2.25' "${STATUS_OUT}" >/dev/null || fail 'status missing current router IP'
-grep -F 'last_seen=2026-08-17T14:00:00Z' "${STATUS_OUT}" >/dev/null || fail 'status missing last_seen'
+grep -F 'Router IP Push provider: status=available invalid_entries=0' "${STATUS_OUT}" >/dev/null || fail 'status missing canonical provider health'
+grep -F 'ROUTER_A         current=192.0.2.25' "${STATUS_OUT}" >/dev/null || fail 'status missing canonical current router IP'
+! grep -F 'last_seen=' "${STATUS_OUT}" >/dev/null || fail 'admin still exposes external Pusher heartbeat state'
 
 echo 'TEST A1: transactional trusted add/remove'
 "${ADMIN}" --root "${T}" trusted-add 203.0.113.10 'temporary admin test' >/dev/null
