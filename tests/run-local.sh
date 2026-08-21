@@ -17,11 +17,11 @@ done < <(find install.sh src tests tools -type f \( -name '*.sh' -o -path '*/sbi
 if command -v shellcheck >/dev/null 2>&1; then
     printf '%s\n' '==> ShellCheck'
     mapfile -d '' shell_files < <(find install.sh src tests tools -type f \( -name '*.sh' -o -path '*/sbin/*' \) -print0)
-    # Keep the complete warning/info report visible, but do not let long-standing
-    # advisory findings prevent the functional regression suite from running.
-    # A real ShellCheck error remains a hard gate.
-    if ! shellcheck "${shell_files[@]}"; then
-        printf '%s\n' '==> ShellCheck: advisory findings above; enforcing errors only'
+    # Keep warning/error findings visible without flooding normal runs with
+    # informational source-following/style notes. Warnings remain advisory;
+    # a real ShellCheck error is a hard gate before functional regression.
+    if ! shellcheck --severity=warning "${shell_files[@]}"; then
+        printf '%s\n' '==> ShellCheck: advisory warnings above; enforcing errors only'
         shellcheck --severity=error "${shell_files[@]}"
     fi
 else
