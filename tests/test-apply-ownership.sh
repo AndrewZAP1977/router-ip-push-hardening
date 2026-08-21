@@ -3,6 +3,7 @@ set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APPLY="${ROOT}/src/usr/local/sbin/riph-apply"
+SYNC="${ROOT}/src/usr/local/sbin/riph-provider-router-ip-push-sync"
 T="$(mktemp -d /tmp/riph-apply-owner.XXXXXX)"
 trap 'rm -rf "${T}"' EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
@@ -33,10 +34,11 @@ mkdir -p "${T}/var/lib/router-ip-push/ips"
 cp "${ROOT}/config/trusted-static.list.example" "${T}/etc/router-ip-push-hardening/trusted-static.list"
 cp "${ROOT}/config/previous-ip-grace.json.example" "${T}/etc/router-ip-push-hardening/previous-ip-grace.json"
 printf '%s\n' '192.0.2.26' >"${T}/var/lib/router-ip-push/ips/ROUTER_A.ipv4"
+bash "${SYNC}" --root "${T}" --no-reconcile >/dev/null
 DRY_OUT="${T}/dry-run.txt"
 bash "${APPLY}" --root "${T}" --dry-run --reason 'ownership-safe candidate' >"${DRY_OUT}" 2>&1
 grep -Fq 'dry-run:' "${DRY_OUT}" || fail 'dry-run did not reach candidate reporting'
-grep -Fq '192.0.2.26/32' "${DRY_OUT}" || fail 'dry-run candidate lost current Router IP'
+grep -Fq '192.0.2.26/32' "${DRY_OUT}" || fail 'dry-run candidate lost canonical current Router IP'
 [[ ! -e "${T}/etc/nginx/stream-enabled/05-router-ip-push-source-allow.conf" ]] || fail 'dry-run unexpectedly installed allowlist'
 [[ ! -e "${T}/etc/nginx/stream-enabled/stream.conf" ]] || fail 'dry-run unexpectedly installed stream config'
 echo 'PASS: apply temporary-hotfix ownership gate and dry-run exception'
