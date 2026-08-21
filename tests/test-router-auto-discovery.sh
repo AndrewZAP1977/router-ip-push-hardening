@@ -94,10 +94,19 @@ sync_provider 2>"${T}/degraded.err"
 [[ "$(jq -r '.routers.BROKEN // empty' "${STATE}")" == '' ]] || fail 'malformed Router ID entry became trusted'
 grep -Fq 'ignoring malformed Router IP Push IPv4 for BROKEN' "${T}/degraded.err" || fail 'malformed input warning missing'
 
-echo 'TEST RAD7: explicit ROUTER_IDS remains a compatibility filter, not a requirement'
+echo 'TEST RAD7: explicit ROUTER_IDS remains a compatibility filter, not a provider requirement'
 printf '%s\n' 'ROUTER_IDS="AX3200"' >>"${T}/etc/router-ip-push-hardening/config.env"
 OUT="$(load_state)"
 grep -Fxq 'ids=AX3200' <<<"${OUT}" || fail "explicit Router ID filter mismatch: ${OUT}"
 ! grep -Fq 'WR3000S=' <<<"${OUT}" || fail 'explicit Router ID filter leaked WR3000S'
+
+echo 'TEST RAD8: legacy registration settings are ignored during upgrade compatibility'
+cat >>"${T}/etc/router-ip-push-hardening/config.env" <<'EOF_LEGACY'
+ROUTER_AUTO_DISCOVER_REGISTERED=1
+ROUTER_REGISTRY_DIR="/etc/router-ip-push/routers.d-does-not-exist"
+EOF_LEGACY
+OUT="$(load_state)"
+grep -Fxq 'ids=AX3200' <<<"${OUT}" || fail 'legacy registration settings changed canonical provider selection'
+[[ ! -e "${T}/etc/router-ip-push" ]] || fail 'test unexpectedly created Router IP Push registration state'
 
 echo 'PASS: RIPH canonical Router IP Push provider lifecycle tests'
