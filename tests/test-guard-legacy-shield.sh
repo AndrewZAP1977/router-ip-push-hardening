@@ -2,6 +2,7 @@
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SYNC="${ROOT}/src/usr/local/sbin/riph-provider-router-ip-push-sync"
 T="$(mktemp -d /tmp/riph-guard-shield.XXXXXX)"
 R="${T}/runtime"
 FS="${T}/rootfs"
@@ -25,6 +26,7 @@ cp "${ROOT}/config/previous-ip-grace.json.example" "${FS}/etc/router-ip-push-har
 : >"${FS}/etc/router-ip-push-hardening/manual-deny-443.list"
 : >"${FS}/etc/router-ip-push-hardening/manual-deny-all.list"
 printf '%s\n' '192.0.2.26' >"${FS}/var/lib/router-ip-push/ips/ROUTER_A.ipv4"
+bash "${SYNC}" --root "${FS}" --no-reconcile >/dev/null
 cat >"${FS}/etc/fail2ban/jail.d/zz-riph-legacy-trusted-ignore.local" <<'EOF_OVERRIDE'
 [nginx-stream-sni-reject]
 ignorecommand = /usr/local/sbin/riph-fail2ban-ignore <ip>
@@ -46,11 +48,12 @@ EOF_STATE1
 : >"${CALLS}"
 bash "${R}/sbin/riph-trusted-unban-guard" --root "${FS}" --now-epoch 1000 >/dev/null
 expected='prepend allow proto tcp from 192.0.2.26 to any port 443 comment riph-legacy-trusted-shield'
-grep -Fx -- "${expected}" "${CALLS}" >/dev/null || fail 'guard did not prepend current Router IP shield'
+grep -Fx -- "${expected}" "${CALLS}" >/dev/null || fail 'guard did not prepend current canonical Router IP shield'
 ! grep -Fq -- '--force delete 1' "${CALLS}" || fail 'guard deleted ambiguous legacy DENY instead of shielding current IP'
 ! grep -Fq -- '--force delete 2' "${CALLS}" || fail 'guard treated wrong-port same-marker rule as owned shield'
 
 printf '%s\n' '192.0.2.27' >"${FS}/var/lib/router-ip-push/ips/ROUTER_A.ipv4"
+bash "${SYNC}" --root "${FS}" --no-reconcile >/dev/null
 cat >"${STATE}" <<'EOF_STATE2'
 [ 1] 443/tcp ALLOW IN 192.0.2.26 # riph-legacy-trusted-shield
 [ 2] 443/tcp DENY IN 192.0.2.27
@@ -59,7 +62,7 @@ cat >"${STATE}" <<'EOF_STATE2'
 EOF_STATE2
 : >"${CALLS}"
 bash "${R}/sbin/riph-trusted-unban-guard" --root "${FS}" --now-epoch 1100 >/dev/null
-grep -Fx -- '--force delete 1' "${CALLS}" >/dev/null || fail 'stale project shield was not removed after Router IP change'
+grep -Fx -- '--force delete 1' "${CALLS}" >/dev/null || fail 'stale project shield was not removed after canonical Router IP change'
 ! grep -Fx -- '--force delete 2' "${CALLS}" >/dev/null || fail 'legacy current-IP DENY was removed'
 ! grep -Fx -- '--force delete 3' "${CALLS}" >/dev/null || fail 'current exact project shield was removed'
 ! grep -Fx -- '--force delete 4' "${CALLS}" >/dev/null || fail 'same-marker DENY was mistaken for project ALLOW shield'
@@ -75,4 +78,4 @@ bash "${R}/sbin/riph-trusted-unban-guard" --root "${FS}" --legacy-shield-remove-
 grep -Fx -- '--force delete 1' "${CALLS}" >/dev/null || fail 'remove-all did not delete exact project shield'
 ! grep -Fx -- '--force delete 2' "${CALLS}" >/dev/null || fail 'remove-all deleted legacy DENY'
 ! grep -Fx -- '--force delete 3' "${CALLS}" >/dev/null || fail 'remove-all deleted wrong-port same-marker rule'
-echo 'PASS: guard-managed legacy trusted UFW shield'
+echo 'PASS: guard-managed legacy trusted UFW shield from canonical provider state'
