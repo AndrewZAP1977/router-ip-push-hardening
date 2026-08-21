@@ -78,7 +78,10 @@ rm -rf "${T5}/var/lib/router-ip-push"
 # Structural transaction checks.
 grep -Fq 'trap restore_install_on_exit EXIT' "${INSTALLER}" || fail 'installer is not protected by EXIT rollback'
 grep -Fq 'resync_temporary_hotfix_after_error' "${INSTALLER}" || fail 'installer lost temporary-hotfix recovery hook'
+# These are intentionally literal shell fragments expected inside install.sh.
+# shellcheck disable=SC2016
 grep -Fq '"${RIPH_ROUTER_IP_PUSH_STATE}"' "${INSTALLER}" || fail 'canonical provider state is not part of install snapshot'
+# shellcheck disable=SC2016
 grep -Fq 'disable --now "${RIPH_PATH_UNIT}" "${RIPH_PROVIDER_TIMER_UNIT}" "${RIPH_TIMER_UNIT}"' "${INSTALLER}" || fail 'rollback does not disable provider/core triggers first'
 grep -Fq 'RIPH_ALLOW_PRODUCTION' "${INSTALLER}" || fail 'installer lost production confirmation gate'
 grep -Fq 'bootstrap-config-from-stream.sh' "${INSTALLER}" || fail 'installer lost stream bootstrap'
@@ -117,7 +120,9 @@ grep -Fq 'public.example.net|0' "${STREAM}" || fail 'public routing missing afte
 grep -Fq 'reality.example.net|1' "${STREAM}" || fail 'trusted Reality routing missing'
 grep -Fq 'xhttp.example.net|0' "${STREAM}" || fail 'untrusted XHTTP fake routing missing'
 backup_stream="$(find "${T1}/var/lib/router-ip-push-hardening/install-backups" -path '*/files/etc/nginx/stream-enabled/stream.conf' -type f | head -n1)"
-[[ -n "${backup_stream}" ]] && grep -Fq PREINSTALL_STREAM_SENTINEL "${backup_stream}" || fail 'pre-install stream snapshot missing'
+if [[ -z "${backup_stream}" ]] || ! grep -Fq PREINSTALL_STREAM_SENTINEL "${backup_stream}"; then
+    fail 'pre-install stream snapshot missing'
+fi
 
 REJECT_JAIL="${T1}/etc/fail2ban/jail.d/riph-nginx-stream-sni-reject.local"
 PRIVATE_JAIL="${T1}/etc/fail2ban/jail.d/riph-nginx-stream-private-sni-abuse.local"
