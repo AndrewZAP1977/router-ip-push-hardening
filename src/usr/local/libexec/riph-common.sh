@@ -173,7 +173,10 @@ riph_load_router_ip_push_provider_state() {
 
     status="$(jq -r '.status' "${state_file}")"
     invalid_count="$(jq -r '(.invalid_entries // 0) | floor' "${state_file}")"
+    # These globals are intentionally consumed by scripts that source this library.
+    # shellcheck disable=SC2034
     RIPH_ROUTER_IP_PUSH_PROVIDER_STATUS="${status}"
+    # shellcheck disable=SC2034
     RIPH_ROUTER_IP_PUSH_PROVIDER_INVALID_COUNT="${invalid_count}"
 
     while IFS=$'\t' read -r router_id ip; do
