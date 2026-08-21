@@ -41,14 +41,13 @@ riph_emit_effective_trusted_entries() {
         done <"${static_file}"
     fi
 
+    # RIPH_ROUTER_IDS is derived only from validated RIPH-owned canonical provider
+    # state. A missing value here is therefore an internal consistency error, not a
+    # provider-availability policy decision. Zero routers simply means zero loops.
     for router_id in "${RIPH_ROUTER_IDS[@]}"; do
-        if current_ip="$(riph_current_router_ip "${router_id}")"; then
-            printf '%s/32\t%s\n' "${current_ip}" "router-ip-push:${router_id} current"
-        elif [[ "${REQUIRE_ROUTER_IP:-1}" == "1" ]]; then
-            riph_die "no current Router IP Push IPv4 for ${router_id}"
-        else
-            riph_log "warning: no current Router IP Push IPv4 for ${router_id}"
-        fi
+        current_ip="$(riph_current_router_ip "${router_id}")" \
+            || riph_die "canonical provider state lost current IPv4 for ${router_id}"
+        printf '%s/32\t%s\n' "${current_ip}" "router-ip-push:${router_id} current"
     done
 
     if [[ -f "${grace_file}" ]]; then
