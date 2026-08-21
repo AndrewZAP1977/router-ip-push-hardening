@@ -3,6 +3,7 @@ set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 GUARD="${ROOT}/src/usr/local/sbin/riph-trusted-unban-guard"
+SYNC="${ROOT}/src/usr/local/sbin/riph-provider-router-ip-push-sync"
 T="$(mktemp -d /tmp/riph-guard.XXXXXX)"
 trap 'rm -rf "${T}"' EXIT
 
@@ -11,6 +12,7 @@ cp "${ROOT}/config/config.env.example" "${T}/etc/router-ip-push-hardening/config
 printf '%s\n' '127.0.0.1/32 # localhost' >"${T}/etc/router-ip-push-hardening/trusted-static.list"
 printf '%s\n' '{"version":1,"routers":{}}' >"${T}/etc/router-ip-push-hardening/previous-ip-grace.json"
 printf '%s\n' '192.0.2.25' >"${T}/var/lib/router-ip-push/ips/ROUTER_A.ipv4"
+bash "${SYNC}" --root "${T}" --no-reconcile >/dev/null
 : >"${T}/etc/router-ip-push-hardening/manual-deny-443.list"
 : >"${T}/etc/router-ip-push-hardening/manual-deny-all.list"
 
