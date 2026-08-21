@@ -134,14 +134,12 @@ if [[ -f "${STATIC_FILE}" ]]; then
     done <"${STATIC_FILE}"
 fi
 
+# Dynamic entries are already validated while canonical provider state is loaded.
+# Zero routers is therefore a normal empty loop, not an error condition.
 for router_id in "${RIPH_ROUTER_IDS[@]}"; do
-    if current_ip="$(riph_current_router_ip "${router_id}")"; then
-        add_entry "${current_ip}/32" "router-ip-push:${router_id} current"
-    elif [[ "${REQUIRE_ROUTER_IP:-1}" == "1" ]]; then
-        riph_die "no current Router IP Push IPv4 for ${router_id}"
-    else
-        riph_log "warning: no current Router IP Push IPv4 for ${router_id}"
-    fi
+    current_ip="$(riph_current_router_ip "${router_id}")" \
+        || riph_die "canonical provider state lost current IPv4 for ${router_id}"
+    add_entry "${current_ip}/32" "router-ip-push:${router_id} current"
 done
 
 if [[ -f "${GRACE_FILE}" ]]; then
