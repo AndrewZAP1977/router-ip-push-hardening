@@ -1,215 +1,107 @@
 # RIPH: практическая инструкция
 
-## РИФ за 30 секунд
+## RIPH за 30 секунд
 
-RIPH (Router IP Push Hardening) держит список доверенных source IP и по нему решает, куда отправлять TLS-трафик по SNI.
-
-```text
-Router IP Push
-    -> сообщает актуальный внешний IP роутера
-
-RIPH
-    -> считает этот IP trusted
-    -> генерирует Nginx allowlist/routing
-    -> защищает trusted IP от своих Fail2ban/manual-deny правил
-```
-
-Для роутера с динамическим IP нормальная схема такая:
+RIPH держит effective trusted source set и по нему маршрутизирует TLS по SNI.
 
 ```text
-установить Router IP Push
- -> зарегистрировать роутер на VPS
- -> дождаться первого успешного push
- -> RIPH автоматически увидит регистрацию и текущий IP
+Router IP Push (optional)
+    -> current Router-ID / IPv4
+    -> RIPH adapter
+    -> RIPH canonical provider state
+
+Static trusted
+    -> trusted-static.list
+
+RIPH policy
+    -> Nginx allowlist/routing
+    -> Fail2ban trusted protection
+    -> manual deny/UFW
 ```
 
-Отдельно добавлять router ID в RIPH обычно не требуется.
+Router IP Push **не обязателен**. RIPH штатно работает при полном отсутствии provider, zero routers, revoke одного или последнего Router ID и повторном появлении provider.
 
-Для VPS/узла с постоянным IPv4 используется **Static trusted**.
+## 1. Перед установкой
 
----
+Обязательны работающий Nginx Stream/Xray layout, include `/etc/nginx/stream-enabled/*.conf`, UFW, Fail2ban, `jq`, `flock`, `sha256sum` и стандартные shell tools.
 
-## 1. Перед первой установкой
-
-Нужны:
-
-- уже установленный и работающий 3x-ui/Xray/Nginx;
-- уже работающий Router IP Push;
-- минимум одна валидная Router IP Push регистрация с первым успешным push;
-- Nginx со `stream` и include для `/etc/nginx/stream-enabled/*.conf`;
-- UFW в активном состоянии;
-- Fail2ban;
-- `jq`, `flock`, `sha256sum`, стандартные shell tools.
-
-### Что RIPH делает с существующим `stream.conf`
-
-При **первой** установке, когда файла
+Router IP Push — optional. Если он установлен и уже имеет:
 
 ```text
-/etc/router-ip-push-hardening/config.env
+/var/lib/router-ip-push/ips/<Router-ID>.ipv4
 ```
 
-ещё нет, installer не использует placeholder SNI из примера. Он читает уже работающий:
+installer перед первым apply materialize эти IP в собственный state RIPH. Если Router IP Push отсутствует, install/apply всё равно должны работать.
 
-```text
-/etc/nginx/stream-enabled/stream.conf
-```
+## 2. Первый bootstrap routing
 
-и автоматически перенимает штатную конфигурацию 3x-ui-installer:
+Если ещё нет `/etc/router-ip-push-hardening/config.env`, installer читает существующий `/etc/nginx/stream-enabled/stream.conf` и перенимает standard 3x-ui-installer routing:
 
 ```text
 public SNI      -> www
 Reality SNI     -> xray
-XHTTP SNI       -> xray2    # если используется отдельный XHTTP SNI
+XHTTP SNI       -> xray2   # если используется
 ```
 
-Также проверяются соответствующие loopback upstream и fake HTTPS site:
+Также сверяются fake HTTPS configs `reality.conf` и `xhttp.conf`. Неизвестный/неполный/неоднозначный layout останавливает bootstrap до production mutation.
 
-```text
-/etc/nginx/sites-available/reality.conf
-/etc/nginx/sites-available/xhttp.conf    # если есть отдельный XHTTP SNI
-```
-
-После этого RIPH создаёт свой `config.env`, делает backup исходного `stream.conf` и уже из обнаруженных реальных значений генерирует защищённый routing.
-
-Поддерживаются оба штатных варианта 3x-ui-installer:
-
-```text
-public + Reality
-public + Reality + отдельный XHTTP SNI
-```
-
-Если исходный stream layout неизвестен, неполон или неоднозначен, bootstrap завершается ошибкой **до изменения production-файлов**.
-
-Для обычной штатной первой установки вручную переносить SNI/порты в `config.env` не нужно. `config/config.env.example` остаётся reference/default-файлом для нестандартной ручной конфигурации.
-
----
-
-## 2. Проверка перед установкой
-
-Read-only preflight:
+## 3. Read-only preflight
 
 ```bash
 sudo ./install.sh --check
 ```
 
-На первой установке эта команда также read-only проверяет, что существующий `stream.conf` можно безопасно перенять и что Router IP Push уже имеет валидную регистрацию/current IP.
+Preflight **не требует Router IP Push** и не изменяет production state.
 
-Если preflight не проходит — production ничего не меняется.
-
----
-
-## 3. Первая установка
-
-Правильный порядок на новой VPS:
-
-```text
-3x-ui-installer
- -> Router IP Push registration + first push
- -> RIPH
-```
-
-Установка RIPH:
+## 4. Production install/update
 
 ```bash
 sudo env RIPH_ALLOW_PRODUCTION=1 \
   ./install.sh --install --apply --enable-timers
 ```
 
-Во время первой установки ожидается следующая последовательность:
+Порядок внутри installer:
 
 ```text
-existing stream.conf
- -> parse/validate
- -> bootstrap production config.env
- -> install backup
- -> generate allowlist + RIPH stream.conf + bridge config
- -> nginx -t
- -> reload only after successful validation
+backup install targets/generated state
+ -> install project files
+ -> provider sync into RIPH canonical state
+ -> riph-apply
+ -> guard
+ -> enable provider/core timers if requested
 ```
 
-После установки:
+Canonical provider state входит в install transaction и откатывается вместе с остальными RIPH files при ошибке.
 
-```bash
-sudo riph-admin status
-```
+При обычном update **не добавляй `--replace-config`**.
 
-Нужно проверить:
+## 5. Canonical provider state
 
-- правильные router ID/current IP;
-- правильный Effective trusted set;
-- реальные public/private SNI сохранились;
-- `nginx -t` = OK;
-- оба RIPH timer/watch = enabled/active;
-- корректный Fail2ban status.
-
-Важно: повторный запуск базового 3x-ui-installer может заново создать его обычный `stream.conf`. Поэтому штатный порядок — сначала базовый installer, затем RIPH. После намеренного изменения базовой Nginx/Xray-схемы RIPH нужно повторно согласовать/применить.
-
----
-
-## 4. Обновление существующей установки
-
-Обычное обновление:
-
-```bash
-sudo env RIPH_ALLOW_PRODUCTION=1 \
-  ./install.sh --install --apply --enable-timers
-```
-
-**Не добавляй `--replace-config` при обычном обновлении.**
-
-Installer обновит project files, но сохранит существующие рабочие config/list файлы. Авто-bootstrap из базового `stream.conf` выполняется только когда production `config.env` ещё отсутствует.
-
-После обновления:
-
-```bash
-sudo riph-admin status
-```
-
----
-
-## 5. Динамические роутеры
-
-По умолчанию RIPH автоматически обнаруживает зарегистрированные Router IP Push роутеры:
+RIPH-owned Router IP Push snapshot:
 
 ```text
-ROUTER_AUTO_DISCOVER_REGISTERED=1
-ROUTER_REGISTRY_DIR=/etc/router-ip-push/routers.d
+/var/lib/router-ip-push-hardening/providers/router-ip-push.json
 ```
 
-Роутер становится effective только если одновременно есть:
-
-1. валидная Router IP Push регистрация;
-2. первый валидный текущий IPv4/state.
-
-Просто положить `.ipv4` файл вручную недостаточно.
-
-### Второй, третий и следующие роутеры
-
-Нормальный порядок:
+Status:
 
 ```text
-Router IP Push install
- -> server registration
- -> first push
- -> RIPH auto-discovery
- -> IP появляется в Effective trusted set
+available   provider directory есть, entries валидны
+degraded    часть .ipv4 невалидна; плохие entries не trusted
+absent      provider directory отсутствует; routers={}
 ```
 
-После первого push проверь:
+Пустая существующая `ips/` directory означает `available` + zero routers.
 
-```bash
-sudo riph-admin status
-```
+Core RIPH не читает и не требует:
 
----
-
-## 6. Static trusted
-
-Для VPS или другого узла с постоянным IP:
-
-```bash
-sudo riph-admin trusted-add 203.0.113.10/32 "admin VPS"
+```text
+/etc/router-ip-push/routers.d/*.json
+/var/lib/router-ip-push/state/*.json
+authorized_keys
+routerip user/group
+receiver/revoker
+Router IP Push service state
 ```
 
 Проверка:
@@ -218,439 +110,220 @@ sudo riph-admin trusted-add 203.0.113.10/32 "admin VPS"
 sudo riph-admin status
 ```
 
-Удаление:
+Status показывает RIPH canonical provider state, а не Router IP Push heartbeat/`last_seen`.
+
+## 6. Dynamic Router ID lifecycle
+
+### Новый Router ID
+
+После появления валидного `/var/lib/router-ip-push/ips/ROUTER_A.ipv4` provider adapter обновляет canonical snapshot и запускает reconcile.
+
+### Обычная смена WAN IPv4
+
+```text
+ROUTER_A: A -> B
+```
+
+B становится current. A остаётся trusted только на `PREVIOUS_IP_GRACE_HOURS`, если grace включён.
+
+### Revoke Router ID
+
+После удаления соответствующего `.ipv4`:
+
+```text
+ROUTER_A исчезает из canonical state
+ -> current trust ROUTER_A исчезает
+ -> previous grace ROUTER_A удаляется
+```
+
+Другие Router ID не затрагиваются.
+
+### Revoke последнего Router ID
+
+`routers={}` — нормальный RIPH state. Static trusted, routing, Fail2ban, manual deny, UFW и rollback продолжают работать.
+
+### Provider полностью удалён
+
+Если `/var/lib/router-ip-push/ips` отсутствует, adapter записывает `status=absent`, dynamic trusted = 0.
+
+### Provider появился снова
+
+Provider fallback timer повторно обнаружит provider; path watch ускоряет обычные изменения.
+
+## 7. Static trusted
+
+Добавить:
+
+```bash
+sudo riph-admin trusted-add 203.0.113.10/32 "admin VPS"
+```
+
+Удалить:
 
 ```bash
 sudo riph-admin trusted-remove 203.0.113.10/32
 ```
 
-Не используй static trusted для обычного динамического домашнего WAN IP — этим должен заниматься Router IP Push.
+Static trusted — явное административное решение.
 
----
-
-## 7. Previous-IP grace
-
-После смены динамического IP старый адрес некоторое время остаётся trusted.
-
-По умолчанию:
+## 8. Previous-IP grace
 
 ```text
 PREVIOUS_IP_GRACE_HOURS=4
 ```
 
-Это уменьшает вероятность разрыва при смене WAN IP.
-
-После истечения grace старый IP удалит reconcile.
-
----
-
-## 8. `riph-admin`
-
-Запуск интерактивного меню:
-
-```bash
-sudo riph-admin
-```
-
-Текущее меню:
+Grace создаётся только при обычной смене current IP одного и того же присутствующего Router ID:
 
 ```text
- 1. Status
- 2. Apply / regenerate trusted + routing
- 3. Reconcile
- 4. Run trusted-unban guard
- 5. Guard log
- 6. Timers / Router-IP watch
- 7. Apply manual deny lists
- 8. Add static trusted CIDR
- 9. Remove static trusted CIDR
-10. Add manual deny 443 CIDR
-11. Remove manual deny 443 CIDR
-12. Add manual deny ALL CIDR
-13. Remove manual deny ALL CIDR
-14. RIPH Fail2ban status
-15. RIPH Fail2ban unban IP
-16. Fail2ban validate + reload
-17. UFW relevant status
-18. Harvest since checkpoint
-19. Set harvest checkpoint
-20. Recent RIPH stream log
-21. List backups
-22. Rollback
- 0. Exit
+IP A -> B           => A может получить grace
+Router ID revoked   => grace для него удаляется
+provider absent     => dynamic routers отсутствуют
 ```
 
-<details>
-<summary><b>1. Status</b></summary>
+## 9. Systemd
 
-Главный экран состояния.
+Core:
 
-Показывает:
-
-- Router IP Push current/last_seen;
-- effective trusted set;
-- static trusted;
-- previous-IP grace;
-- last apply state;
-- generated Nginx files и SHA256;
-- manual deny lists;
-- `nginx -t`;
-- RIPH Fail2ban jail;
-- timers/watch.
-
-Команда:
-
-```bash
-sudo riph-admin status
+```text
+riph-reconcile.service
+riph-reconcile.timer
+riph-guard.service
 ```
-</details>
 
-<details>
-<summary><b>2. Apply / regenerate trusted + routing</b></summary>
+Optional Router IP Push adapter:
 
-Принудительно пересобирает trusted/routing из текущих источников.
+```text
+riph-router-ip.path
+    -> riph-provider-router-ip-push.service
 
-Обычно вручную не нужен: этим занимается reconcile.
-
-```bash
-sudo riph-admin apply
+riph-provider-router-ip-push.timer
+    -> fallback provider sync
 ```
-</details>
 
-<details>
-<summary><b>3. Reconcile</b></summary>
-
-Полный штатный цикл синхронизации.
-
-Проверяет Router IP Push, применяет изменения, убеждается в сходимости и запускает trusted guard.
-
-```bash
-sudo riph-admin reconcile
-```
-</details>
-
-<details>
-<summary><b>4. Run trusted-unban guard</b></summary>
-
-Проверяет, что trusted source не остаётся заблокирован собственными RIPH Fail2ban/manual-deny правилами.
-
-```bash
-sudo riph-admin guard
-```
-</details>
-
-<details>
-<summary><b>5. Guard log</b></summary>
-
-Показывает журнал последних запусков trusted-unban guard.
-</details>
-
-<details>
-<summary><b>6. Timers / Router-IP watch</b></summary>
-
-Показывает состояние:
-
-- `riph-router-ip.path`;
-- `riph-reconcile.timer`.
+Проверка:
 
 ```bash
 sudo riph-admin timers
 ```
-</details>
 
-<details>
-<summary><b>7. Apply manual deny lists</b></summary>
-
-Синхронизирует управляемые manual deny списки с UFW.
+## 10. Основные команды
 
 ```bash
+sudo riph-admin
+sudo riph-admin status
+sudo riph-admin apply
+sudo riph-admin reconcile
+sudo riph-admin guard
+sudo riph-admin guard-log
+sudo riph-admin timers
 sudo riph-admin manual-deny-apply
+sudo riph-admin fail2ban-status
+sudo riph-admin fail2ban-unban 203.0.113.50
+sudo riph-admin fail2ban-reload
+sudo riph-admin ufw-status
+sudo riph-admin harvest
+sudo riph-admin harvest-checkpoint
+sudo riph-admin recent-log 50
+sudo riph-admin backups
 ```
-</details>
 
-<details>
-<summary><b>8. Add static trusted CIDR</b></summary>
+## 11. Manual deny
 
-Добавляет постоянный trusted IPv4/CIDR и сразу выполняет безопасный reconcile.
-
-```bash
-sudo riph-admin trusted-add 203.0.113.10/32 "admin VPS"
-```
-</details>
-
-<details>
-<summary><b>9. Remove static trusted CIDR</b></summary>
-
-Удаляет static trusted entry и пересобирает effective state.
-
-```bash
-sudo riph-admin trusted-remove 203.0.113.10/32
-```
-</details>
-
-<details>
-<summary><b>10. Add manual deny 443 CIDR</b></summary>
-
-Постоянно блокирует source только на TCP/443.
-
-Это предпочтительный manual deny для scanner/abuse source.
+TCP/443:
 
 ```bash
 sudo riph-admin deny443-add 198.51.100.0/24 "scanner range"
-```
-</details>
-
-<details>
-<summary><b>11. Remove manual deny 443 CIDR</b></summary>
-
-Удаляет запись из управляемого TCP/443 deny list.
-
-```bash
 sudo riph-admin deny443-remove 198.51.100.0/24
 ```
-</details>
 
-<details>
-<summary><b>12. Add manual deny ALL CIDR</b></summary>
-
-Блокирует source на всех портах.
-
-Использовать только в исключительных случаях: такой deny способен затронуть management traffic.
+All ports:
 
 ```bash
 sudo riph-admin denyall-add 198.51.100.25/32 "exceptional block"
-```
-</details>
-
-<details>
-<summary><b>13. Remove manual deny ALL CIDR</b></summary>
-
-Удаляет all-ports deny.
-
-```bash
 sudo riph-admin denyall-remove 198.51.100.25/32
 ```
-</details>
 
-<details>
-<summary><b>14. RIPH Fail2ban status</b></summary>
+All-ports deny используй только в исключительных случаях. Перед apply RIPH проверяет overlap с effective trusted set.
 
-Показывает только собственные RIPH jail.
+## 12. Fail2ban
 
-```bash
-sudo riph-admin fail2ban-status
-```
-</details>
-
-<details>
-<summary><b>15. RIPH Fail2ban unban IP</b></summary>
-
-Снимает IP только из RIPH jail.
-
-```bash
-sudo riph-admin fail2ban-unban 203.0.113.50
-```
-</details>
-
-<details>
-<summary><b>16. Fail2ban validate + reload</b></summary>
-
-Сначала выполняет validation, затем reload Fail2ban и trusted guard.
-
-```bash
-sudo riph-admin fail2ban-reload
-```
-</details>
-
-<details>
-<summary><b>17. UFW relevant status</b></summary>
-
-Показывает UFW rules, имеющие отношение к RIPH.
-
-```bash
-sudo riph-admin ufw-status
-```
-</details>
-
-<details>
-<summary><b>18. Harvest since checkpoint</b></summary>
-
-Анализирует новые записи route-aware stream log после последнего checkpoint.
-
-```bash
-sudo riph-admin harvest
-```
-</details>
-
-<details>
-<summary><b>19. Set harvest checkpoint</b></summary>
-
-Запоминает текущую позицию в stream log как начало следующего анализа.
-
-```bash
-sudo riph-admin harvest-checkpoint
-```
-</details>
-
-<details>
-<summary><b>20. Recent RIPH stream log</b></summary>
-
-Показывает последние строки route-aware stream log.
-
-```bash
-sudo riph-admin recent-log 50
-```
-</details>
-
-<details>
-<summary><b>21. List backups</b></summary>
-
-Показывает доступные runtime backups.
-
-```bash
-sudo riph-admin backups
-```
-</details>
-
-<details>
-<summary><b>22. Rollback</b></summary>
-
-Восстанавливает выбранный runtime backup.
-
-Перед rollback создаётся safety snapshot, а восстановленная Nginx-конфигурация проходит validation.
-
-```bash
-sudo riph-admin rollback latest
-```
-
-Интерактивный rollback дополнительно требует явного подтверждения.
-</details>
-
----
-
-## 9. Manual deny: что выбирать
-
-Обычно:
-
-```text
-scanner/abuse на HTTPS
- -> manual deny 443
-```
-
-Только если действительно нужно перекрыть source целиком:
-
-```text
-исключительный случай
- -> manual deny ALL
-```
-
-RIPH проверяет пересечение manual deny с trusted set и не должен позволять штатно заблокировать собственный trusted source.
-
----
-
-## 10. Fail2ban
-
-RIPH использует два jail:
+RIPH jails:
 
 ```text
 riph-nginx-stream-sni-reject
 riph-nginx-stream-private-sni-abuse
 ```
 
-По умолчанию автоматические баны ограничены TCP/443.
+Автоматические bans ограничены TCP/443.
 
-Если ранее untrusted IP позже становится trusted (например после Router IP Push регистрации/смены адреса), reconcile/guard должен снять соответствующий RIPH ban.
+`riph-fail2ban-ignore` не читает raw Router IP Push runtime. Fast paths:
 
----
+1. RIPH canonical provider state;
+2. active generated RIPH allowlist.
 
-## 11. Где смотреть логи
+Fail2ban activation допускает zero-provider/zero-router state. Если dynamic routers есть, каждый current IP обязан уже находиться в active allowlist и быть защищён ignore helper.
 
-Route-aware stream log:
-
-```text
-/var/log/nginx/riph-stream-sni.log
-```
-
-Быстро посмотреть:
-
-```bash
-sudo riph-admin recent-log 100
-```
-
-Статистика новых записей:
-
-```bash
-sudo riph-admin harvest
-```
-
----
-
-## 12. Если что-то не работает
-
-Начинай с:
-
-```bash
-sudo riph-admin status
-sudo nginx -t
-sudo fail2ban-client -t
-sudo riph-admin timers
-```
-
-Если **первая** установка останавливается на bootstrap `stream.conf`, не запускай `--replace-config` наугад. Сначала проверь исходный базовый routing:
-
-```bash
-sudo cat /etc/nginx/stream-enabled/stream.conf
-sudo cat /etc/nginx/sites-available/reality.conf
-sudo test ! -e /etc/nginx/sites-available/xhttp.conf || sudo cat /etc/nginx/sites-available/xhttp.conf
-```
-
-Bootstrap специально fail-closed: неизвестную схему он не должен молча превращать в другую.
-
-Если Router IP Push уже обновил IP, но RIPH его не видит:
-
-```bash
-sudo riph-admin reconcile
-sudo riph-admin status
-```
-
-Проверь также наличие регистрации:
+## 13. Routing
 
 ```text
-/etc/router-ip-push/routers.d/<router_id>.json
+public SNI
+    -> public upstream
+
+private SNI + trusted
+    -> Xray
+
+private SNI + untrusted
+    -> PROXY bridge
+    -> fake HTTPS
+
+unknown / empty / IP-SNI
+    -> reject
 ```
 
-и текущего Router IP Push state:
+Generated files:
 
 ```text
-/var/lib/router-ip-push/ips/<router_id>.ipv4
-/var/lib/router-ip-push/state/<router_id>.json
+/etc/nginx/stream-enabled/05-router-ip-push-source-allow.conf
+/etc/nginx/stream-enabled/stream.conf
+/etc/nginx/stream-enabled/06-router-ip-push-fake-site-bridges.conf
 ```
 
----
+Историческое имя allowlist файла не меняет ownership: файл принадлежит RIPH и не должен удаляться вместе с Router IP Push.
 
-## 13. Важные файлы
+## 14. Rollback
 
-```text
-/etc/router-ip-push-hardening/config.env
-/etc/router-ip-push-hardening/trusted-static.list
-/etc/router-ip-push-hardening/previous-ip-grace.json
-/etc/router-ip-push-hardening/manual-deny-443.list
-/etc/router-ip-push-hardening/manual-deny-all.list
-
-/var/lib/router-ip-push-hardening/
-/var/log/nginx/riph-stream-sni.log
+```bash
+sudo riph-admin backups
 ```
 
-Generated Nginx files вручную не редактируются.
+Rollback создаёт safety snapshot, восстанавливает выбранный state и проверяет Nginx. Это core RIPH операция и она должна работать без Router IP Push.
 
----
+## 15. Старый `router-ip-push-nginx-hotfix.*`
 
-## 14. Локальная проверка исходников
+Это transitional pre-RIPH allowlist writer, а не современный provider adapter.
+
+`riph-hotfix-handover` делает controlled ownership transfer и сохраняет старые files для rollback/forensics.
+
+Не путай его с `riph-legacy-handover`, который относится к старому stream-audit/Fail2ban coexistence.
+
+## 16. Что RIPH не трогает
+
+RIPH не управляет:
+
+- Router IP Push registrations/keys/user/receiver/revoker;
+- Xray client definitions / 3x-ui DB;
+- SSH policy;
+- ZeroTier/VPN/overlay;
+- приложениями за reverse proxy.
+
+## 17. Regression tests
 
 ```bash
 bash tests/run-local.sh
 ```
 
-Она запускает Bash syntax check, ShellCheck (если установлен) и regression tests.
+Suite выполняет `bash -n`, ShellCheck если установлен и все `tests/test-*.sh`.
 
-GitHub Actions в проекте оставлен только для ручного запуска через `workflow_dispatch`.
+Provider lifecycle regression включает absent/zero/multiple routers, A→B + grace, revoke одного/последнего, disappearance/reappearance, malformed entry, Fail2ban ignore без raw-provider trust, install/rollback без provider и bounded canonical-state convergence.
+
+GitHub Actions остаётся только ручным (`workflow_dispatch`).
