@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+COMMON_DEFAULT="/usr/local/libexec/riph-common.sh"
+if [[ -f "${SCRIPT_DIR}/../libexec/riph-common.sh" ]]; then
+    # Repository/test layout.
+    # shellcheck source=../libexec/riph-common.sh
+    source "${SCRIPT_DIR}/../libexec/riph-common.sh"
+else
+    # shellcheck source=/usr/local/libexec/riph-common.sh
+    source "${COMMON_DEFAULT}"
+fi
+
+RIPH_ROOT="/"
+CONFIG_PATH="/etc/router-ip-push-hardening/config.env"
+SOURCE_DIR_OVERRIDE=""
+NO_RECONCILE=0
+
+usage() {
+    cat <<'USAGE'
+Usage: riph-provider-router-ip-push-sync [options]
+
+Materialize the optional Router IP Push provider into RIPH-owned canonical state.
+The provider contract is only Router-ID -> current IPv4 from ips/*.ipv4.
+
+Options:
+  --root DIR          Production/test root.
+  --config PATH       RIPH config path inside root.
+  --source-dir PATH   Override Router IP Push ips directory inside root (tests).
+  --no-reconcile      Update provider state only; do not invoke riph-reconcile.
+  -h, --help          Show this help.
+USAGE
+}
+
+while (($#)); do
+    case "$1" in
+        --root)
+            (($# >= 2)) || riph_die "--root requires a value"
+            RIPH_ROOT="$(riph_validate_root "$2")"
+            shift 2
+            ;;
+        --config)
+            (($# >= 2)) || riph_die "--config requires a value"
+            CONFIG_PATH="$2"
+            shift 2
+            ;;
+        --source-dir)
+            (($# >= 2)) || riph_die "--source-dir requires a value"
+            SOURCE_DIR_OVERRIDE="$2"
+            shift 2
+            ;;
+        --no-reconcile)
+            NO_RECONCILE=1
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            riph_die "unknown argument: $1"
+            ;;
+    esac
+done
+
+riph_require_cmd jq
+riph_require_cmd install
+riph_require_cmd sort
+
+CONFIG_FILE="$(riph_root_path "${CONFIG_PATH}")"
+riph_load_config "${CONFIG_FILE}"
+riph_prepare_dirs
+
+SOURCE_LOGICAL="${SOURCE_DIR_OVERRIDE:-${ROUTER_IP_PUSH_DIR}/ips}"
+[[ "${SOURCE_LOGICAL}" == /* ]] || riph_die "provider source directory must be absolute"
+SOURCE_DIR="$(riph_root_path "${SOURCE_LOGICAL}")"
+STATE_FILE="$(riph_root_path "${RIPH_ROUTER_IP_PUSH_STATE}")"
+STATE_DIR="$(dirname "${STATE_FILE}")"
+mkdir -p "${STATE_DIR}"
+
+candidate="$(mktemp "${STATE_DIR}/.router-ip-push.XXXXXX")"
+routers_tmp="$(mktemp "${STATE_DIR}/.router-ip-push-routers.XXXXXX")"
+cleanup() {
+    rm -f "${candidate}" "${routers_tmp}"
+}
+trap cleanup EXIT
+
+printf '{"version":1,"provider":"router-ip-push","status":"absent","routers":{},"invalid_entries":0}\n' >"${candidate}"
+
+status="absent"
+invalid_count=0
+
+if [[ -d "${SOURCE_DIR}" ]]; then
+    status="available"
+    shopt -s nullglob
+    files=("${SOURCE_DIR}"/*.ipv4)
+    shopt -u nullglob
+
+    if ((${#files[@]} > 0)); then
+        printf '%s\n' "${files[@]}" | LC_ALL=C sort >"${routers_tmp}"
+        while IFS= read -r ip_file; do
+            [[ -n "${ip_file}" ]] || continue
+            router_id="$(basename "${ip_file}" .ipv4)"
+            if ! riph_is_router_id "${router_id}"; then
+                invalid_count=$((invalid_count + 1))
+                riph_log "WARNING: ignoring Router IP Push file with invalid Router ID: ${ip_file}"
+                continue
+            fi
+
+            ip="$(tr -d '[:space:]' <"${ip_file}" 2>/dev/null || true)"
+            if ! riph_is_ipv4 "${ip}"; then
+                invalid_count=$((invalid_count + 1))
+                riph_log "WARNING: ignoring malformed Router IP Push IPv4 for ${router_id}: ${ip_file}"
+                continue
+            fi
+
+            tmp="${candidate}.tmp"
+            jq --arg id "${router_id}" --arg ip "${ip}" \
+                '.routers[$id] = {"current_ip": $ip}' \
+                "${candidate}" >"${tmp}"
+            mv "${tmp}" "${candidate}"
+        done <"${routers_tmp}"
+    fi
+
+    (( invalid_count == 0 )) || status="degraded"
+fi
+
+tmp="${candidate}.tmp"
+jq --arg status "${status}" --argjson invalid "${invalid_count}" \
+    '.status = $status | .invalid_entries = $invalid' \
+    "${candidate}" >"${tmp}"
+mv "${tmp}" "${candidate}"
+
+if [[ -f "${STATE_FILE}" ]] && cmp -s "${STATE_FILE}" "${candidate}"; then
+    riph_log "Router IP Push provider state unchanged (${status})"
+    exit 0
+fi
+
+installed_tmp="${STATE_FILE}.new.$$"
+install -m 0600 "${candidate}" "${installed_tmp}"
+mv -f "${installed_tmp}" "${STATE_FILE}"
+riph_log "Router IP Push provider state updated: status=${status} routers=$(jq '.routers | length' "${STATE_FILE}") invalid=${invalid_count}"
+
+if (( NO_RECONCILE == 0 )); then
+    if [[ -f "${SCRIPT_DIR}/riph-reconcile" ]]; then
+        RECONCILE="${SCRIPT_DIR}/riph-reconcile"
+    else
+        RECONCILE="/usr/local/sbin/riph-reconcile"
+    fi
+    [[ -x "${RECONCILE}" || -f "${RECONCILE}" ]] || riph_die "riph-reconcile not found: ${RECONCILE}"
+    bash "${RECONCILE}" --root "${RIPH_ROOT}" --config "${CONFIG_PATH}" \
+        --reason "Router IP Push provider state changed"
+fi
