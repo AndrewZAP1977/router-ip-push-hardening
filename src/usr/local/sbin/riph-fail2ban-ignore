@@ -56,19 +56,21 @@ done
 [[ -n "${IP}" ]] || exit 2
 riph_is_ipv4 "${IP}" || exit 1
 
-# Emergency fast path #1: protect every currently reported Router IP Push IPv4
-# before loading hardening config. This closes the short race between the receiver
-# writing a new address and riph-reconcile rebuilding the Nginx allowlist, and it
+# Emergency fast path #1: protect every current IP already materialized into
+# RIPH-owned canonical provider state. This closes the short race between provider
+# sync and Nginx reconcile without reading Router IP Push runtime directly, and it
 # still works if config.env is temporarily malformed.
-DEFAULT_ROUTER_IP_DIR="$(riph_root_path /var/lib/router-ip-push/ips)"
-if [[ -d "${DEFAULT_ROUTER_IP_DIR}" ]]; then
-    for ip_file in "${DEFAULT_ROUTER_IP_DIR}"/*.ipv4; do
-        [[ -f "${ip_file}" ]] || continue
-        current="$(tr -d '[:space:]' <"${ip_file}" 2>/dev/null || true)"
-        if [[ "${current}" == "${IP}" ]]; then
+DEFAULT_PROVIDER_STATE="$(riph_root_path /var/lib/router-ip-push-hardening/providers/router-ip-push.json)"
+if [[ -f "${DEFAULT_PROVIDER_STATE}" ]] && command -v jq >/dev/null 2>&1; then
+    while IFS= read -r current; do
+        [[ -n "${current}" ]] || continue
+        if riph_is_ipv4 "${current}" && [[ "${current}" == "${IP}" ]]; then
             exit 0
         fi
-    done
+    done < <(jq -r '
+        select(.version == 1 and .provider == "router-ip-push" and (.routers | type == "object"))
+        | .routers[]?.current_ip // empty
+    ' "${DEFAULT_PROVIDER_STATE}" 2>/dev/null || true)
 fi
 
 # Emergency fast path #2: the generated allowlist is a last-known-good artifact
