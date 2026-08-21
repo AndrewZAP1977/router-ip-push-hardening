@@ -34,10 +34,11 @@ Options:
   --now-epoch EPOCH   Deterministic test time.
   -h, --help          Show this help.
 
-Normal reconcile is convergent: after each successful apply it re-reads Router IP
-Push and verifies that last successful state + active allowlist still contain the
-current Router IP. If the ISP/Router IP changes during the transaction, reconcile
-immediately retries up to three times instead of waiting for another path/timer event.
+Normal reconcile is convergent: after each successful apply it reloads RIPH-owned
+canonical provider state and verifies that the last successful state + active
+allowlist still contain every current dynamic Router IP. If provider state changes
+during the transaction, reconcile immediately retries up to three times instead of
+waiting for another path/timer event. Zero dynamic routers is a valid converged state.
 
 A successful trusted/Nginx apply is never rolled back merely because the post-apply
 guard cleanup is temporarily unavailable. Guard failures are logged and retried by
@@ -106,20 +107,25 @@ LAST_STATE_FILE="$(riph_root_path "${RIPH_CONFIG_DIR}/last-apply-state.json")"
 ALLOWLIST_FILE="$(riph_root_path "${ALLOWLIST_OUTPUT}")"
 
 current_state_converged() {
-    local router_id current_ip applied_ip
+    local router_id current_ip applied_ip applied_count
 
     [[ -f "${LAST_STATE_FILE}" ]] || return 1
     [[ -f "${ALLOWLIST_FILE}" ]] || return 1
     jq -e '.version == 1 and (.routers | type == "object")' "${LAST_STATE_FILE}" >/dev/null 2>&1 || return 1
 
+    applied_count="$(jq '.routers | length' "${LAST_STATE_FILE}")"
+    [[ "${applied_count}" -eq "${#RIPH_ROUTER_IDS[@]}" ]] || return 1
+
+    while IFS= read -r router_id; do
+        [[ -n "${router_id}" ]] || continue
+        riph_router_id_is_effective "${router_id}" || return 1
+    done < <(jq -r '.routers | keys[]' "${LAST_STATE_FILE}")
+
     for router_id in "${RIPH_ROUTER_IDS[@]}"; do
-        if current_ip="$(riph_current_router_ip "${router_id}")"; then
-            applied_ip="$(jq -r --arg id "${router_id}" '.routers[$id].current_ip // empty' "${LAST_STATE_FILE}")"
-            [[ "${applied_ip}" == "${current_ip}" ]] || return 1
-            grep -Eq "^[[:space:]]*${current_ip//./\\.}/32[[:space:]]+1;" "${ALLOWLIST_FILE}" || return 1
-        elif [[ "${REQUIRE_ROUTER_IP:-1}" == 1 ]]; then
-            return 1
-        fi
+        current_ip="$(riph_current_router_ip "${router_id}")" || return 1
+        applied_ip="$(jq -r --arg id "${router_id}" '.routers[$id].current_ip // empty' "${LAST_STATE_FILE}")"
+        [[ "${applied_ip}" == "${current_ip}" ]] || return 1
+        grep -Eq "^[[:space:]]*${current_ip//./\\.}/32[[:space:]]+1;" "${ALLOWLIST_FILE}" || return 1
     done
     return 0
 }
@@ -136,20 +142,25 @@ else
         # fail hard; riph-apply has already restored its previous Nginx state.
         bash "${APPLY}" "${apply_args[@]}"
 
+        # riph-apply is a separate process and may have observed a newer provider
+        # snapshot than this reconcile process had at startup. Reload canonical
+        # state before checking convergence so revoke/change races are bounded.
+        riph_load_config "${CONFIG_FILE}"
+
         if current_state_converged; then
             converged=1
             break
         fi
 
-        riph_log "Router IP changed or active allowlist moved during reconcile attempt ${attempt}; retrying"
+        riph_log "provider state or active allowlist moved during reconcile attempt ${attempt}; retrying"
         if (( attempt < MAX_CONVERGENCE_ATTEMPTS )); then
             sleep 1
         fi
     done
-    (( converged == 1 )) || riph_die "Router IP did not converge into active allowlist after ${MAX_CONVERGENCE_ATTEMPTS} attempts"
+    (( converged == 1 )) || riph_die "dynamic provider state did not converge into active allowlist after ${MAX_CONVERGENCE_ATTEMPTS} attempts"
 fi
 
-# Cleanup is secondary and retryable. Rolling back a freshly accepted Router IP
+# Cleanup is secondary and retryable. Rolling back freshly accepted trusted state
 # because Fail2ban/UFW cleanup is temporarily unavailable would be less safe than
 # keeping the new trusted state and retrying the guard on the next reconcile.
 if ! bash "${GUARD}" "${guard_args[@]}"; then
