@@ -3,12 +3,13 @@ set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RECONCILE="${ROOT}/src/usr/local/sbin/riph-reconcile"
+SYNC="${ROOT}/src/usr/local/sbin/riph-provider-router-ip-push-sync"
 T="$(mktemp -d /tmp/riph-ip-change-incident.XXXXXX)"
 trap 'rm -rf "${T}"' EXIT
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
-mkdir -p "${T}/etc/router-ip-push-hardening" "${T}/etc/nginx/stream-enabled" "${T}/var/lib/router-ip-push/ips" "${T}/var/lib/router-ip-push/state" "${T}/usr/local/bin"
+mkdir -p "${T}/etc/router-ip-push-hardening" "${T}/etc/nginx/stream-enabled" "${T}/var/lib/router-ip-push/ips" "${T}/usr/local/bin"
 cp "${ROOT}/config/config.env.example" "${T}/etc/router-ip-push-hardening/config.env"
 cp "${ROOT}/config/trusted-static.list.example" "${T}/etc/router-ip-push-hardening/trusted-static.list"
 cp "${ROOT}/config/previous-ip-grace.json.example" "${T}/etc/router-ip-push-hardening/previous-ip-grace.json"
@@ -43,9 +44,11 @@ ALLOW="${T}/etc/nginx/stream-enabled/05-router-ip-push-source-allow.conf"
 GRACE="${T}/etc/router-ip-push-hardening/previous-ip-grace.json"
 STATE="${T}/etc/router-ip-push-hardening/last-apply-state.json"
 IP_FILE="${T}/var/lib/router-ip-push/ips/ROUTER_A.ipv4"
+PROVIDER_STATE="${T}/var/lib/router-ip-push-hardening/providers/router-ip-push.json"
 
 printf '%s\n' "${OLD_IP}" >"${IP_FILE}"
-printf '%s\n' "{\"version\":1,\"router_id\":\"ROUTER_A\",\"source_ip\":\"${OLD_IP}\",\"last_seen\":\"2026-08-17T03:51:00Z\"}" >"${T}/var/lib/router-ip-push/state/ROUTER_A.json"
+bash "${SYNC}" --root "${T}" --no-reconcile >/dev/null
+[[ "$(jq -r '.routers.ROUTER_A.current_ip' "${PROVIDER_STATE}")" == "${OLD_IP}" ]] || fail 'baseline provider sync is wrong'
 bash "${RECONCILE}" --root "${T}" --reason 'IP-change baseline' --now-epoch 1000
 grep -Fq "${OLD_IP}/32" "${ALLOW}" || fail 'baseline old IP is not trusted'
 [[ "$(jq -r '.routers.ROUTER_A.current_ip' "${STATE}")" == "${OLD_IP}" ]] || fail 'baseline last-apply state is wrong'
@@ -53,9 +56,10 @@ grep -Fq "${OLD_IP}/32" "${ALLOW}" || fail 'baseline old IP is not trusted'
 tmp_ip="${IP_FILE}.receiver.$$"
 printf '%s\n' "${NEW_IP}" >"${tmp_ip}"
 mv -f "${tmp_ip}" "${IP_FILE}"
-printf '%s\n' "{\"version\":1,\"router_id\":\"ROUTER_A\",\"source_ip\":\"${NEW_IP}\",\"last_seen\":\"2026-08-17T17:38:12Z\"}" >"${T}/var/lib/router-ip-push/state/ROUTER_A.json"
+bash "${SYNC}" --root "${T}" --no-reconcile >/dev/null
+[[ "$(jq -r '.routers.ROUTER_A.current_ip' "${PROVIDER_STATE}")" == "${NEW_IP}" ]] || fail 'changed provider sync is wrong'
 
-bash "${RECONCILE}" --root "${T}" --reason 'Router IP Push changed ROUTER_A' --now-epoch 2000
+bash "${RECONCILE}" --root "${T}" --reason 'Router IP Push provider changed ROUTER_A' --now-epoch 2000
 grep -Fq "${NEW_IP}/32" "${ALLOW}" || fail 'new Router IP did not become trusted immediately'
 grep -Fq "${OLD_IP}/32" "${ALLOW}" || fail 'old Router IP was not retained for grace'
 grep -Fq 'router-ip-push:ROUTER_A current' "${ALLOW}" || fail 'new IP is not marked current'
@@ -69,4 +73,4 @@ bash "${RECONCILE}" --root "${T}" --reason 'grace expiry check' --now-epoch "$((
 grep -Fq "${NEW_IP}/32" "${ALLOW}" || fail 'new IP disappeared after grace expiry'
 if grep -Fq "${OLD_IP}/32" "${ALLOW}"; then fail 'old IP remained trusted after grace expiry'; fi
 
-echo 'PASS: Router IP change regression'
+echo 'PASS: Router IP change regression through canonical provider state'
