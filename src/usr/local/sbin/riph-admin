@@ -87,6 +87,7 @@ riph_load_config "${CONFIG_FILE}"
 riph_prepare_dirs
 CONFIG_DIR="$(riph_root_path "${RIPH_CONFIG_DIR}")"
 STATE_DIR="$(riph_root_path "${RIPH_STATE_DIR}")"
+PROVIDER_STATE_FILE="$(riph_root_path "${RIPH_ROUTER_IP_PUSH_STATE}")"
 STATIC_FILE="${CONFIG_DIR}/trusted-static.list"
 GRACE_FILE="${CONFIG_DIR}/previous-ip-grace.json"
 MANUAL_443_FILE="${CONFIG_DIR}/manual-deny-443.list"
@@ -145,21 +146,24 @@ print_generated_file_state() {
 }
 
 status_cmd() {
-    local router_id ip last_seen state_file
+    local router_id ip
     printf 'Router IP Push Hardening status\n===============================\n'
-    printf 'Config: %s\n\nRouters:\n' "${CONFIG_FILE}"
-    for router_id in "${RIPH_ROUTER_IDS[@]}"; do
-        if ip="$(riph_current_router_ip "${router_id}" 2>/dev/null)"; then
-            last_seen=""
-            state_file="$(riph_root_path "${ROUTER_IP_PUSH_DIR}/state/${router_id}.json")"
-            if [[ -f "${state_file}" ]]; then
-                last_seen="$(jq -r '.last_seen // empty' "${state_file}" 2>/dev/null || true)"
+    printf 'Config: %s\n' "${CONFIG_FILE}"
+    printf 'Provider state: %s\n' "${PROVIDER_STATE_FILE}"
+    printf 'Router IP Push provider: status=%s invalid_entries=%s\n' \
+        "${RIPH_ROUTER_IP_PUSH_PROVIDER_STATUS}" "${RIPH_ROUTER_IP_PUSH_PROVIDER_INVALID_COUNT}"
+    printf '\nDynamic routers from RIPH canonical state:\n'
+    if ((${#RIPH_ROUTER_IDS[@]} == 0)); then
+        printf '%s\n' '  (none)'
+    else
+        for router_id in "${RIPH_ROUTER_IDS[@]}"; do
+            if ip="$(riph_current_router_ip "${router_id}" 2>/dev/null)"; then
+                printf '  %-16s current=%s\n' "${router_id}" "${ip}"
+            else
+                printf '  %-16s current=(missing)\n' "${router_id}"
             fi
-            printf '  %-16s current=%-15s last_seen=%s\n' "${router_id}" "${ip}" "${last_seen:-unknown}"
-        else
-            printf '  %-16s current=(missing)\n' "${router_id}"
-        fi
-    done
+        done
+    fi
 
     printf '\nEffective trusted set:\n'
     print_effective_trusted
@@ -372,12 +376,12 @@ ufw_status_cmd() {
 timers_cmd() {
     local unit enabled active
     [[ "${RIPH_ROOT}" == "/" ]] || { printf '%s\n' 'systemd status is available only on production root.'; return 0; }
-    for unit in riph-router-ip.path riph-reconcile.timer; do
+    for unit in riph-router-ip.path riph-provider-router-ip-push.timer riph-reconcile.timer; do
         enabled="$(systemctl is-enabled "${unit}" 2>/dev/null || true)"
         active="$(systemctl is-active "${unit}" 2>/dev/null || true)"
-        printf '  %-24s enabled=%-10s active=%s\n' "${unit}" "${enabled:-unknown}" "${active:-unknown}"
+        printf '  %-36s enabled=%-10s active=%s\n' "${unit}" "${enabled:-unknown}" "${active:-unknown}"
     done
-    printf '  %-24s %s\n' 'trusted guard:' 'runs inside each reconcile and can also be run manually'
+    printf '  %-36s %s\n' 'trusted guard:' 'runs inside each reconcile and can also be run manually'
 }
 
 guard_log_cmd() {
