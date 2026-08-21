@@ -136,11 +136,9 @@ legacy_shield_rules() {
 legacy_shield_current_ips() {
     local router_id current_ip
     for router_id in "${RIPH_ROUTER_IDS[@]}"; do
-        if current_ip="$(riph_current_router_ip "${router_id}")"; then
-            printf '%s\n' "${current_ip}"
-        elif [[ "${REQUIRE_ROUTER_IP:-1}" == 1 ]]; then
-            riph_die "current Router IP missing while syncing legacy trusted shield: ${router_id}"
-        fi
+        current_ip="$(riph_current_router_ip "${router_id}")" \
+            || riph_die "canonical provider state lost current IPv4 for ${router_id}"
+        printf '%s\n' "${current_ip}"
     done | sort -u
 }
 

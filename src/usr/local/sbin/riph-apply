@@ -167,19 +167,15 @@ printf '{"version":1,"routers":{}}\n' >"${CURRENT_ROUTERS_JSON}"
 
 # Build validated current-router map.
 for router_id in "${RIPH_ROUTER_IDS[@]}"; do
-    if current_ip="$(riph_current_router_ip "${router_id}")"; then
-        tmp="${CURRENT_ROUTERS_JSON}.tmp"
-        jq \
-            --arg id "${router_id}" \
-            --arg ip "${current_ip}" \
-            '.routers[$id] = {"current_ip": $ip}' \
-            "${CURRENT_ROUTERS_JSON}" >"${tmp}"
-        mv "${tmp}" "${CURRENT_ROUTERS_JSON}"
-    elif [[ "${REQUIRE_ROUTER_IP:-1}" == "1" ]]; then
-        riph_die "no current Router IP Push IPv4 for ${router_id}"
-    else
-        riph_log "warning: no current Router IP Push IPv4 for ${router_id}"
-    fi
+    current_ip="$(riph_current_router_ip "${router_id}")" \
+        || riph_die "canonical provider state lost current IPv4 for ${router_id}"
+    tmp="${CURRENT_ROUTERS_JSON}.tmp"
+    jq \
+        --arg id "${router_id}" \
+        --arg ip "${current_ip}" \
+        '.routers[$id] = {"current_ip": $ip}' \
+        "${CURRENT_ROUTERS_JSON}" >"${tmp}"
+    mv "${tmp}" "${CURRENT_ROUTERS_JSON}"
 done
 
 if [[ -f "${GRACE_FILE}" ]]; then
