@@ -1,97 +1,164 @@
 # RIPH architecture
 
-Этот документ описывает действующую архитектуру Router IP Push Hardening без привязки к конкретному серверу, провайдеру или набору доменов.
+Этот документ описывает архитектуру Router IP Push Hardening без привязки к конкретному VPS, провайдеру или доменам.
 
-## 1. Назначение
+## 1. Назначение и граница ответственности
 
-RIPH располагается поверх уже существующей схемы Nginx Stream/Xray и решает две задачи:
+RIPH располагается поверх существующей схемы Nginx Stream/Xray и отвечает за:
 
-1. поддерживает актуальный набор доверенных source IPv4;
-2. маршрутизирует TLS по SNI и признаку trusted/untrusted source.
+1. effective trusted source IPv4/CIDR;
+2. SNI routing по признаку trusted/untrusted source;
+3. собственные Fail2ban/UFW/manual-deny policy;
+4. transactional apply/reconcile/rollback.
 
-Router IP Push остаётся отдельным компонентом и отвечает только за безопасную доставку текущего внешнего IP роутера. RIPH читает его состояние и применяет policy.
+Router IP Push — **отдельный optional provider**. Он отвечает только за безопасную доставку текущего внешнего IPv4 роутера. Core RIPH не знает о его registrations, SSH keys, пользователе, receiver/revoker или heartbeat runtime.
 
-## 2. Источники trusted state
+```text
+Router IP Push provider ─┐
+trusted-static.list ──────┼─> RIPH own canonical/input state
+no provider ──────────────┘                │
+                                           ▼
+                                  policy / reconcile
+                                           │
+                           ┌───────────────┼───────────────┐
+                           ▼               ▼               ▼
+                         Nginx          Fail2ban           UFW
+```
+
+Zero-provider и zero-router — штатные состояния.
+
+## 2. Optional Router IP Push adapter
+
+Provider contract:
+
+```text
+/var/lib/router-ip-push/ips/<Router-ID>.ipv4
+```
+
+Adapter:
+
+```text
+/usr/local/sbin/riph-provider-router-ip-push-sync
+```
+
+читает только `ips/*.ipv4`, валидирует Router ID/IPv4 и атомарно записывает RIPH-owned snapshot:
+
+```text
+/var/lib/router-ip-push-hardening/providers/router-ip-push.json
+```
+
+Пример:
+
+```json
+{
+  "version": 1,
+  "provider": "router-ip-push",
+  "status": "available",
+  "routers": {
+    "ROUTER_A": {"current_ip": "192.0.2.10"},
+    "ROUTER_B": {"current_ip": "192.0.2.20"}
+  },
+  "invalid_entries": 0
+}
+```
+
+### Provider status
+
+- `available` — source directory существует и все найденные `.ipv4` валидны;
+- `degraded` — часть provider entries невалидна; плохие entries не trusted, хорошие сохраняются;
+- `absent` — source directory отсутствует; `routers={}`.
+
+Пустой существующий source directory — `available` + `routers={}`.
+
+Canonical snapshot является единственным dynamic-provider input для core RIPH. Core не читает напрямую:
+
+```text
+/etc/router-ip-push/routers.d
+/var/lib/router-ip-push/state
+authorized_keys
+routerip user/group
+receiver/revoker
+```
+
+## 3. Provider lifecycle semantics
+
+### Обычная смена IPv4
+
+```text
+ROUTER_A: A -> B
+```
+
+B становится current, A может попасть в `previous-ip-grace.json` на `PREVIOUS_IP_GRACE_HOURS`.
+
+### Revoke/withdraw Router ID
+
+Если provider перестал отдавать `ROUTER_A`, Router ID исчезает из canonical state. Его current trust и его grace удаляются. Это **не** обычная смена IP и новый grace не создаётся.
+
+Если остаётся `ROUTER_B`, он не затрагивается.
+
+### Revoke последнего Router ID
+
+```text
+routers={}
+```
+
+валиден. Apply/reconcile продолжают работать со static/no-dynamic trusted set.
+
+### Provider disappearance
+
+Если `/var/lib/router-ip-push/ips` отсутствует, adapter materializes `status=absent`, `routers={}`. RIPH core продолжает работать.
+
+### Temporary provider service outage
+
+RIPH не проверяет состояние Router IP Push service и не использует heartbeat TTL. Пока authoritative `.ipv4` остаются, они сохраняются в provider snapshot. Это сознательная policy текущей версии.
+
+## 4. Effective trusted set
 
 Effective trusted set строится из:
 
-- `trusted-static.list` — постоянные IPv4/CIDR;
-- явно заданных `ROUTER_IDS`, если они используются;
-- автоматически обнаруженных валидно зарегистрированных Router IP Push роутеров;
-- предыдущих динамических IP, пока для них действует grace.
+- `/etc/router-ip-push-hardening/trusted-static.list`;
+- current dynamic routers из RIPH canonical provider state;
+- ещё не истёкшего previous-IP grace для обычных IP transitions.
 
-### 2.1. Auto-discovery
+`ROUTER_IDS` — только optional compatibility filter canonical provider entries. Пустое значение принимает все валидные Router ID.
 
-По умолчанию:
+`REQUIRE_ROUTER_IP` сохранён как compatibility config key, но zero dynamic routers больше не является fatal state.
 
-```text
-ROUTER_AUTO_DISCOVER_REGISTERED=1
-ROUTER_REGISTRY_DIR=/etc/router-ip-push/routers.d
-```
+## 5. Previous-IP grace
 
-Регистрация считается валидной только если JSON имеет ожидаемую версию, `router_id` совпадает с именем файла, а `public_key` имеет ожидаемый SSH Ed25519 формат.
-
-Регистрация сама по себе ещё не делает адрес trusted. Роутер становится effective только после появления валидного текущего Router IP Push IPv4/state.
-
-Файл `.ipv4` без регистрации не является достаточным основанием для доверия.
-
-## 3. Previous-IP grace
-
-После успешной смены динамического IP предыдущий адрес временно сохраняется в trusted set.
-
-Цель — пережить гонки между сменой WAN IP, уже открытыми соединениями и обновлением внешних клиентов.
-
-Продолжительность задаётся:
+Grace существует только для перехода current IP одного и того же присутствующего Router ID:
 
 ```text
-PREVIOUS_IP_GRACE_HOURS
+A -> B
 ```
 
-По истечении grace старый адрес удаляется очередным reconcile.
+Он нужен для гонок между сменой WAN IP, открытыми соединениями и обновлением клиентов.
 
-## 4. Nginx routing
+При provider withdraw/revoke grace соответствующего Router ID удаляется немедленно при apply.
 
-RIPH генерирует три логических части:
+## 6. Nginx routing
+
+RIPH генерирует:
 
 - source allowlist (`geo`);
 - основной stream routing;
-- PROXY-protocol bridge для untrusted private-SNI маршрутов.
-
-Общая схема:
+- PROXY-protocol bridges для untrusted private SNI.
 
 ```text
-                     +----------------------+
-TLS :443 ----------> | Nginx Stream         |
-                     +----------+-----------+
-                                |
-                 SNI + source trusted?
-                                |
-          +---------------------+---------------------+
-          |                     |                     |
-      public SNI          private SNI           unknown/empty/IP-SNI
-          |                     |                     |
-          v              +------+-------+             v
- public upstream         | trusted?     |       reject upstream
-                         +------+-------+
-                                |
-                     +----------+----------+
-                     |                     |
-                    yes                   no
-                     |                     |
-                     v                     v
-               Xray upstream        PROXY bridge
-                                          |
-                                          v
-                                   fake HTTPS upstream
+TLS :443
+   |
+   +-- public SNI --------------------------> public upstream
+   |
+   +-- private SNI + trusted --------------> Xray
+   |
+   +-- private SNI + untrusted ------------> PROXY bridge -> fake HTTPS
+   |
+   +-- unknown / empty / IP-SNI -----------> reject
 ```
 
-### Почему нужен bridge
+Bridge нужен потому, что внешний stream listener передаёт PROXY protocol, а fake HTTPS upstream ожидает обычный TLS.
 
-Внешний stream listener передаёт PROXY protocol, чтобы downstream мог видеть реальный source IP. Обычный fake HTTPS upstream при этом может ожидать чистый TLS. Bridge принимает соединение с PROXY protocol и создаёт обычное TLS-соединение к fake upstream.
-
-## 5. Generated files и source of truth
-
-Типовые generated files:
+Исторические generated filenames сохраняются для совместимости:
 
 ```text
 /etc/nginx/stream-enabled/05-router-ip-push-source-allow.conf
@@ -99,168 +166,213 @@ TLS :443 ----------> | Nginx Stream         |
 /etc/nginx/stream-enabled/06-router-ip-push-fake-site-bridges.conf
 ```
 
-Их нельзя использовать как ручной источник конфигурации. Они генерируются из:
+Имя allowlist файла не означает ownership Router IP Push: файл управляется RIPH.
+
+## 7. Source of truth
+
+RIPH source/input state:
 
 ```text
 /etc/router-ip-push-hardening/config.env
 /etc/router-ip-push-hardening/trusted-static.list
 /etc/router-ip-push-hardening/previous-ip-grace.json
-/var/lib/router-ip-push/...
+/etc/router-ip-push-hardening/manual-deny-*.list
+/var/lib/router-ip-push-hardening/providers/router-ip-push.json
 ```
 
-## 6. Transactional apply
+Generated Nginx files не редактируются вручную.
 
-`riph-apply` выполняет изменение как транзакцию:
+`last-apply-state.json` — результат последнего успешного apply, а не provider input.
+
+## 8. Transactional apply
+
+`riph-apply`:
 
 ```text
 lock
- -> read/validate inputs
- -> generate candidate files
+ -> load RIPH config + canonical provider state
+ -> build effective trusted/current state
+ -> update/expire/remove grace
+ -> generate candidates
  -> backup current state
  -> atomic install
  -> nginx -t
- -> rollback on validation failure
- -> reload only if state actually changed
+ -> rollback on failure
+ -> reload only if generated state changed
  -> write last-apply-state
 ```
 
-Одновременные writers блокируются через `flock`.
+Withdrawn Router ID отсутствует в effective current set, поэтому его old grace удаляется до allowlist generation.
 
-Если generated state не изменился, Nginx не перезагружается без необходимости.
+## 9. Reconcile
 
-## 7. Reconcile
+`riph-reconcile` работает только с canonical RIPH state.
 
-`riph-reconcile` сводит фактическое состояние к желаемому.
+После apply он **перечитывает canonical provider state** и проверяет соответствие:
 
-Он:
+```text
+canonical current routers
+        == last successful apply routers
+        == current IPs in active allowlist
+```
 
-- читает текущие Router IP Push адреса;
-- вызывает apply;
-- проверяет, что после apply текущие адреса действительно присутствуют в active allowlist/state;
-- повторяет попытку ограниченное число раз, если IP успел измениться во время операции;
-- запускает trusted-unban guard после сходимости.
+Если provider snapshot изменился во время транзакции, reconcile немедленно повторяет apply. Число попыток ограничено.
 
-Это защищает от гонки вида «IP изменился между чтением и применением».
+Zero routers сходится штатно.
 
-## 8. systemd watch + fallback
+Trusted-unban guard запускается после успешной сходимости.
 
-Основной быстрый путь:
+## 10. systemd
+
+Core:
+
+```text
+riph-reconcile.service
+riph-reconcile.timer
+riph-guard.service
+```
+
+Optional Router IP Push integration:
 
 ```text
 /var/lib/router-ip-push/ips changes
- -> riph-router-ip.path
- -> riph-reconcile.service
+    -> riph-router-ip.path
+    -> riph-provider-router-ip-push.service
+    -> adapter updates RIPH canonical state
+    -> riph-reconcile
 ```
 
-Резервный путь:
+Fallback provider sync:
+
+```text
+riph-provider-router-ip-push.timer
+```
+
+Core fallback:
 
 ```text
 riph-reconcile.timer
- -> reconcile примерно раз в минуту
 ```
 
-Timer нужен как страховка от пропущенного path event и для истечения previous-IP grace.
+Provider timer нужен, в частности, для disappearance/reappearance и пропущенных filesystem events. Core timer нужен для convergence/maintenance, включая expiry grace.
 
-## 9. Fail2ban
+`riph-router-ip.path` сохранил историческое имя, но больше не запускает core reconcile напрямую от Pusher filesystem.
 
-RIPH использует два собственных jail:
+## 11. Fail2ban
+
+RIPH jails:
 
 ```text
 riph-nginx-stream-sni-reject
 riph-nginx-stream-private-sni-abuse
 ```
 
-Первый реагирует на reject route, второй — на повторные обращения untrusted source к private SNI.
+Автоматические bans ограничены TCP/443.
 
-Автоматические action ограничены TCP/443.
+### Trusted ignore
 
-### Dynamic ignore
+`riph-fail2ban-ignore` не читает raw Router IP Push runtime.
 
-`riph-fail2ban-ignore` проверяет, является ли IP trusted. Для отказоустойчивости он имеет fast paths для текущих Router IP Push адресов и last-known-good allowlist, поэтому кратковременная проблема основного config не должна превращать актуальный trusted IP в бан.
+Fast paths:
 
-## 10. Trusted-unban guard
+1. current IP из RIPH canonical provider snapshot;
+2. active generated RIPH allowlist как last-known-good applied artifact.
 
-Guard выполняется после reconcile и может запускаться вручную.
+Затем выполняется обычная effective-trusted evaluation.
 
-Он защищает effective trusted set от:
+Fail2ban activation не требует наличия dynamic provider. Production readiness требует валидный RIPH Nginx state, core reconcile timer и корректную защиту **всех dynamic routers, если они есть**.
+
+## 12. Trusted-unban guard
+
+Guard защищает effective trusted set от:
 
 - RIPH Fail2ban bans;
-- конфликтующих project-owned manual deny rules.
+- project-owned manual deny conflicts;
+- transitional legacy-shield conflicts во время старой Fail2ban coexistence.
 
-Если IP становится trusted после того, как ранее был заблокирован RIPH, guard снимает соответствующий RIPH ban.
+Он использует тот же canonical/effective trusted input, что и Nginx policy.
 
-## 11. Manual deny
+## 13. Manual deny
 
-Есть два управляемых списка:
+Управляемые списки:
 
 ```text
 manual-deny-443.list
 manual-deny-all.list
 ```
 
-TCP/443 deny — нормальный вариант для постоянной блокировки scanner source.
+Перед применением выполняется overlap check с effective trusted set. RIPH удаляет/изменяет только rules с собственным marker/ownership state.
 
-All-ports deny — исключительный режим, потому что способен затронуть management traffic.
-
-Перед применением выполняется CIDR overlap check с effective trusted set. RIPH также проверяет, что applied-state соответствует реально существующим UFW rules с проектными marker.
-
-## 12. Audit log и harvest
-
-Внешний `:443` пишет route-aware журнал:
-
-```text
-/var/log/nginx/riph-stream-sni.log
-```
-
-Запись содержит source, SNI, выбранный route/upstream и результат сессии. Этот журнал используется Fail2ban и `riph-harvest`.
-
-Harvest умеет работать от checkpoint, чтобы анализировать только новые записи.
-
-## 13. Rollback
-
-`riph-rollback` умеет:
-
-- показать backups;
-- восстановить выбранный backup или `latest`;
-- сделать pre-rollback safety snapshot;
-- проверить восстановленную Nginx-конфигурацию;
-- вернуть исходное состояние, если восстановленный backup не проходит validation.
-
-Rollback не должен превращать ошибочный старый snapshot в новое рабочее состояние без проверки.
+All-ports deny — исключительный режим из-за риска management traffic.
 
 ## 14. Installer
 
 `install.sh` разделяет:
 
-- project files — обновляются;
-- config/list files — seed only и сохраняются при обычном reinstall;
-- runtime generated files — входят в install transaction snapshot.
+- project files — replace/update;
+- config/list files — seed only при обычной установке;
+- runtime/generated/canonical provider state — install transaction snapshot.
 
-Production mutation требует явного:
+Перед **первым requested apply** installer запускает provider sync `--no-reconcile`. Поэтому upgrade не создаёт промежуточный static-only allowlist, если Router IP Push уже содержит current IP.
 
-```bash
-RIPH_ALLOW_PRODUCTION=1
-```
+Если provider отсутствует, sync успешно создаёт `absent` snapshot и install/apply продолжается.
 
-`--replace-config` предназначен только для осознанной замены пользовательских config/list файлов и не используется при обычном обновлении.
+Rollback install transaction восстанавливает/удаляет canonical provider snapshot вместе с остальным RIPH state.
 
-## 15. Safety boundary
+## 15. Transitional Router IP Push Nginx hotfix
 
-RIPH не должен управлять:
+`router-ip-push-nginx-hotfix.*` — старый pre-RIPH writer allowlist. Он не является provider adapter.
 
-- базой/клиентами Xray или 3x-ui;
+`riph-hotfix-handover`:
+
+1. останавливает old writer под его lock;
+2. materializes provider state;
+3. делает reconcile;
+4. включает provider path;
+5. повторяет provider sync + reconcile для закрытия transition race;
+6. включает provider/core fallback timers;
+7. сохраняет старые hotfix files для rollback/forensics.
+
+Это отдельный mechanism от `riph-legacy-handover`, который относится к старому stream-audit/Fail2ban stack.
+
+## 16. Rollback
+
+`riph-rollback` является core RIPH функцией и не требует Router IP Push.
+
+Он:
+
+- показывает backups;
+- делает safety snapshot;
+- восстанавливает выбранный backup;
+- проверяет Nginx;
+- возвращает pre-rollback state, если restored state невалиден.
+
+## 17. Safety boundary
+
+RIPH не управляет:
+
+- Router IP Push registrations/authorized_keys/user/receiver/revoker;
+- Xray client definitions / 3x-ui DB;
 - SSH policy;
-- VPN/overlay-сетями;
+- VPN/overlay networks;
 - приложениями за reverse proxy.
 
-Эта граница намеренная: RIPH владеет только source trust, stream routing, собственными Fail2ban/UFW правилами и своим runtime state.
+RIPH владеет только своим trust/policy state, Nginx routing, собственными Fail2ban/UFW rules и runtime.
 
-## 16. Тестирование
+## 18. Regression expectations
 
-`tests/run-local.sh` выполняет:
+`tests/run-local.sh` выполняет Bash syntax check, ShellCheck (если установлен) и `tests/test-*.sh`.
 
-1. `bash -n`;
-2. ShellCheck, если он установлен;
-3. все regression tests `tests/test-*.sh` в изолированных `/tmp` test roots.
+Обязательные provider lifecycle scenarios:
 
-Тесты покрывают apply/rollback, смену Router IP, bounded convergence, auto-discovery, Fail2ban, UFW ownership, guard, installer и systemd watch/timer.
+- provider absent;
+- provider present, zero routers;
+- one/two routers;
+- ordinary IP A→B + grace;
+- revoke one of two;
+- revoke last;
+- provider disappearance/reappearance;
+- malformed entry with surviving valid routers;
+- Fail2ban ignore without raw-provider trust;
+- installer/rollback with no provider;
+- bounded canonical-state convergence.
