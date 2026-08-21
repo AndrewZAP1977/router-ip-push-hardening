@@ -37,10 +37,18 @@ server
 }
 EOF_STREAM
     cat >"${t}/etc/nginx/sites-available/reality.conf" <<'EOF_REALITY'
-server { server_name reality.example.net; listen 127.0.0.1:9443 ssl; }
+server
+{
+    server_name reality.example.net;
+    listen 127.0.0.1:9443 ssl;
+}
 EOF_REALITY
     cat >"${t}/etc/nginx/sites-available/xhttp.conf" <<'EOF_XHTTP'
-server { server_name xhttp.example.net; listen 127.0.0.1:9444 ssl; }
+server
+{
+    server_name xhttp.example.net;
+    listen 127.0.0.1:9444 ssl;
+}
 EOF_XHTTP
     cat >"${t}/usr/local/bin/nginx-stub" <<'EOF_STUB'
 #!/usr/bin/env bash
