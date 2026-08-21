@@ -20,6 +20,7 @@ HOTFIX_PATH_UNIT="router-ip-push-nginx-hotfix.path"
 HOTFIX_TIMER_UNIT="router-ip-push-nginx-hotfix.timer"
 HOTFIX_SERVICE_UNIT="router-ip-push-nginx-hotfix.service"
 RIPH_PATH_UNIT="riph-router-ip.path"
+RIPH_PROVIDER_TIMER_UNIT="riph-provider-router-ip-push.timer"
 RIPH_TIMER_UNIT="riph-reconcile.timer"
 
 usage() {
@@ -37,10 +38,11 @@ Commands:
                       Push Nginx hotfix to RIPH without a two-writer window.
 
 The takeover keeps the temporary hotfix files for rollback/forensics. It disables
-its automatic triggers only while holding the same lock used by that hotfix, runs a
-strict convergent RIPH reconcile, activates the RIPH path watch, runs a second
-convergent reconcile to close the ownership-transition race, verifies current Router
-IP presence in the active allowlist, then activates the 1-minute fallback timer.
+its automatic triggers only while holding the same lock used by that hotfix,
+materializes optional Router IP Push data into RIPH-owned canonical provider state,
+runs a strict convergent RIPH reconcile, activates the provider path watch, syncs
+and reconciles once more to close the ownership-transition race, then activates the
+provider and core fallback timers.
 
 Any failure after mutation begins disables RIPH automatic triggers first and restores
 the temporary hotfix path/timer to their exact pre-handover enabled/active state.
@@ -96,6 +98,16 @@ else
 fi
 [[ -x "${RECONCILE}" || -f "${RECONCILE}" ]] || riph_die "riph-reconcile not found: ${RECONCILE}"
 
+if [[ -n "${RIPH_PROVIDER_SYNC_BIN:-}" ]]; then
+    PROVIDER_SYNC="${RIPH_PROVIDER_SYNC_BIN}"
+elif [[ -f "${SCRIPT_DIR}/riph-provider-router-ip-push-sync" ]]; then
+    PROVIDER_SYNC="${SCRIPT_DIR}/riph-provider-router-ip-push-sync"
+else
+    PROVIDER_SYNC="/usr/local/sbin/riph-provider-router-ip-push-sync"
+fi
+[[ -x "${PROVIDER_SYNC}" || -f "${PROVIDER_SYNC}" ]] \
+    || riph_die "provider sync not found: ${PROVIDER_SYNC}"
+
 unit_state() {
     local verb="$1" unit="$2"
     "${SYSTEMCTL_BIN}" "${verb}" "${unit}" 2>/dev/null || true
@@ -110,8 +122,8 @@ status_cmd() {
         printf '  %-40s enabled=%-12s active=%s\n' "${unit}" "${enabled:-unknown}" "${active:-unknown}"
     done
 
-    printf '\nRIPH ownership:\n'
-    for unit in "${RIPH_PATH_UNIT}" "${RIPH_TIMER_UNIT}"; do
+    printf '\nRIPH ownership/provider triggers:\n'
+    for unit in "${RIPH_PATH_UNIT}" "${RIPH_PROVIDER_TIMER_UNIT}" "${RIPH_TIMER_UNIT}"; do
         enabled="$(unit_state is-enabled "${unit}")"
         active="$(unit_state is-active "${unit}")"
         printf '  %-40s enabled=%-12s active=%s\n' "${unit}" "${enabled:-unknown}" "${active:-unknown}"
@@ -134,6 +146,8 @@ hotfix_timer_was_enabled="$(unit_state is-enabled "${HOTFIX_TIMER_UNIT}")"
 hotfix_timer_was_active="$(unit_state is-active "${HOTFIX_TIMER_UNIT}")"
 riph_path_was_enabled="$(unit_state is-enabled "${RIPH_PATH_UNIT}")"
 riph_path_was_active="$(unit_state is-active "${RIPH_PATH_UNIT}")"
+riph_provider_timer_was_enabled="$(unit_state is-enabled "${RIPH_PROVIDER_TIMER_UNIT}")"
+riph_provider_timer_was_active="$(unit_state is-active "${RIPH_PROVIDER_TIMER_UNIT}")"
 riph_timer_was_enabled="$(unit_state is-enabled "${RIPH_TIMER_UNIT}")"
 riph_timer_was_active="$(unit_state is-active "${RIPH_TIMER_UNIT}")"
 
@@ -143,8 +157,9 @@ if [[ "${hotfix_path_was_enabled}" != enabled && "${hotfix_path_was_active}" != 
 fi
 
 if [[ "${riph_path_was_enabled}" == enabled || "${riph_path_was_active}" == active \
+   || "${riph_provider_timer_was_enabled}" == enabled || "${riph_provider_timer_was_active}" == active \
    || "${riph_timer_was_enabled}" == enabled || "${riph_timer_was_active}" == active ]]; then
-    riph_die "RIPH path/timer are already enabled or active; refuse ambiguous two-writer takeover"
+    riph_die "RIPH provider/core triggers are already enabled or active; refuse ambiguous two-writer takeover"
 fi
 
 restore_unit_state() {
@@ -173,9 +188,11 @@ restore_ownership_on_exit() {
         riph_log "handover failed; restoring pre-handover ownership"
 
         # Never restore the temporary writer before first removing any RIPH
-        # automatic writer that may have been enabled before the failure.
-        "${SYSTEMCTL_BIN}" disable --now "${RIPH_PATH_UNIT}" "${RIPH_TIMER_UNIT}" >/dev/null 2>&1 || true
+        # automatic trigger that may have been enabled before the failure.
+        "${SYSTEMCTL_BIN}" disable --now \
+            "${RIPH_PATH_UNIT}" "${RIPH_PROVIDER_TIMER_UNIT}" "${RIPH_TIMER_UNIT}" >/dev/null 2>&1 || true
         restore_unit_state "${RIPH_PATH_UNIT}" "${riph_path_was_enabled}" "${riph_path_was_active}"
+        restore_unit_state "${RIPH_PROVIDER_TIMER_UNIT}" "${riph_provider_timer_was_enabled}" "${riph_provider_timer_was_active}"
         restore_unit_state "${RIPH_TIMER_UNIT}" "${riph_timer_was_enabled}" "${riph_timer_was_active}"
         restore_unit_state "${HOTFIX_PATH_UNIT}" "${hotfix_path_was_enabled}" "${hotfix_path_was_active}"
         restore_unit_state "${HOTFIX_TIMER_UNIT}" "${hotfix_timer_was_enabled}" "${hotfix_timer_was_active}"
@@ -192,39 +209,44 @@ TAKEOVER_STARTED=1
 "${SYSTEMCTL_BIN}" disable --now "${HOTFIX_PATH_UNIT}" "${HOTFIX_TIMER_UNIT}" >/dev/null
 "${SYSTEMCTL_BIN}" stop "${HOTFIX_SERVICE_UNIT}" >/dev/null 2>&1 || true
 
-# Initial transaction while neither automatic writer is active. riph-reconcile
-# itself rechecks live Router IP after each apply and immediately retries if the
-# address changes during this transaction.
+# Materialize provider input before RIPH first takes ownership. Missing Router IP
+# Push is a valid empty provider state; no direct Pusher runtime is read by core.
+bash "${PROVIDER_SYNC}" --root "${RIPH_ROOT}" --config "${CONFIG_PATH}" --no-reconcile
+
+# Initial transaction while neither automatic writer is active.
 bash "${RECONCILE}" --root "${RIPH_ROOT}" --config "${CONFIG_PATH}" \
     --reason "temporary hotfix ownership handover"
 
 "${SYSTEMCTL_BIN}" daemon-reload
 
-# Activate only the path first. The independent periodic timer is intentionally
-# added after the transition is verified, keeping takeover concurrency minimal.
+# Activate only the provider path first. Periodic timers are intentionally added
+# after the transition is verified, keeping takeover concurrency minimal.
 "${SYSTEMCTL_BIN}" enable --now "${RIPH_PATH_UNIT}" >/dev/null
 [[ "$(unit_state is-active "${RIPH_PATH_UNIT}")" == active ]] \
     || riph_die "${RIPH_PATH_UNIT} is not active after handover"
 
-# Router IP Push does not share HOTFIX_LOCK, so the ISP address can change between
-# the first reconcile and path activation. A second strict convergent reconcile
-# closes that transition race; a real apply/nginx failure aborts immediately.
+# Router IP Push does not share HOTFIX_LOCK, so provider output can change between
+# the first sync/reconcile and path activation. Force a second provider snapshot
+# and strict reconcile to close that transition race even if the path event was missed.
+bash "${PROVIDER_SYNC}" --root "${RIPH_ROOT}" --config "${CONFIG_PATH}" --no-reconcile
 bash "${RECONCILE}" --root "${RIPH_ROOT}" --config "${CONFIG_PATH}" \
-    --reason "post-handover Router IP verification"
+    --reason "post-handover provider verification"
 
+# Reload current canonical state after the second provider sync before verifying it.
+riph_load_config "${CONFIG_FILE}"
 ALLOWLIST_FILE="$(riph_root_path "${ALLOWLIST_OUTPUT}")"
 [[ -f "${ALLOWLIST_FILE}" ]] || riph_die "generated allowlist missing after handover: ${ALLOWLIST_FILE}"
 
 for router_id in "${RIPH_ROUTER_IDS[@]}"; do
-    if current_ip="$(riph_current_router_ip "${router_id}")"; then
-        grep -Eq "^[[:space:]]*${current_ip//./\\.}/32[[:space:]]+1;" "${ALLOWLIST_FILE}" \
-            || riph_die "current ${router_id} IP ${current_ip} is not trusted after handover"
-    elif [[ "${REQUIRE_ROUTER_IP:-1}" == 1 ]]; then
-        riph_die "current Router IP missing after handover: ${router_id}"
-    fi
+    current_ip="$(riph_current_router_ip "${router_id}")" \
+        || riph_die "RIPH provider state lost current IPv4 after handover: ${router_id}"
+    grep -Eq "^[[:space:]]*${current_ip//./\\.}/32[[:space:]]+1;" "${ALLOWLIST_FILE}" \
+        || riph_die "current ${router_id} IP ${current_ip} is not trusted after handover"
 done
 
-"${SYSTEMCTL_BIN}" enable --now "${RIPH_TIMER_UNIT}" >/dev/null
+"${SYSTEMCTL_BIN}" enable --now "${RIPH_PROVIDER_TIMER_UNIT}" "${RIPH_TIMER_UNIT}" >/dev/null
+[[ "$(unit_state is-active "${RIPH_PROVIDER_TIMER_UNIT}")" == active ]] \
+    || riph_die "${RIPH_PROVIDER_TIMER_UNIT} is not active after handover"
 [[ "$(unit_state is-active "${RIPH_TIMER_UNIT}")" == active ]] \
     || riph_die "${RIPH_TIMER_UNIT} is not active after handover"
 
