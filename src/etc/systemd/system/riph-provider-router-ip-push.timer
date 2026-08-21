@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodic fallback sync for optional Router IP Push provider
+
+[Timer]
+OnActiveSec=1min
+OnUnitActiveSec=1min
+AccuracySec=5s
+Unit=riph-provider-router-ip-push.service
+
+[Install]
+WantedBy=timers.target
