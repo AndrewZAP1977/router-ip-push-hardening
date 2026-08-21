@@ -1,0 +1,8 @@
+[Unit]
+Description=Sync optional Router IP Push provider into RIPH state
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/riph-provider-router-ip-push-sync
