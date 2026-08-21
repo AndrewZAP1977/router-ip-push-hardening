@@ -29,9 +29,10 @@ Options:
   --dry-run        Validate/report without changing jail files or reloading.
   -h, --help       Show this help.
 
-Production activation is refused until RIPH owns the allowlist, its path/timer are
-active, the current Router IP is in the active allowlist and the installed filters
-pass a local fail2ban-regex compatibility check.
+Production activation is refused until RIPH owns a valid active allowlist,
+its core reconcile timer is active, every current dynamic router in RIPH-owned
+provider state is protected, and the installed filters pass a local
+fail2ban-regex compatibility check. Zero dynamic routers is a supported state.
 
 While the legacy jail remains active, activation also installs a late jail.d/*.local
 override that gives the legacy jail the same dynamic trusted-source ignorecommand.
@@ -147,14 +148,12 @@ validate_current_router_protection() {
 
     [[ -f "${ALLOWLIST_FILE}" ]] || riph_die "active RIPH allowlist missing: ${ALLOWLIST_FILE}"
     for router_id in "${RIPH_ROUTER_IDS[@]}"; do
-        if current_ip="$(riph_current_router_ip "${router_id}")"; then
-            grep -Eq "^[[:space:]]*${current_ip//./\\.}/32[[:space:]]+1;" "${ALLOWLIST_FILE}" \
-                || riph_die "current ${router_id} IP ${current_ip} is absent from active allowlist"
-            bash "${IGNORE_BIN}" --root "${RIPH_ROOT}" --config "${CONFIG_PATH}" "${current_ip}" \
-                || riph_die "Fail2ban ignore helper does not protect current ${router_id} IP ${current_ip}"
-        elif [[ "${REQUIRE_ROUTER_IP:-1}" == 1 ]]; then
-            riph_die "current Router IP is missing during Fail2ban activation: ${router_id}"
-        fi
+        current_ip="$(riph_current_router_ip "${router_id}")" \
+            || riph_die "RIPH provider state lost current IPv4 during Fail2ban activation: ${router_id}"
+        grep -Eq "^[[:space:]]*${current_ip//./\\.}/32[[:space:]]+1;" "${ALLOWLIST_FILE}" \
+            || riph_die "current ${router_id} IP ${current_ip} is absent from active allowlist"
+        bash "${IGNORE_BIN}" --root "${RIPH_ROOT}" --config "${CONFIG_PATH}" "${current_ip}" \
+            || riph_die "Fail2ban ignore helper does not protect current ${router_id} IP ${current_ip}"
     done
 }
 
@@ -195,8 +194,6 @@ production_readiness() {
 
     temporary_hotfix_owns_allowlist \
         && riph_die "temporary Router IP Push Nginx hotfix still owns the allowlist; Fail2ban activation is premature"
-    unit_is_enabled_active riph-router-ip.path \
-        || riph_die "riph-router-ip.path must be enabled and active before Fail2ban activation"
     unit_is_enabled_active riph-reconcile.timer \
         || riph_die "riph-reconcile.timer must be enabled and active before Fail2ban activation"
 
