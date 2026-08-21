@@ -81,10 +81,14 @@ riph_normalize_ipv4_cidr() {
     fi
 }
 
+riph_is_router_id() {
+    local router_id="$1"
+    [[ "${router_id}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]
+}
+
 riph_validate_router_id() {
     local router_id="$1"
-    [[ "${router_id}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] \
-        || riph_die "invalid router id: ${router_id}"
+    riph_is_router_id "${router_id}" || riph_die "invalid router id: ${router_id}"
 }
 
 riph_read_single_line() {
@@ -134,43 +138,58 @@ riph_add_effective_router_id() {
     riph_router_id_is_effective "${router_id}" || RIPH_ROUTER_IDS+=("${router_id}")
 }
 
-riph_discover_registered_router_ids() {
-    local registry_dir registration router_id ip_file state_file
-    local -a registrations=()
-
-    registry_dir="$(riph_root_path "${ROUTER_REGISTRY_DIR}")"
-    [[ -d "${registry_dir}" ]] || return 0
-    riph_require_cmd jq
-
-    shopt -s nullglob
-    registrations=("${registry_dir}"/*.json)
-    shopt -u nullglob
-
-    for registration in "${registrations[@]}"; do
-        router_id="$(basename "${registration}" .json)"
-        riph_validate_router_id "${router_id}"
-
-        jq -e --arg id "${router_id}" '
-            .version == 1
-            and .router_id == $id
-            and (.public_key | type == "string")
-            and (.public_key | test("^ssh-ed25519 [A-Za-z0-9+/=]+$"))
-        ' "${registration}" >/dev/null \
-            || riph_die "invalid Router IP Push registration: ${registration}"
-
-        # Registration is the trust gate, but a just-registered router may not have
-        # sent its first update yet. Only activate it after Router IP Push has
-        # written a current IP/state. The first .ipv4 write wakes riph-router-ip.path.
-        ip_file="$(riph_root_path "${ROUTER_IP_PUSH_DIR}/ips/${router_id}.ipv4")"
-        state_file="$(riph_root_path "${ROUTER_IP_PUSH_DIR}/state/${router_id}.json")"
-        if [[ -f "${ip_file}" || -f "${state_file}" ]]; then
-            # Validate the current value now; malformed state must fail closed.
-            riph_current_router_ip "${router_id}" >/dev/null
-            riph_add_effective_router_id "${router_id}"
-        else
-            riph_log "registered router ${router_id} has no current IPv4 yet; waiting for first Router IP Push update"
-        fi
+riph_router_id_is_explicit() {
+    local wanted="$1" existing
+    ((${#RIPH_EXPLICIT_ROUTER_IDS[@]} == 0)) && return 0
+    for existing in "${RIPH_EXPLICIT_ROUTER_IDS[@]}"; do
+        [[ "${existing}" == "${wanted}" ]] && return 0
     done
+    return 1
+}
+
+riph_load_router_ip_push_provider_state() {
+    local state_file router_id ip status invalid_count
+
+    RIPH_ROUTER_IDS=()
+    declare -gA RIPH_ROUTER_IPS=()
+    RIPH_ROUTER_IP_PUSH_PROVIDER_STATUS="absent"
+    RIPH_ROUTER_IP_PUSH_PROVIDER_INVALID_COUNT=0
+
+    state_file="$(riph_root_path "${RIPH_ROUTER_IP_PUSH_STATE}")"
+    [[ -f "${state_file}" ]] || return 0
+
+    riph_require_cmd jq
+    if ! jq -e '
+        .version == 1
+        and .provider == "router-ip-push"
+        and (.status == "available" or .status == "absent" or .status == "degraded")
+        and (.routers | type == "object")
+        and ((.invalid_entries // 0) | type == "number")
+        and ((.invalid_entries // 0) >= 0)
+    ' "${state_file}" >/dev/null 2>&1; then
+        riph_log "WARNING: invalid RIPH Router IP Push provider state; dynamic router trust disabled: ${state_file}"
+        return 0
+    fi
+
+    status="$(jq -r '.status' "${state_file}")"
+    invalid_count="$(jq -r '(.invalid_entries // 0) | floor' "${state_file}")"
+    RIPH_ROUTER_IP_PUSH_PROVIDER_STATUS="${status}"
+    RIPH_ROUTER_IP_PUSH_PROVIDER_INVALID_COUNT="${invalid_count}"
+
+    while IFS=$'\t' read -r router_id ip; do
+        [[ -n "${router_id}" ]] || continue
+        if ! riph_is_router_id "${router_id}"; then
+            riph_log "WARNING: invalid Router ID in RIPH provider state ignored: ${router_id}"
+            continue
+        fi
+        if ! riph_is_ipv4 "${ip}"; then
+            riph_log "WARNING: invalid IPv4 for ${router_id} in RIPH provider state ignored: ${ip}"
+            continue
+        fi
+        riph_router_id_is_explicit "${router_id}" || continue
+        RIPH_ROUTER_IPS["${router_id}"]="${ip}"
+        riph_add_effective_router_id "${router_id}"
+    done < <(jq -r '.routers | to_entries[] | [.key, (.value.current_ip // "")] | @tsv' "${state_file}")
 }
 
 riph_load_config() {
@@ -184,64 +203,50 @@ riph_load_config() {
         || riph_die "PREVIOUS_IP_GRACE_HOURS must be a non-negative integer"
     (( PREVIOUS_IP_GRACE_HOURS <= 168 )) \
         || riph_die "PREVIOUS_IP_GRACE_HOURS must not exceed 168"
+
+    # Compatibility-only settings from the original direct Router IP Push coupling.
+    # They are intentionally not used as core availability requirements anymore.
     [[ "${REQUIRE_ROUTER_IP:-1}" == "0" || "${REQUIRE_ROUTER_IP:-1}" == "1" ]] \
         || riph_die "REQUIRE_ROUTER_IP must be 0 or 1"
-
-    ROUTER_AUTO_DISCOVER_REGISTERED="${ROUTER_AUTO_DISCOVER_REGISTERED:-1}"
-    [[ "${ROUTER_AUTO_DISCOVER_REGISTERED}" == "0" || "${ROUTER_AUTO_DISCOVER_REGISTERED}" == "1" ]] \
-        || riph_die "ROUTER_AUTO_DISCOVER_REGISTERED must be 0 or 1"
-
     ROUTER_IP_PUSH_DIR="${ROUTER_IP_PUSH_DIR:-/var/lib/router-ip-push}"
-    ROUTER_REGISTRY_DIR="${ROUTER_REGISTRY_DIR:-/etc/router-ip-push/routers.d}"
+
     RIPH_STATE_DIR="${RIPH_STATE_DIR:-/var/lib/router-ip-push-hardening}"
     RIPH_CONFIG_DIR="${RIPH_CONFIG_DIR:-/etc/router-ip-push-hardening}"
+    RIPH_PROVIDER_DIR="${RIPH_PROVIDER_DIR:-${RIPH_STATE_DIR}/providers}"
+    RIPH_ROUTER_IP_PUSH_STATE="${RIPH_ROUTER_IP_PUSH_STATE:-${RIPH_PROVIDER_DIR}/router-ip-push.json}"
     ALLOWLIST_OUTPUT="${ALLOWLIST_OUTPUT:-/etc/nginx/stream-enabled/05-router-ip-push-source-allow.conf}"
 
     local path_var path_value
-    for path_var in ROUTER_IP_PUSH_DIR ROUTER_REGISTRY_DIR RIPH_STATE_DIR RIPH_CONFIG_DIR ALLOWLIST_OUTPUT; do
+    for path_var in ROUTER_IP_PUSH_DIR RIPH_STATE_DIR RIPH_CONFIG_DIR RIPH_PROVIDER_DIR RIPH_ROUTER_IP_PUSH_STATE ALLOWLIST_OUTPUT; do
         path_value="${!path_var}"
         [[ "${path_value}" == /* ]] || riph_die "${path_var} must be an absolute path"
     done
 
-    RIPH_ROUTER_IDS=()
+    RIPH_EXPLICIT_ROUTER_IDS=()
     local router_id
     if [[ -n "${ROUTER_IDS:-}" ]]; then
-        local -a explicit_router_ids=()
-        read -r -a explicit_router_ids <<<"${ROUTER_IDS}"
-        for router_id in "${explicit_router_ids[@]}"; do
-            riph_add_effective_router_id "${router_id}"
+        read -r -a RIPH_EXPLICIT_ROUTER_IDS <<<"${ROUTER_IDS}"
+        for router_id in "${RIPH_EXPLICIT_ROUTER_IDS[@]}"; do
+            riph_validate_router_id "${router_id}"
         done
     fi
 
-    if [[ "${ROUTER_AUTO_DISCOVER_REGISTERED}" == "1" ]]; then
-        riph_discover_registered_router_ids
-    fi
-
-    ((${#RIPH_ROUTER_IDS[@]} > 0)) \
-        || riph_die "no Router IP Push routers configured or registered with a current IPv4"
+    # Dynamic routers are loaded only from RIPH-owned canonical provider state.
+    # Missing provider state and an empty router set are normal supported states.
+    riph_load_router_ip_push_provider_state
 }
 
 riph_current_router_ip() {
     local router_id="$1"
-    local ip_file state_file ip
-    ip_file="$(riph_root_path "${ROUTER_IP_PUSH_DIR}/ips/${router_id}.ipv4")"
-    state_file="$(riph_root_path "${ROUTER_IP_PUSH_DIR}/state/${router_id}.json")"
-
-    if ip="$(riph_read_single_line "${ip_file}")"; then
-        :
-    elif [[ -f "${state_file}" ]]; then
-        ip="$(jq -r '.source_ip // empty' "${state_file}")"
-    else
-        return 1
-    fi
-
-    riph_is_ipv4 "${ip}" || riph_die "invalid current IPv4 for ${router_id}: ${ip}"
-    printf '%s\n' "${ip}"
+    riph_validate_router_id "${router_id}"
+    [[ -n "${RIPH_ROUTER_IPS[${router_id}]:-}" ]] || return 1
+    printf '%s\n' "${RIPH_ROUTER_IPS[${router_id}]}"
 }
 
 riph_prepare_dirs() {
     mkdir -p \
         "$(riph_root_path "${RIPH_STATE_DIR}/backups")" \
         "$(riph_root_path "${RIPH_STATE_DIR}/locks")" \
-        "$(riph_root_path "${RIPH_STATE_DIR}/runtime")"
+        "$(riph_root_path "${RIPH_STATE_DIR}/runtime")" \
+        "$(riph_root_path "${RIPH_PROVIDER_DIR}")"
 }
