@@ -8,11 +8,12 @@ T="$(mktemp -d /tmp/riph-rollback-test.XXXXXX)"
 trap 'rm -rf "${T}"' EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
-mkdir -p "${T}/etc/router-ip-push-hardening" "${T}/etc/nginx/stream-enabled" "${T}/var/lib/router-ip-push/ips" "${T}/usr/local/bin"
+# Deliberately do not create /var/lib/router-ip-push: rollback and routing are core
+# RIPH functions and must remain healthy in a zero-provider deployment.
+mkdir -p "${T}/etc/router-ip-push-hardening" "${T}/etc/nginx/stream-enabled" "${T}/usr/local/bin"
 cp "${ROOT}/config/config.env.example" "${T}/etc/router-ip-push-hardening/config.env"
 printf '%s\n' '127.0.0.1/32 # localhost' >"${T}/etc/router-ip-push-hardening/trusted-static.list"
 printf '%s\n' '{"version":1,"routers":{}}' >"${T}/etc/router-ip-push-hardening/previous-ip-grace.json"
-printf '%s\n' '192.0.2.25' >"${T}/var/lib/router-ip-push/ips/ROUTER_A.ipv4"
 
 CALL_LOG="${T}/calls.log"
 cat >"${T}/usr/local/bin/nginx-stub" <<EOF_STUB
@@ -31,7 +32,11 @@ export RIPH_SYSTEMCTL_BIN="${T}/usr/local/bin/systemctl-stub"
 
 "${APPLY}" --root "${T}" --reason initial --now-epoch 1000 >/dev/null
 STREAM="${T}/etc/nginx/stream-enabled/stream.conf"
+ALLOWLIST="${T}/etc/nginx/stream-enabled/05-router-ip-push-source-allow.conf"
 grep -F 'server 127.0.0.1:7443;' "${STREAM}" >/dev/null
+grep -F '127.0.0.1/32' "${ALLOWLIST}" >/dev/null || fail 'zero-provider apply lost static trust'
+! grep -F 'router-ip-push:' "${ALLOWLIST}" >/dev/null || fail 'zero-provider apply invented dynamic trust'
+
 sed -i 's/PUBLIC_UPSTREAM="127.0.0.1:7443"/PUBLIC_UPSTREAM="127.0.0.1:7555"/' "${T}/etc/router-ip-push-hardening/config.env"
 "${APPLY}" --root "${T}" --reason route-7555 --now-epoch 2000 >/dev/null
 grep -F 'server 127.0.0.1:7555;' "${STREAM}" >/dev/null
@@ -50,4 +55,4 @@ export RIPH_TEST_NGINX_EXIT=1
 if "${ROLLBACK}" --root "${T}" --backup "${BACKUP_ID}"; then fail 'rollback unexpectedly succeeded while nginx validation failed'; fi
 unset RIPH_TEST_NGINX_EXIT
 cmp -s "${STREAM}" "${T}/stream.before-failed-rollback" || fail 'failed rollback did not restore safety snapshot'
-echo 'PASS: rollback tests'
+echo 'PASS: rollback tests (zero provider)'
