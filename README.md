@@ -6,17 +6,41 @@ RIPH — защита приватных SNI для Nginx Stream/Xray.
 
 ## Быстрый старт
 
-Ниже — обычная установка на VPS, где уже работает стек от `3x-ui-installer`: Nginx Stream/Xray, UFW и Fail2ban.
+Обычный сценарий: на VPS уже установлен стек от `3x-ui-installer` — Nginx Stream/Xray, UFW и Fail2ban.
 
-> Команды рассчитаны на то, что репозиторий во время установки **Public**.
+> Команды ниже рассчитаны на то, что репозиторий во время установки **Public**.
 
-### 1. Скачать и установить RIPH
+### Самый простой вариант — скопировать один блок
+
+Для Debian/Ubuntu:
 
 ```bash
+sudo apt-get update && \
+sudo apt-get install -y git && \
+git clone https://github.com/AndrewZAP1977/router-ip-push-hardening.git && \
+cd router-ip-push-hardening && \
+sudo env RIPH_ALLOW_PRODUCTION=1 bash ./install.sh --install --apply --enable-timers && \
+sudo riph-fail2ban-activate && \
+sudo riph-admin status
+```
+
+Если блок завершился без ошибок и `riph-admin status` показывает валидный Nginx, trusted set и активные timers — RIPH установлен и запущен.
+
+### То же самое по шагам
+
+```bash
+sudo apt-get update
+sudo apt-get install -y git
+
 git clone https://github.com/AndrewZAP1977/router-ip-push-hardening.git
 cd router-ip-push-hardening
+
 sudo env RIPH_ALLOW_PRODUCTION=1 bash ./install.sh --install --apply --enable-timers
+sudo riph-fail2ban-activate
+sudo riph-admin status
 ```
+
+При **первой** установке RIPH Fail2ban jails специально ставятся выключенными, поэтому после успешного install/apply выполняется `riph-fail2ban-activate`.
 
 Installer сам:
 
@@ -28,24 +52,6 @@ Installer сам:
 - если Router IP Push нет — продолжит установку без dynamic routers;
 - применит Nginx routing/allowlist;
 - включит provider watcher и reconcile timers.
-
-### 2. Включить RIPH Fail2ban
-
-При **первой** установке RIPH Fail2ban jails ставятся выключенными. После успешной установки включи их:
-
-```bash
-sudo riph-fail2ban-activate
-```
-
-При обычном обновлении уже активные RIPH jails сохраняют своё состояние, повторно активировать их не нужно.
-
-### 3. Проверить состояние
-
-```bash
-sudo riph-admin status
-```
-
-Если команда показывает валидный Nginx, trusted set и активные timers — RIPH запущен.
 
 ## Хочешь сначала только проверить VPS
 
@@ -67,6 +73,8 @@ git pull --ff-only
 sudo env RIPH_ALLOW_PRODUCTION=1 bash ./install.sh --install --apply --enable-timers
 sudo riph-admin status
 ```
+
+При обновлении уже активные RIPH Fail2ban jails сохраняют своё состояние, повторно запускать `riph-fail2ban-activate` обычно не нужно.
 
 При обычном обновлении **не используй `--replace-config`** — существующие рабочие config/list файлы должны сохраняться.
 
