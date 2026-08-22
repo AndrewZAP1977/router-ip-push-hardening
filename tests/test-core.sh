@@ -171,4 +171,31 @@ unset RIPH_TEST_NGINX_EXIT
 cmp -s "${STREAM}" "${TEST_ROOT}/stream.before-routing-failure" || fail "routing stream rollback mismatch"
 cmp -s "${STATE}" "${TEST_ROOT}/state.before-routing-failure" || fail "routing state rollback mismatch"
 
+echo "TEST 10: passthrough routing is independent of Router IP Push lifecycle"
+sed -i 's/^PASSTHROUGH_ROUTE_COUNT=0$/PASSTHROUGH_ROUTE_COUNT=1/' \
+    "${TEST_ROOT}/etc/router-ip-push-hardening/config.env"
+cat >>"${TEST_ROOT}/etc/router-ip-push-hardening/config.env" <<'EOF'
+PASSTHROUGH_SNI_1="cloud.example.invalid"
+PASSTHROUGH_UPSTREAM_1="127.0.0.1:10443"
+EOF
+"${APPLY}" --root "${TEST_ROOT}" --reason "enable passthrough" --now-epoch 23000
+assert_contains "${STREAM}" 'cloud.example.invalid|0'
+assert_contains "${STREAM}" 'cloud.example.invalid|1'
+assert_contains "${STREAM}" 'upstream passthrough_1'
+assert_contains "${STREAM}" 'server 127.0.0.1:10443;'
+cp "${STREAM}" "${TEST_ROOT}/stream.with-passthrough"
+
+printf '%s\n' '192.0.2.100' \
+    >"${TEST_ROOT}/var/lib/router-ip-push/ips/ROUTER_A.ipv4"
+bash "${SYNC}" --root "${TEST_ROOT}" --no-reconcile >/dev/null
+"${APPLY}" --root "${TEST_ROOT}" --reason "provider changed with passthrough" --now-epoch 24000
+cmp -s "${STREAM}" "${TEST_ROOT}/stream.with-passthrough" \
+    || fail "provider IP change altered passthrough stream routing"
+
+rm -f "${TEST_ROOT}/var/lib/router-ip-push/ips/ROUTER_A.ipv4"
+bash "${SYNC}" --root "${TEST_ROOT}" --no-reconcile >/dev/null
+"${APPLY}" --root "${TEST_ROOT}" --reason "provider revoked with passthrough" --now-epoch 25000
+cmp -s "${STREAM}" "${TEST_ROOT}/stream.with-passthrough" \
+    || fail "provider revoke altered passthrough stream routing"
+
 echo "PASS: core tests"

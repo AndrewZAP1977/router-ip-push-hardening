@@ -98,6 +98,7 @@ validate_format_name() {
 PUBLIC_SNI="${PUBLIC_SNI:-}"
 PUBLIC_UPSTREAM="${PUBLIC_UPSTREAM:-127.0.0.1:7443}"
 PRIVATE_ROUTE_COUNT="${PRIVATE_ROUTE_COUNT:-0}"
+PASSTHROUGH_ROUTE_COUNT="${PASSTHROUGH_ROUTE_COUNT:-0}"
 REJECT_UPSTREAM="${REJECT_UPSTREAM:-127.0.0.1:9}"
 STREAM_OUTPUT="${STREAM_OUTPUT_OVERRIDE:-${STREAM_OUTPUT:-/etc/nginx/stream-enabled/stream.conf}}"
 BRIDGE_OUTPUT="${BRIDGE_OUTPUT_OVERRIDE:-${BRIDGE_OUTPUT:-/etc/nginx/stream-enabled/06-router-ip-push-fake-site-bridges.conf}}"
@@ -112,6 +113,9 @@ validate_loopback_upstream PUBLIC_UPSTREAM "${PUBLIC_UPSTREAM}"
 validate_loopback_upstream REJECT_UPSTREAM "${REJECT_UPSTREAM}"
 [[ "${PRIVATE_ROUTE_COUNT}" =~ ^[0-9]+$ ]] || riph_die "PRIVATE_ROUTE_COUNT must be an integer"
 (( PRIVATE_ROUTE_COUNT >= 1 && PRIVATE_ROUTE_COUNT <= 20 )) || riph_die "PRIVATE_ROUTE_COUNT must be 1..20"
+[[ "${PASSTHROUGH_ROUTE_COUNT}" =~ ^[0-9]+$ ]] || riph_die "PASSTHROUGH_ROUTE_COUNT must be an integer"
+(( PASSTHROUGH_ROUTE_COUNT >= 0 && PASSTHROUGH_ROUTE_COUNT <= 20 )) \
+    || riph_die "PASSTHROUGH_ROUTE_COUNT must be 0..20"
 [[ "${LEGACY_STREAM_AUDIT_COMPAT}" == 0 || "${LEGACY_STREAM_AUDIT_COMPAT}" == 1 ]] \
     || riph_die "LEGACY_STREAM_AUDIT_COMPAT must be 0 or 1"
 [[ "${STREAM_OUTPUT}" == /* && "${BRIDGE_OUTPUT}" == /* && "${STREAM_AUDIT_LOG}" == /* ]] \
@@ -130,7 +134,7 @@ printf '%s\n' "${PUBLIC_SNI}" >"${TMP_NAMES}"
 
 {
     printf '# Managed by router-ip-push-hardening. DO NOT EDIT.\n'
-    printf '# Private SNI routing: trusted -> Xray, untrusted -> fake site.\n\n'
+    printf '# Public/passthrough SNI ignore source trust; private SNI use trusted policy.\n\n'
     cat <<'EOF_LOG_FORMAT'
 log_format riph_stream_sni '$time_iso8601 src=$remote_addr route=$sni_name sni=$ssl_preread_server_name upstream=$upstream_addr status=$status session=$session_time';
 
@@ -182,6 +186,25 @@ server
 EOF_BRIDGE
 done
 
+for ((i = 1; i <= PASSTHROUGH_ROUTE_COUNT; i++)); do
+    sni_var="PASSTHROUGH_SNI_${i}"
+    upstream_var="PASSTHROUGH_UPSTREAM_${i}"
+    sni="${!sni_var:-}"
+    upstream="${!upstream_var:-}"
+
+    [[ -n "${sni}" ]] || riph_die "${sni_var} is empty"
+    is_hostname "${sni}" || riph_die "invalid ${sni_var}: ${sni}"
+    if grep -Fqx -- "${sni}" "${TMP_NAMES}"; then
+        riph_die "duplicate routing SNI: ${sni}"
+    fi
+    printf '%s\n' "${sni}" >>"${TMP_NAMES}"
+
+    validate_loopback_upstream "${upstream_var}" "${upstream}"
+
+    printf '        %-40s passthrough_%d;\n' "${sni}|0" "${i}" >>"${TMP_STREAM}"
+    printf '        %-40s passthrough_%d;\n' "${sni}|1" "${i}" >>"${TMP_STREAM}"
+done
+
 cat >>"${TMP_STREAM}" <<'EOF_MAP_END'
         default                                  reject;
 }
@@ -213,6 +236,18 @@ upstream fake_${i}
 }
 
 EOF_UPSTREAM
+done
+
+for ((i = 1; i <= PASSTHROUGH_ROUTE_COUNT; i++)); do
+    upstream_var="PASSTHROUGH_UPSTREAM_${i}"
+    upstream="${!upstream_var}"
+    cat >>"${TMP_STREAM}" <<EOF_PASSTHROUGH
+upstream passthrough_${i}
+{
+        server ${upstream};
+}
+
+EOF_PASSTHROUGH
 done
 
 cat >>"${TMP_STREAM}" <<EOF_REJECT

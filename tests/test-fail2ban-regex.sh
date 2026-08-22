@@ -15,6 +15,7 @@ cat >"${T}/stream.log" <<'LOG'
 2026-08-17T14:00:02+00:00 src=203.0.113.12 route=fake_2 sni=private-b.example.net upstream=127.0.0.1:9544 status=200 session=1.100
 2026-08-17T14:00:03+00:00 src=192.0.2.25 route=xray_1 sni=private-a.example.net upstream=127.0.0.1:8443 status=200 session=20.000
 2026-08-17T14:00:04+00:00 src=198.51.100.7 route=www sni=public.example.net upstream=127.0.0.1:7443 status=200 session=0.300
+2026-08-17T14:00:05+00:00 src=203.0.113.99 route=passthrough_1 sni=cloud.example.net upstream=127.0.0.1:10443 status=200 session=4.200
 LOG
 
 reject_out="$(fail2ban-regex "${T}/stream.log" "${ROOT}/src/etc/fail2ban/filter.d/riph-nginx-stream-sni-reject.conf" --usedns=no -o ip | sort -u)"
